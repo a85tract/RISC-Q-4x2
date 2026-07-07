@@ -1,0 +1,47 @@
+"""Pulse: one envelope + carrier parameters, with per-channel packing/duration hooks."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from riscq.map import SocMap
+from riscq.pulses import units
+from riscq.pulses.pack import pack_env
+
+
+@dataclass(frozen=True)
+class Pulse:
+    """env is complex float64 on the target channel's stored-sample grid
+    (riscq.pulses.envelopes); amp in [-1, 1], phase in rad. freq_hz is the carrier frequency, or
+    None to inherit the ParamTable's carrier (spec 02 §3.2) — a Pulse carries no channel/slot."""
+
+    env: np.ndarray
+    amp: float
+    freq_hz: float | None = None
+    phase: float = 0.0
+    name: str | None = None
+
+    def packed_lines(self, m: SocMap, channel: int) -> np.ndarray:
+        """Envelope-RAM lines, (n_lines, samples_per_line) uint32, zero-padded to whole lines.
+        `channel` is the logical RF channel index (0 gate / 1 ro / 2 demod)."""
+        return pack_env(self.env, m.channel(channel).samples_per_line)
+
+    def dur_batches(self, m: SocMap, channel: int) -> int:
+        """Pulse duration in batches = number of envelope lines (one line per batch)."""
+        return -(-len(self.env) // m.channel(channel).samples_per_line)
+
+    def freq_code(self, m: SocMap, carrier_hz: float | None = None) -> int:
+        """Carrier frequency code: the Pulse's own freq_hz, or `carrier_hz` (the table carrier)
+        when it has none."""
+        f = self.freq_hz if self.freq_hz is not None else carrier_hz
+        if f is None:
+            raise ValueError("Pulse has no carrier: set Pulse.freq_hz or supply a table carrier")
+        return units.freq_to_code(f, m.params)
+
+    def amp_code(self) -> int:
+        return units.amp_to_code(self.amp)
+
+    def phase_code(self) -> int:
+        return units.phase_to_code(self.phase)
