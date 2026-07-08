@@ -87,6 +87,13 @@ def test_demod_freq_to_code_is_4x_dac():
     assert units.demod_freq_to_code(f, M.params) == -(1 << 15)
     with pytest.raises(ValueError):
         units.demod_freq_to_code(4 * FS, M.params)      # past the demod band (16 turns), still loud
+    # a frequency where rounding at the ADC rate INDEPENDENTLY lands 2 LSB (61 kHz) off 4x the DAC
+    # code: the demod must track the tone the DAC actually synthesizes — its rounded code — or the
+    # drive-demod offset rotates the readout phase shot to shot (the hardware iq_scatter ring).
+    f = 0.30001 * FS
+    fc = units.freq_to_code(f, M.params)                 # 19661 (4x = 78644)
+    assert round(f * (1 << 16) / (FS / 4)) == 78646      # what an independent round would give
+    assert units.demod_freq_to_code(f, M.params) == ((4 * fc + (1 << 15)) & 0xFFFF) - (1 << 15) == 13108
 
 
 def test_phase_to_code():

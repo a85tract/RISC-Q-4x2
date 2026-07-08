@@ -12,17 +12,15 @@ from riscq.pulses.golden import AMP_SCALE  # noqa: F401  (re-exported: THE ampli
 _PERIOD = 1 << 16    # SF(16) phase wraps mod 2^16 (one full turn per sample == the sample rate)
 
 
-def _wrap_sf16(f_hz: float, code: int, rate: float, label: str, max_turns: int = 1) -> int:
+def _wrap_sf16(f_hz: float, code: int, rate: float) -> int:
     """Fold a raw per-sample phase-advance code into signed SF(16) [-2^15, 2^15). The hardware
     phase accumulator wraps mod 2^16, so a positive code above Nyquist (2^15) is bit-for-bit the
-    same tone as code - 2^16 below zero; fold it there rather than rejecting it. `max_turns` bounds
-    how many full 2^16 turns of aliasing are legitimate: the DAC allows one (a tone must be below the
-    sample rate), the demod allows BATCH_SIZE/ADC_BATCH — its per-sample turn is that many times
-    smaller, so the same physical band up to the sample rate spans that many turns. Only a code past
-    `max_turns` full turns from DC is a genuine out-of-range error and still fails loud."""
-    if not -max_turns * _PERIOD < code < max_turns * _PERIOD:
-        raise ValueError(f"{label} {f_hz} Hz -> code {code} exceeds {max_turns} full turn(s) "
-                         f"[{-max_turns * _PERIOD + 1}, {max_turns * _PERIOD - 1}] (rate {rate:g} Hz)")
+    same tone as code - 2^16 below zero; fold it there rather than rejecting it. Only a code a
+    full turn or more from DC (a tone at or past the sample rate) is a genuine out-of-range error
+    and still fails loud."""
+    if not -_PERIOD < code < _PERIOD:
+        raise ValueError(f"freq {f_hz} Hz -> code {code} exceeds one full turn "
+                         f"[{-_PERIOD + 1}, {_PERIOD - 1}] (rate {rate:g} Hz)")
     return ((code + (1 << 15)) & 0xFFFF) - (1 << 15)
 
 
@@ -37,7 +35,7 @@ def freq_to_code(f_hz: float, params: SocParams) -> int:
     above Nyquist aliases to its negative-frequency code (the phase accumulator wraps the same way).
     Fails loud only past one full turn."""
     fs = sample_rate(params)
-    return _wrap_sf16(f_hz, round(f_hz * (1 << 16) / fs), fs, "freq")
+    return _wrap_sf16(f_hz, round(f_hz * (1 << 16) / fs), fs)
 
 
 def code_to_freq(code: int, params: SocParams) -> float:
@@ -45,18 +43,17 @@ def code_to_freq(code: int, params: SocParams) -> float:
 
 
 def demod_freq_to_code(f_hz: float, params: SocParams) -> int:
-    """Demod-LO frequency code = per-ADC-SAMPLE phase advance in pi units, SF(16). The ADC has
-    ADC_BATCH (4) samples/batch vs the DAC's BATCH_SIZE (16), so for the same physical frequency
-    the demod code is BATCH_SIZE/ADC_BATCH = 4x the DAC's freq_to_code. Pinned by measurement in
-    the M3 loopback test (a DAC tone at code F loops back onto the ADC at demod code 4F), NOT by
-    re-deriving the RTL: code = round(f_hz * 2^16 / (ADC_BATCH * dsp_freq_hz)), folded mod 2^16 into
-    signed SF(16) — a tone above the demod's own Nyquist aliases exactly like freq_to_code (on-core,
-    set_freq(demod, 4 * dac_code) writes the product into the same 16-bit register). The demod's
-    per-sample turn is BATCH_SIZE/ADC_BATCH x smaller than the DAC's, so the DAC's full band up to
-    the sample rate spans that many demod turns; fails loud only past it."""
-    rate = ADC_BATCH * params.dsp_freq_hz
-    return _wrap_sf16(f_hz, round(f_hz * (1 << 16) / rate), rate, "demod freq",
-                      max_turns=BATCH_SIZE // ADC_BATCH)
+    """Demod-LO frequency code = per-ADC-SAMPLE phase advance in pi units, SF(16), DERIVED from
+    the DAC code: BATCH_SIZE/ADC_BATCH (4x) freq_to_code, folded mod 2^16 — exactly what the
+    on-core set_freq(demod, 4 * dac_code) truncates into the same 16-bit register. It must NOT be
+    rounded independently from f_hz: the demod has to track the tone the DAC actually synthesizes
+    (its rounded code), and an independent round(f * 2^16 / adc_rate) lands 1-2 LSB (30-61 kHz at
+    2 GS/s) off 4x the DAC code at most frequencies — a drive-vs-demod offset that rotates the
+    readout phase shot to shot (the hardware iq_scatter ring, 2026-07). Accepts any tone
+    freq_to_code accepts (the full DAC band = BATCH_SIZE/ADC_BATCH demod turns); fails loud past
+    it. The 4x relation itself is pinned by measurement in the M3 loopback test."""
+    code = (BATCH_SIZE // ADC_BATCH) * freq_to_code(f_hz, params)
+    return ((code + (1 << 15)) & 0xFFFF) - (1 << 15)
 
 
 def demod_code_to_freq(code: int, params: SocParams) -> float:
