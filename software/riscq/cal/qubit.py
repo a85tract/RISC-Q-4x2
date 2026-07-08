@@ -21,6 +21,7 @@ from riscq.cal.base import (GATE_ENV, RELAX, SEP, Result, batch_timeout, bind_pa
                             grid_period, qubit_freq, readout_tables, socmap, sweep_counts, sweep_q16,
                             x90_pulse, x180_pulse)
 from riscq.lang import Array, ParamTable, compile_kernel
+from riscq.map import pack16
 from riscq.pulses import units
 
 TWO_PI = 2 * math.pi
@@ -124,7 +125,8 @@ class Frequency:
         wf = np.array(waits, float)
         for dc in d_codes:                                  # one rerun per detuning — no reload
             out = rq.rerun(drv, m, {q: prog},
-                           params={q: {"p0": 16 * dc * self.t0, "dp": 16 * dc * self.dt}},
+                           params={q: {"p0": pack16(16 * dc * self.t0),   # phase pair, seated (spec 12)
+                                       "dp": pack16(16 * dc * self.dt)}},
                            results=["out"], timeout=timeout)[q]["out"]
             P = out.astype(float) / self.shots
             fit = fits.fit_damped_cosine(wf, P)
@@ -173,8 +175,10 @@ class Phase:
         prog = compile_kernel(kernels.k_ramsey, m, tables=dict(gate=gate, ro=ro, demod=demod),
                               out=Array(npts), npts=npts, shots=self.shots, period=period,
                               code=code, mode=kernels.COUNTS)
-        # wait 0 (w0=dw=0), virtual-Z phase computed on-core: φ_i = i·dphi (p0=0, dp=dphi_code)
-        P = sweep_counts(drv, m, prog, q, {"w0": 0, "dw": 0, "p0": 0, "dp": self.dphi_code},
+        # wait 0 (w0=dw=0), virtual-Z phase computed on-core: φ_i = i·dphi (p0=0, dp=dphi_code);
+        # the phase pair is host-seated into data[31:16] (spec 12)
+        P = sweep_counts(drv, m, prog, q,
+                         {"w0": 0, "dw": 0, "p0": pack16(0), "dp": pack16(self.dphi_code)},
                          self.shots, batch_timeout(npts * self.shots * period))
         phis = [i * self.dphi_code for i in range(self.points)]          # realized φ codes (host mirror)
         x = np.array([p * math.pi / (1 << 15) for p in phis], float)     # φ in radians
@@ -257,7 +261,8 @@ class T2:
         # wait sweep computed on-core (w0/dw); the small detuning is applied as the virtual-Z pair
         dc = self.detune_code
         P = sweep_counts(drv, m, prog, q,
-                         {"w0": self.t0, "dw": self.dt, "p0": 16 * dc * self.t0, "dp": 16 * dc * self.dt},
+                         {"w0": self.t0, "dw": self.dt,           # waits plain; phase pair seated (spec 12)
+                          "p0": pack16(16 * dc * self.t0), "dp": pack16(16 * dc * self.dt)},
                          self.shots, batch_timeout(npts * self.shots * period))
         self.data = {"x": np.array(waits, float), "y": P}
         fit = fits.fit_damped_cosine(np.array(waits, float), P)

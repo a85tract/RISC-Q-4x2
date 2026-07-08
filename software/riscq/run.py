@@ -9,7 +9,7 @@ import numpy as np
 import serpent
 
 from riscq.build import Image, Program
-from riscq.map import SocMap
+from riscq.map import SocMap, pack16
 
 STATUS_DONE_MASK = 0xFFFF0000
 STATUS_DONE = 0xD04E0000
@@ -68,9 +68,10 @@ _SLOT_FIELD_OFF = {"phase": 0, "amp": 4, "env": 8, "dur": 12}
 def load_tables(drv, m: SocMap, core: int, program: Program) -> None:
     """Fill each live ParamTable's .data `struct rq_slot[]` by symbol+offset with its compiled
     design-time codes — the kernel's init_pulse_params programs the hardware slots from it. .data
-    (RQ_PARAM) survives start.S's .bss zeroing, like a param global (spec 02 §3.2)."""
+    (RQ_PARAM) survives start.S's .bss zeroing, like a param global (spec 02 §3.2). Every field is
+    seated in data[31:16] (pack16, spec 12) so init_pulse_params' set_* write it raw."""
     for name, slot_codes in program.tables.items():
-        buf = b"".join(int(c & 0xFFFFFFFF).to_bytes(4, "little")
+        buf = b"".join((pack16(c) & 0xFFFFFFFF).to_bytes(4, "little")
                        for slot in slot_codes for c in slot)
         drv.write_block(m.to_host_addr(core, program.var_addr(name)), buf)
 
@@ -78,9 +79,10 @@ def load_tables(drv, m: SocMap, core: int, program: Program) -> None:
 def write_slot(drv, m: SocMap, core: int, program: Program, table: str, slot: int,
                field: str, value: int) -> None:
     """Retune one field of one ParamTable slot in .data by name (`gate[0].amp`) — no recompile,
-    the next init_pulse_params picks it up (spec 02 §3.2)."""
+    the next init_pulse_params picks it up (spec 02 §3.2). `value` is a plain code; it is seated in
+    data[31:16] (pack16, spec 12) to match the compiled table fields."""
     addr = program.var_addr(table) + _SLOT_BYTES * slot + _SLOT_FIELD_OFF[field]
-    drv.write32(m.to_host_addr(core, addr), int(value) & 0xFFFFFFFF)
+    drv.write32(m.to_host_addr(core, addr), pack16(value) & 0xFFFFFFFF)
 
 
 def write_params(drv, m: SocMap, core: int, program: Program,

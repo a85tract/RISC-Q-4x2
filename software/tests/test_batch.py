@@ -25,7 +25,7 @@ from riscq.cal.base import SEP, bind_params, gate_sigma, sweep_q16
 from riscq.cal import fits, kernels
 from riscq.cal.readout import Classifier
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
-from riscq.map import LEAD, READOUT_LEAD, READOUT_MAX_WIN_LOG2
+from riscq.map import LEAD, READOUT_LEAD, READOUT_MAX_WIN_LOG2, pack16
 from riscq.pulses import Pulse, envelopes, golden, units
 
 pytestmark = pytest.mark.cosim
@@ -66,7 +66,7 @@ def _phase_cal(drv, m, demod):
 
     def rd(ph):
         drv.sim.set_model({**base, "readout_phase": ph})
-        prog = compile_kernel(_k_read, m, tables=dict(demod=demod), out=Array(2), code=RO_CODE)
+        prog = compile_kernel(_k_read, m, tables=dict(demod=demod), out=Array(2), code=pack16(RO_CODE))
         out = rq.run(drv, m, {0: prog}, timeout=1_000_000)[0]["out"]
         return float(out[0]), float(out[1])
 
@@ -83,12 +83,12 @@ def _sig(m, amp_code):
 
 def _rabi_pi(m):
     return float(math.pi / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.99), F_GE,
-                                      units.amp_to_code(0.99)))
+                                      units._amp_code(0.99)))
 
 
 def _rabi_pi2(m):
     return float((math.pi / 2) / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5), F_GE,
-                                            units.amp_to_code(0.5)))
+                                            units._amp_code(0.5)))
 
 
 def _timeout(nbatches):
@@ -171,7 +171,7 @@ def test_raw_clusters(sub):
     npts, shots, period = 1, 15, 8192
     prog = compile_kernel(kernels.k_t1, m, tables=dict(gate=gate180, ro=ro, demod=demod),
                           out=Array(2 * npts * shots), npts=npts, shots=shots, period=period,
-                          code=RO_CODE, mode=RAW, d0=SEP, dd=0)          # prep runtime (per rerun)
+                          code=pack16(RO_CODE), mode=RAW, d0=SEP, dd=0)          # prep runtime (per rerun)
     rq.setup(drv, m, {0: prog})
 
     def cluster(prep):                                                  # prep=0 → |0>, prep=1 → |1>
@@ -200,7 +200,7 @@ def test_first_row_clean(sub):
     npts, shots, period = 4, 4, 8192
     prog = compile_kernel(kernels.k_t1, m, tables=dict(gate=gate180, ro=ro, demod=demod),
                           out=Array(2 * npts * shots), npts=npts, shots=shots, period=period,
-                          code=RO_CODE, mode=RAW, d0=SEP, dd=0)
+                          code=pack16(RO_CODE), mode=RAW, d0=SEP, dd=0)
     out = rq.run(drv, m, {0: prog}, params={0: {"prep": 0}},
                  timeout=_timeout(npts * shots * period))[0]["out"]
     iq = out.reshape(npts * shots, 2).astype(float)
@@ -222,7 +222,7 @@ def test_counts_rabi(sub):
     npts = points
     prog = compile_kernel(kernels.k_rabi, m, tables=dict(gate=gate, ro=ro, demod=demod),
                           out=Array(npts), npts=npts, shots=shots, period=period,
-                          ngates=1, code=RO_CODE, mode=COUNTS, a0q=int(a0q), daq=int(daq), prep=1)
+                          ngates=1, code=pack16(RO_CODE), mode=COUNTS, a0q=int(a0q), daq=int(daq), prep=1)
     out = rq.run(drv, m, {0: prog},
                  timeout=_timeout(npts * shots * period))[0]["out"]
     P = out.astype(float) / shots
@@ -241,8 +241,8 @@ def test_counts_frequency(sub):
     npts = points
     prog = compile_kernel(kernels.k_ramsey, m, tables=dict(gate=gate, ro=ro, demod=demod),
                           out=Array(npts), npts=npts, shots=shots, period=period,
-                          code=RO_CODE, mode=COUNTS, w0=t0, dw=dt,
-                          p0=16 * d_code * t0, dp=16 * d_code * dt)     # detuning applied via virtual-Z
+                          code=pack16(RO_CODE), mode=COUNTS, w0=t0, dw=dt,
+                          p0=pack16(16 * d_code * t0), dp=pack16(16 * d_code * dt))     # detuning applied via virtual-Z
     out = rq.run(drv, m, {0: prog},
                  timeout=_timeout(npts * shots * period))[0]["out"]
     P = out.astype(float) / shots
@@ -261,7 +261,7 @@ def test_counts_t1(sub):
     npts = points
     prog = compile_kernel(kernels.k_t1, m, tables=dict(gate=gate180, ro=ro, demod=demod),
                           out=Array(npts), npts=npts, shots=shots, period=period,
-                          code=RO_CODE, mode=COUNTS, d0=SEP, dd=dt, prep=1)
+                          code=pack16(RO_CODE), mode=COUNTS, d0=SEP, dd=dt, prep=1)
     out = rq.run(drv, m, {0: prog},
                  timeout=_timeout(npts * shots * period))[0]["out"]
     P = out.astype(float) / shots                                 # |1> population, decaying
@@ -279,8 +279,8 @@ def test_counts_t2(sub):
     npts = points
     prog = compile_kernel(kernels.k_ramsey, m, tables=dict(gate=gate, ro=ro, demod=demod),
                           out=Array(npts), npts=npts, shots=shots, period=period,
-                          code=RO_CODE, mode=COUNTS, w0=t0, dw=dt,
-                          p0=16 * d_code * t0, dp=16 * d_code * dt)
+                          code=pack16(RO_CODE), mode=COUNTS, w0=t0, dw=dt,
+                          p0=pack16(16 * d_code * t0), dp=pack16(16 * d_code * dt))
     out = rq.run(drv, m, {0: prog},
                  timeout=_timeout(npts * shots * period))[0]["out"]
     P = out.astype(float) / shots
@@ -296,7 +296,7 @@ def test_counts_t2(sub):
 def test_computed_amp_matches_xs(sub):
     """spec 09 §4.2 acceptance: the on-core computed amp sweep reproduces sweep_q16's xs. Capture the
     gate DAC across a computed-amp k_rabi run and match each per-point pulse window bit-exactly vs the
-    golden at the host-mirrored code — `set_amp(aq >> 16)` == sweep_q16 point-for-point (a bit-exact
+    golden at the host-mirrored code — `set_amp(aq)` raw == sweep_q16 point-for-point (a bit-exact
     readback, not a fit)."""
     drv, m, (gate, gate180, ro, demod), phase = sub
     drv.sim.set_model({"kind": "zero"})                  # the gate DAC carries only the core's gate pulses
@@ -309,7 +309,7 @@ def test_computed_amp_matches_xs(sub):
     f_code, ph_code, dur = x90.freq_code(m), x90.phase_code(), len(lines)
     prog = compile_kernel(kernels.k_rabi, m, tables=dict(gate=gate, ro=ro, demod=demod),
                           out=Array(npts), npts=npts, shots=shots, period=period,
-                          ngates=1, code=RO_CODE, mode=COUNTS, a0q=int(a0q), daq=int(daq), prep=1)
+                          ngates=1, code=pack16(RO_CODE), mode=COUNTS, a0q=int(a0q), daq=int(daq), prep=1)
     ncap = 8000                                          # armed before reset release: covers boot + grid
     rq.setup(drv, m, {0: prog})
     rq.check_magic(drv, m, 0, prog)
@@ -354,7 +354,7 @@ def test_applied_demod_phase(sub):
     npts, shots, period = 1, 1, 8192
     prog = compile_kernel(kernels.k_t1, m, tables=dict(gate=gate180, ro=ro, demod=demod),
                           out=Array(2 * npts * shots), npts=npts, shots=shots, period=period,
-                          code=RO_CODE, mode=RAW, d0=SEP, dd=0)      # prep runtime (per-prep rerun)
+                          code=pack16(RO_CODE), mode=RAW, d0=SEP, dd=0)      # prep runtime (per-prep rerun)
     runs = build.CC_RUNS
     rq.setup(drv, m, {0: prog})
 
@@ -368,7 +368,7 @@ def test_applied_demod_phase(sub):
 
     z0, z1 = read()                                                 # demod phase 0 → fixed pipeline angle
     a0 = math.atan2(z0.imag, z0.real)
-    rq.write_slot(drv, m, 0, prog, "demod", 0, "phase", units.phase_to_code(-a0))   # rotate |0> → +real
+    rq.write_slot(drv, m, 0, prog, "demod", 0, "phase", units._phase_code(-a0))   # rotate |0> → +real
     z0p, z1p = read()                                               # rerun, no recompile
     rot = math.remainder(math.atan2(z0p.imag, z0p.real) - a0, 2 * math.pi)          # measured rotation
     print(f"\n[demod-phase] a0={math.degrees(a0):.1f}° applied={math.degrees(-a0):.1f}° "
@@ -392,7 +392,7 @@ def test_fidelity_dur_retune(sub):
     npts, shots, period = 1, 1, 8192                                # one |0> row (no drive)
     prog = compile_kernel(kernels.k_t1, m, tables=dict(gate=gate180, ro=ro, demod=demod),
                           out=Array(2 * npts * shots), npts=npts, shots=shots, period=period,
-                          code=RO_CODE, mode=RAW, d0=SEP, dd=0, prep=0)
+                          code=pack16(RO_CODE), mode=RAW, d0=SEP, dd=0, prep=0)
     runs = build.CC_RUNS
     rq.setup(drv, m, {0: prog})
 

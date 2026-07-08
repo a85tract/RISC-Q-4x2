@@ -3,13 +3,29 @@ verified against the SpinalHDL SocMemoryMap), and the generators evaluate them."
 
 from pathlib import Path
 
-from riscq.map import MEM_BASE, SocMap, SocParams
+from riscq.map import MEM_BASE, SocMap, SocParams, pack16
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
 
 def _map(name: str) -> SocMap:
     return SocMap(SocParams.load(CONFIGS / f"{name}.json"))
+
+
+def test_pack16_seats_field_at_bit16():
+    """pack16 seats a 16-bit code in data[31:16] (spec 12) — the software-side RQ_PACK16, returning
+    the SIGNED int32 word a register holds. The low 16 bits are zero (single-`lui` constant / free
+    Q16 fraction); a code with bit 15 set seats to a negative word (passes the kernel int32 check)."""
+    assert pack16(0) == 0
+    assert pack16(1) == 0x00010000
+    assert pack16(0x7FFF) == 0x7FFF0000
+    assert pack16(-0x8000) == -(1 << 31)                       # bit-15 code -> most-negative int32
+    assert pack16(-1) == -0x10000                              # 0xFFFF0000 as signed
+    for code in (0, 1, 1234, -1, -2048, 0x7FFF, -0x8000, 0x8000):
+        w = pack16(code)
+        assert -(1 << 31) <= w <= (1 << 31) - 1 and w & 0xFFFF == 0   # signed int32, low half free
+        assert (w >> 16) & 0xFFFF == code & 0xFFFF             # field == code mod 2^16
+    assert pack16(0x12345) == 0x23450000                       # wider codes fold mod 2^16
 
 
 def test_zcu216_14q_numbers():

@@ -8,7 +8,10 @@
 #include "riscq_map.h"
 
 #define RQ_MMIO(a)   (*(volatile uint32_t *)(uintptr_t)(a))
-#define RQ_PACK16(c) ((uint32_t)((c) & 0xffff) << 16)   /* 16-bit fields live at data[31:16] */
+/* 16-bit pulse-parameter fields live at data[31:16]; the ops write the word RAW. Values arrive
+ * pre-seated in [31:16] by their producer — python via riscq.map.pack16 for generated/host-loaded
+ * codes (a seated code is a single-`lui` constant), or an on-core Q16 accumulator written raw (its
+ * integer code is in [31:16]; the low fraction is ignored by hardware). See specs/software/12. */
 
 /* Host-written parameter globals MUST carry this: a zero-initialized global lands in .bss,
  * and start.S zeroes .bss at boot — wiping anything the host wrote before the reset release.
@@ -30,21 +33,21 @@ static inline void wait_until(uint32_t t) {
     (void)RQ_MMIO(RQ_CTRL_WAIT_TIME_CMP);   /* read HALTS until time + 3 >= timeCmp */
 }
 
-/* ── pulse programming (posted writes, ordered; codes are SF(16) at data[31:16]) ── */
+/* ── pulse programming (posted writes, ordered; args pre-seated in data[31:16], written raw) ── */
 static inline void set_freq(uint32_t ch, int32_t code) {
-    RQ_MMIO(ch + RQ_FREQ) = RQ_PACK16(code);
+    RQ_MMIO(ch + RQ_FREQ) = code;
 }
 static inline void set_phase(uint32_t ch, uint32_t slot, int32_t code) {
-    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0x0) = RQ_PACK16(code);
+    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0x0) = code;
 }
 static inline void set_amp(uint32_t ch, uint32_t slot, int32_t code) {
-    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0x4) = RQ_PACK16(code);
+    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0x4) = code;
 }
 static inline void set_env(uint32_t ch, uint32_t slot, uint32_t line) {
-    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0x8) = RQ_PACK16(line);
+    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0x8) = line;
 }
 static inline void set_dur(uint32_t ch, uint32_t slot, uint32_t dur) {
-    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0xc) = RQ_PACK16(dur);
+    RQ_MMIO(ch + (slot + 1) * RQ_SLOT_STRIDE + 0xc) = dur;
 }
 static inline void set_start(uint32_t ch, uint32_t t) {
     RQ_MMIO(ch + RQ_START_TIME) = t;         /* absolute batch time; wins over auto-advance same beat */
@@ -63,12 +66,12 @@ static inline void play(uint32_t ch, uint32_t slot, uint32_t t) {
 /* virtual-Z frame rotation: added (mod 2^16 = one turn) to the fired slot's phase, CAPTURED AT
  * FIRE — write it before the fire it should apply to; it persists until rewritten. */
 static inline void set_phase_offset(uint32_t ch, int32_t code) {
-    RQ_MMIO(ch + RQ_PHASE_OFFSET) = RQ_PACK16(code);
+    RQ_MMIO(ch + RQ_PHASE_OFFSET) = code;
 }
 /* quasi-static DC bias on the real output lanes (drive channels; no-op on demod). Applied
  * continuously, NOT captured at fire — do not toggle it mid-pulse. */
 static inline void set_dc_offset(uint32_t ch, int32_t code) {
-    RQ_MMIO(ch + RQ_DC_OFFSET) = RQ_PACK16(code);
+    RQ_MMIO(ch + RQ_DC_OFFSET) = code;
 }
 
 /* ── pulse table (spec 02 §3.2): a host-retunable rq_slot[] programs a channel's slots ── */

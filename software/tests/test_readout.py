@@ -26,7 +26,7 @@ import pytest
 
 from riscq import run as rq
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
-from riscq.map import LEAD, READOUT_LEAD
+from riscq.map import LEAD, READOUT_LEAD, pack16
 from riscq.pulses import Pulse, envelopes, units
 
 pytestmark = pytest.mark.cosim
@@ -104,7 +104,7 @@ def _read_once(cosim, spec, code, dur):
     drv, m = cosim
     drv.sim.set_model(spec)
     prog = compile_kernel(k_read_once, m, tables=dict(demod=demod_table(dur)),
-                          out=Array(3), code=code)
+                          out=Array(3), code=pack16(code))
     out = rq.run(drv, m, {0: prog}, timeout=1_000_000)[0]["out"]
     return int(out[0]), int(out[1]), int(out[2])
 
@@ -161,7 +161,7 @@ def test_readout_integrator_golden(cosim):
 
     # PIN: the matched demod code is 4F = 4x the DAC freq_to_code for the same physical tone.
     assert peak == 2, f"matched demod code index {peak} != 2 (4F); |z|={mags}"
-    assert codes[peak] == units.demod_freq_to_code(f_hz, m.params) == 4 * units.freq_to_code(f_hz, m.params)
+    assert codes[peak] == units._demod_code(f_hz, m.params) == 4 * units._freq_code(f_hz, m.params)
     assert mags[peak] > 4 * mags[-1], f"no selectivity vs far-detuned 16F: {mags}"   # VNA >>
 
     # magnitude matches the analytic value |z| ~ A*B*Nsamp/2^16 (A = tone amp, B ~ full-scale demod
@@ -218,7 +218,7 @@ def test_feedback_active_reset(cosim, demod_cal):
     # the demod carrier is re-played per shot: a short square pulse matched to the window (dur+8).
     # maxit=8, but the reset converges in 1-2, well within this.
     prog = compile_kernel(k_feedback, m, tables=dict(gate=gate, demod=demod_table(RO_DUR)),
-                          out=Array(1), code=RO_CODE, gap=48, excited=EXCITED, maxit=8)
+                          out=Array(1), code=pack16(RO_CODE), gap=48, excited=EXCITED, maxit=8)
     count = int(rq.run(drv, m, {0: prog}, timeout=2_000_000)[0]["out"][0])
     print(f"\n[feedback] active reset completed in {count} iteration(s)")
     assert 1 <= count <= 4, f"active reset took {count} iterations (not bounded/small)"
@@ -260,7 +260,7 @@ def test_demod_replay_within_program(cosim):
     drv.sim.set_model({"kind": "tone", "adc": m.adc_of(0),
                        "freq_hz": units.code_to_freq(F, m.params), "amp": RO_AMP})
     prog = compile_kernel(k_read_five, m, tables=dict(demod=demod_table(dur)),
-                          out=Array(10), code=code)
+                          out=Array(10), code=pack16(code))
     out = rq.run(drv, m, {0: prog}, timeout=4_000_000)[0]["out"]
 
     def s32(x):

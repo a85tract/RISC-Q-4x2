@@ -15,7 +15,7 @@ import pytest
 from riscq import run as rq
 from riscq.cal.base import SEP, bind_params, gate_sigma
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
-from riscq.map import LEAD, READOUT_LEAD
+from riscq.map import LEAD, READOUT_LEAD, pack16
 from riscq.pulses import Pulse, envelopes, units
 
 pytestmark = pytest.mark.cosim
@@ -80,7 +80,7 @@ def _phase_cal(drv, m, demod):
 
     def rd(ph):
         drv.sim.set_model({**base, "readout_phase": ph})
-        prog = compile_kernel(k_read, m, tables=dict(demod=demod), out=Array(2), code=RO_CODE)
+        prog = compile_kernel(k_read, m, tables=dict(demod=demod), out=Array(2), code=pack16(RO_CODE))
         out = rq.run(drv, m, {0: prog}, timeout=1_000_000)[0]["out"]
         return float(out[0]), float(out[1])
 
@@ -116,7 +116,7 @@ def test_projective_bimodal_binomial(cosim):
     nshots = 150
     prog = compile_kernel(k_shots, m, tables=dict(gate=gate, ro=ro, demod=demod),
                           res_out=Array(nshots), iq=Array(2 * nshots),
-                          code=RO_CODE, period=256, nshots=nshots)
+                          code=pack16(RO_CODE), period=256, nshots=nshots)
     out = rq.run(drv, m, {0: prog}, timeout=20_000_000)[0]
 
     res = out["res_out"].astype(int)

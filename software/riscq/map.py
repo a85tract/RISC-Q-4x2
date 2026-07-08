@@ -33,6 +33,21 @@ READOUT_LEAD = 48
 # programs write freq early against startTime 0 (see test_pulse.PULSE_SRC).
 LEAD = 96
 
+
+# 16-bit pulse-parameter fields live at data[31:16] of the posted write word (PulseParamBuffer
+# bitOffset = 16; the hardware ignores data[15:0] on those addresses — only startTime/fire read the
+# low bits). pack16 seats a code there — THE software-side field packer, replacing the firmware
+# RQ_PACK16 (spec 12). A seated code is code << 16: its low 16 bits are zero, so a compile-time
+# literal loads in one `lui`, and an on-core Q16 accumulator carries its fraction in the ignored low
+# half and is written raw (no >> 16 extraction). Codes wider than 16 bits (phase wraps) fold mod 2^16.
+# The result is a SIGNED int32 (the value a C int32_t register holds): a code with bit 15 set seats
+# to a NEGATIVE word — so it passes the kernel's int32 binding range check and emits as a clean C
+# literal. Byte/word writers mask with & 0xFFFFFFFF for serialization.
+def pack16(code: int) -> int:
+    w = (int(code) & 0xFFFF) << 16
+    return w - (1 << 32) if w >= (1 << 31) else w
+
+
 _FIELDS = {
     "name": str,
     "qubit_num": int,

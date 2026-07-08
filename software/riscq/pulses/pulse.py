@@ -33,15 +33,17 @@ class Pulse:
         return -(-len(self.env) // m.channel(channel).samples_per_line)
 
     def freq_code(self, m: SocMap, carrier_hz: float | None = None) -> int:
-        """Carrier frequency code: the Pulse's own freq_hz, or `carrier_hz` (the table carrier)
-        when it has none."""
+        """PLAIN carrier frequency code (the golden/pulse-table form, not a seated word): the
+        Pulse's own freq_hz, or `carrier_hz` (the table carrier) when it has none."""
         f = self.freq_hz if self.freq_hz is not None else carrier_hz
         if f is None:
             raise ValueError("Pulse has no carrier: set Pulse.freq_hz or supply a table carrier")
-        return units.freq_to_code(f, m.params)
+        return units._freq_code(f, m.params)
 
     def amp_code(self) -> int:
-        return units.amp_to_code(self.amp)
+        """PLAIN amplitude code (slot-code / golden form); load_tables seats it for the register."""
+        return units._amp_code(self.amp)
 
     def phase_code(self) -> int:
-        return units.phase_to_code(self.phase)
+        """PLAIN phase code (slot-code / golden form); load_tables seats it for the register."""
+        return units._phase_code(self.phase)

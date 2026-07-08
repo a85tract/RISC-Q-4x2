@@ -27,7 +27,7 @@ from riscq import run as rq
 from riscq.cal import fits
 from riscq.cal.base import SEP, demod_table
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
-from riscq.map import LEAD, READOUT_LEAD
+from riscq.map import LEAD, READOUT_LEAD, pack16
 from riscq.pulses import Pulse, envelopes, golden, units
 
 pytestmark = pytest.mark.cosim
@@ -103,7 +103,7 @@ def _rabi_for(m, pulse: Pulse, carrier_hz: float, target_rad: float) -> float:
     where amp_est is the model's per-batch phase-blind RMS over the bit-exact DAC golden (the same
     samples the model sees) — exactly M3's Rabi calibration, generalized to an arbitrary angle."""
     lines = pulse.packed_lines(m, 0)
-    w = golden.pulse_window(lines, pulse.amp_code(), units.freq_to_code(carrier_hz, m.params),
+    w = golden.pulse_window(lines, pulse.amp_code(), units._freq_code(carrier_hz, m.params),
                             0, 0, len(lines))
     sigma = sum(math.sqrt(2 * np.mean(row.astype(float) ** 2)) for row in w)
     return target_rad / sigma
@@ -116,7 +116,7 @@ def _sweep(cosim, prog, spec, name, points, extra=None):
     z = []
     for v in points:
         drv.sim.set_model(spec)
-        params = {name: int(v), "code": RO_CODE, **(extra or {})}
+        params = {name: int(v), "code": pack16(RO_CODE), **(extra or {})}
         out = rq.run(drv, m, {0: prog}, params={0: params}, timeout=3_000_000)[0]["out"]
         z.append(complex(float(out[0]), float(out[1])))
     return np.array(z)
@@ -129,7 +129,7 @@ def demod_cal(cosim):
     reuse it."""
     drv, m = cosim
     prog = compile_kernel(k_read, m, tables=dict(demod=demod_table(RO_DUR)),
-                          out=Array(3), code=RO_CODE)
+                          out=Array(3), code=pack16(RO_CODE))
 
     def read(phase):
         drv.sim.set_model(dict(kind="twolevel", rabi_rad_per_amp=0.0, readout_code=RO_CODE,
@@ -154,7 +154,7 @@ def _zero_model_after(cosim):
 
 def test_ramsey_oscillates_at_planted_detuning(cosim, demod_cal):
     _, m = cosim
-    f_ge_hz = units.code_to_freq(units.freq_to_code(F_DRIVE_HZ, m.params) - DETUNE_CODE, m.params)
+    f_ge_hz = units.code_to_freq(units._freq_code(F_DRIVE_HZ, m.params) - DETUNE_CODE, m.params)
     x90 = Pulse(envelopes.square(16), freq_hz=F_DRIVE_HZ, amp=0.5)     # short => little intra-pulse smear
     gate = ParamTable(0, F_DRIVE_HZ, {"x90": x90})
     rabi = _rabi_for(m, x90, F_DRIVE_HZ, math.pi / 2)

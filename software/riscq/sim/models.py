@@ -153,7 +153,7 @@ class TwoLevelModel:
         self.readout_amp = float(readout_amp)
         self.readout_phase = float(readout_phase)
         self.f_ge = float(f_ge)
-        self._f_ge_code = units.freq_to_code(self.f_ge, m.params)   # the fixed demod reference (SF16)
+        self._f_ge_code = units._freq_code(self.f_ge, m.params)   # PLAIN reference code (16-bit phase math)
         self.t1 = t1
         self.t2 = t2
 

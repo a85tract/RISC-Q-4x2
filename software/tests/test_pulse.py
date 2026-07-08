@@ -6,6 +6,7 @@ import pytest
 
 from riscq import run as rq
 from riscq.build import Program, compile_c
+from riscq.map import pack16
 from riscq.pulses import EnvelopeAllocator, Pulse
 from riscq.pulses import envelopes, golden, units
 from riscq.pulses.pack import pack_env
@@ -35,11 +36,11 @@ int main(void) {
     set_phase(ch, 0, phase_code);
     set_amp(ch, 0, amp_code);
     set_env(ch, 0, (uint32_t)env_line);
-    set_dur(ch, 0, (uint32_t)dur);
+    set_dur(ch, 0, (uint32_t)dur);   /* params arrive pre-seated in data[31:16] (spec 12) */
     uint32_t t = now() + (uint32_t)lead;
     t_fire = t;
     play(ch, 0, t);
-    wait_until(t + (uint32_t)dur + 8);
+    wait_until(t + ((uint32_t)dur >> 16) + 8);   /* dur is a seated field; batches = dur >> 16 */
     return 0;
 }
 """
@@ -60,7 +61,7 @@ int main(void) {
     uint32_t t = now() + RQ_LEAD;
     t_fire = t;
     play(RF_CH0, 0, t);
-    wait_until(t + (uint32_t)tbl[0].dur + 8);
+    wait_until(t + ((uint32_t)tbl[0].dur >> 16) + 8);   /* seated field; batches = dur >> 16 */
     return 0;
 }
 """
@@ -80,8 +81,10 @@ def _play(cosim, channel, lines, freq_code, amp_code, phase_code, lead=None,
     for core in range(1, m.params.qubit_num):
         rq.park_core(drv, m, core)
     rq.write_envelope(drv, m, 0, channel, 0, lines)
-    params = {"ch_sel": channel, "freq_code": freq_code,
-              "amp_code": amp_code, "phase_code": phase_code, "env_line": 0, "dur": dur}
+    # packed fields arrive pre-seated in data[31:16] (spec 12); ch_sel/lead are plain
+    params = {"ch_sel": channel, "freq_code": pack16(freq_code),
+              "amp_code": pack16(amp_code), "phase_code": pack16(phase_code),
+              "env_line": pack16(0), "dur": pack16(dur)}
     if lead is not None:
         params["lead"] = lead
     rq.write_params(drv, m, 0, prog, params)
@@ -159,10 +162,10 @@ def test_init_pulse_params_dac_window(cosim):
     for core in range(1, m.params.qubit_num):
         rq.park_core(drv, m, core)
     rq.write_envelope(drv, m, 0, 0, 0, lines)   # core 0, gate channel, line 0
-    rq.write_var(drv, m, 0, prog, "freq_code", f)
+    rq.write_var(drv, m, 0, prog, "freq_code", pack16(f))
     base = prog.var_addr("tbl")                          # fill tbl[0] = {phase, amp, env, dur}
-    for off, val in ((0, ph), (4, a), (8, 0), (12, dur)):
-        drv.write32(m.to_host_addr(0, base + off), val & 0xFFFFFFFF)
+    for off, val in ((0, ph), (4, a), (8, 0), (12, dur)):   # seated like load_tables (spec 12)
+        drv.write32(m.to_host_addr(0, base + off), pack16(val))
     handle = drv.sim.dac_capture_arm(m.gate_dac(0), N_CAPTURE)
     rq.reset(drv, m, on=False)
     rq.poll_done(drv, m, 0, prog, timeout=500_000)
@@ -183,7 +186,7 @@ def test_vna_freq_pin(cosim, f_code):
     sign-mishandled negative code would alias near Nyquist, which the check catches.)"""
     _, m = cosim
     lines = pack_env(envelopes.square(256), m.gate_samples_per_line)   # dur 64 batches
-    amp = units.amp_to_code(0.5)
+    amp = units._amp_code(0.5)
     t_fire, t0, cap = _play(cosim, 0, lines, f_code, amp, 0)
 
     dur, idx = len(lines), t_fire - t0
@@ -208,7 +211,7 @@ def test_lead_too_late_fails_loudly(cosim):
     """Scheduling at now()+4 (far below every queue lead) must NOT produce the exact window."""
     _, m = cosim
     lines = pack_env(envelopes.square(64), m.gate_samples_per_line)    # dur 16
-    f, a = 2048, units.amp_to_code(0.5)
+    f, a = 2048, units._amp_code(0.5)
     t_fire, t0, cap = _play(cosim, 0, lines, f, a, 0, lead=4)
     assert not _window_ok(t_fire, t0, cap, lines, f, a, 0), \
         "a lead of 4 batches produced a correctly-placed bit-exact window — LEAD test broken"
@@ -227,7 +230,7 @@ def test_lead_margin(cosim):
 
     results = {}
     for i, lead in enumerate((m.LEAD, 88, 80, 72, 64)):
-        a, ph = units.amp_to_code(0.3 + 0.05 * i), 1000 * (i + 1)
+        a, ph = units._amp_code(0.3 + 0.05 * i), 1000 * (i + 1)
         t_fire, t0, cap = _play(cosim, 0, lines, f, a, ph, lead=lead)
         results[lead] = _window_ok(t_fire, t0, cap, lines, f, a, ph)
     assert results[m.LEAD], f"LEAD={m.LEAD} did not produce an exact window: {results}"
@@ -286,7 +289,7 @@ def test_amp_scaling_pin(cosim):
     f = 1024
     peaks = {}
     for amp in (0.25, 0.5):
-        a = units.amp_to_code(amp)
+        a = units._amp_code(amp)
         t_fire, t0, cap = _play(cosim, 0, lines, f, a, 0)
         assert _window_ok(t_fire, t0, cap, lines, f, a, 0), f"amp {amp} window not bit-exact"
         peaks[amp] = int(np.abs(cap.astype(int)).max())

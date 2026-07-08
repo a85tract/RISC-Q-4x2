@@ -18,7 +18,7 @@ import pytest
 
 from riscq import run as rq
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
-from riscq.map import LEAD, READOUT_LEAD
+from riscq.map import LEAD, READOUT_LEAD, pack16
 from riscq.pulses import Pulse, envelopes, units
 
 pytestmark = pytest.mark.cosim
@@ -85,12 +85,13 @@ def test_demod_retunes_on_core(cosim):
 
     # on-core: ONE program retunes + re-plays every code
     prog = compile_kernel(k_vna_sweep, m, tables=dict(demod=_demod()),
-                          iq=Array(2 * npts), base=F, step=F, npts=npts, period=400)
+                          iq=Array(2 * npts), base=pack16(F), step=pack16(F),   # on-core seated pair (spec 12)
+                          npts=npts, period=400)
     on = _mags(rq.run(drv, m, {0: prog}, timeout=8_000_000)[0]["iq"])
 
     # host loop: one run per code (the current Separation path), same tone
     host = np.array([_mags(rq.run(drv, m, {0: compile_kernel(k_vna_one, m, tables=dict(demod=_demod()),
-                                                             out=Array(2), code=c)},
+                                                             out=Array(2), code=pack16(c))},
                                   timeout=2_000_000)[0]["out"])[0] for c in codes])
 
     print(f"\n[vna-retune] codes/F={[c // F for c in codes]}\n"

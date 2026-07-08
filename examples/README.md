@@ -21,11 +21,12 @@ flows; specs [`05-simulation`](../specs/software/05-simulation.md),
 imports — the between-experiment control flow (ordering, gating, the conditional re-run) needs no
 kernel DSL because it runs on the host.
 
-Two notebooks target **real hardware** instead of the co-sim and are therefore *not* executed in CI:
+Four notebooks target **real hardware** instead of the co-sim and are therefore *not* executed in CI:
 
 | Notebook | What it shows |
 |---|---|
 | [`remote_pulse.ipynb`](remote_pulse.ipynb) | the ZCU216 quickstart — connect to the board server with `RemoteDriver`, upload/load a gateware bundle, and fire a pulse train from an on-core `@kernel` on a real DAC. Server setup: [docs/software/board-server.md](../docs/software/board-server.md) |
+| [`readout_robs.ipynb`](readout_robs.ipynb) | fire **one** readout-drive pulse at 2.76 GHz on qubit 1's readout channel (1) on the `xm650-loopback` board and plot the SoC's readout-observation buffer (`robs`) — the raw ADC-rate trace the hardware streams (per-lane sum of the mapped ADCs) for the whole time the pulse is valid, i.e. the looped-back readout tone coming back off the DAC (folded to ~0.76 GHz at the 2 GS/s ADC). The minimal `robs` demo — one `rq.run` + one `rq.read_robs` |
 | [`vna.ipynb`](vna.ipynb) | a wideband VNA on the `xm650-loopback` board — from-scratch on-core `@kernel`s sweep the readout carrier 0.1 → 7.9 GHz (the full 8 GS/s Nyquist zone, 781 points at 10 MHz) and plot the mean shot amplitude per frequency. Two implementations, both bounded by the 16 KB core RAM: one keeps **every** shot's raw IQ (6 MB → one `rq.rerun` per frequency, 781 reruns), the other **accumulates each shot's power** `re²+im²` on-core (phase-insensitive, 1 word/point, sweeping the frequency code on-core via a wrapping-Q16 accumulator → the whole sweep in one rerun); the notebook compares their data-collection time |
 | [`iq_scatter.ipynb`](iq_scatter.ipynb) | single-shot IQ at a **fixed** 2.75 GHz on the `xm650-loopback` board — the readout drive (ch 1) plays a measurement tone, the demod carrier (ch 2, `demod_freq_to_code` = 4× the drive code, folded above its own Nyquist) returns one `(I, Q)` per shot. Records **10,000 shots** (10 reruns of 1,000 — the 16 KB core RAM caps one `out` buffer at ~2,000 words) and draws the IQ **scatter**; the blob's 1-σ spread is the readout noise floor |
 

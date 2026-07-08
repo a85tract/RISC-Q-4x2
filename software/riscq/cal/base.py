@@ -96,7 +96,7 @@ def gate_sigma(m, pulse: Pulse, carrier_hz: float, amp_code: int) -> float:
     bit-exact DAC golden — exactly what TwoLevelModel integrates, so θ = rabi_rad_per_amp·gate_sigma
     is the qubit's rotation angle. Linear in amp_code (used to convert a fitted Rabi rate)."""
     lines = pulse.packed_lines(m, 0)   # gate channel
-    w = golden.pulse_window(lines, int(amp_code), units.freq_to_code(carrier_hz, m.params),
+    w = golden.pulse_window(lines, int(amp_code), units._freq_code(carrier_hz, m.params),
                             0, 0, len(lines))
     return float(sum(math.sqrt(2 * np.mean(row.astype(float) ** 2)) for row in w))
 

@@ -74,7 +74,7 @@ def _model(rabi, f_ge=F_GE, t1=300, t2=450, noise=0.0, seed=0, collapse=False):
 def _rabi_pi(m):
     """The Rabi rate that makes the x180 amp (0.99) a π rotation."""
     return float(math.pi / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.99), F_GE,
-                                      units.amp_to_code(0.99)))
+                                      units._amp_code(0.99)))
 
 
 @pytest.fixture(scope="session")
@@ -126,9 +126,9 @@ def test_frequency_recovers_detuning(cosim, demod_phase):
     drv, m = cosim
     bind_params(m)
     rabi = float((math.pi / 2) / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5),
-                                            F_GE, units.amp_to_code(0.5)))
+                                            F_GE, units._amp_code(0.5)))
     d0_code = 60
-    drive = units.code_to_freq(units.freq_to_code(F_GE, m.params) + d0_code, m.params)   # f_ge + δ0
+    drive = units.code_to_freq(units._freq_code(F_GE, m.params) + d0_code, m.params)   # f_ge + δ0
     drv.sim.set_model(_model(rabi, t1=200, t2=3000, noise=300.0, seed=3, collapse=True))
     cfg = _cfg(m, drive, x90_amp=0.5)
     cfg["readout/0/demod_phase"] = demod_phase
@@ -168,7 +168,7 @@ def test_t2_recovers_decay(cosim, demod_phase):
     bind_params(m)
     t2 = 200
     rabi = float((math.pi / 2) / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5),
-                                            F_GE, units.amp_to_code(0.5)))
+                                            F_GE, units._amp_code(0.5)))
     drv.sim.set_model(_model(rabi, t1=400, t2=t2, noise=300.0, seed=5, collapse=True))
     cfg = _cfg(m, F_GE, x90_amp=0.5)
     cfg["readout/0/demod_phase"] = demod_phase
@@ -186,7 +186,7 @@ def test_phase_recovers_zero(cosim, demod_phase):
     drv, m = cosim
     bind_params(m)
     rabi = float((math.pi / 2) / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5),
-                                            F_GE, units.amp_to_code(0.5)))
+                                            F_GE, units._amp_code(0.5)))
     drv.sim.set_model(_model(rabi, t1=200, t2=3000, noise=300.0, seed=6, collapse=True))
     cfg = _cfg(m, F_GE, x90_amp=0.5)
     cfg["readout/0/demod_phase"] = demod_phase
@@ -305,7 +305,7 @@ def test_x6y3_improves_detuned_config(cosim):
 
     # deliberately-detuned config: qubit freq off by d0, X90 amp wrong (0.5 vs the true π/2 amp)
     d0_code = 60
-    drive = units.code_to_freq(units.freq_to_code(F_GE, m.params) + d0_code, m.params)
+    drive = units.code_to_freq(units._freq_code(F_GE, m.params) + d0_code, m.params)
     cfg = _cfg(m, drive, x90_amp=0.5)
     true_x90_amp = _true_x90_amp(m, rabi)
 

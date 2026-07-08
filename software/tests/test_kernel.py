@@ -9,7 +9,7 @@ import pytest
 import riscq.build as build
 from riscq import run as rq
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
-from riscq.map import LEAD
+from riscq.map import LEAD, pack16
 from riscq.pulses import Pulse, envelopes, golden, units
 
 pytestmark = pytest.mark.cosim
@@ -262,7 +262,7 @@ def test_amplitude_staircase_no_recompile(cosim):
     prog = compile_kernel(k_staircase, m, tables=dict(gate=gate), ts=Array(8))
     lines = pulse.packed_lines(m, 0)
     dur = len(lines)
-    f, ph = gate.freq_code(m), units.phase_to_code(pulse.phase)
+    f, ph = pulse.freq_code(m), units._phase_code(pulse.phase)
 
     def once(n, a0, da, gap=48):
         rq.reset(drv, m, on=True)
@@ -270,7 +270,9 @@ def test_amplitude_staircase_no_recompile(cosim):
         rq.check_magic(drv, m, 0, prog)
         rq.load_envelopes(drv, m, 0, prog)
         rq.load_tables(drv, m, 0, prog)
-        rq.write_params(drv, m, 0, prog, dict(n=n, a0=a0, da=da, gap=gap))
+        # a0/da are amp codes accumulated on-core (a0 + i·da); seat them so the sum lands in
+        # data[31:16] (spec 12) — the seated pair accumulates in the seated domain.
+        rq.write_params(drv, m, 0, prog, dict(n=n, a0=pack16(a0), da=pack16(da), gap=gap))
         rq.park_core(drv, m, 1)
         handle = drv.sim.dac_capture_arm(m.gate_dac(0), 3600)
         rq.reset(drv, m, on=False)
@@ -392,7 +394,7 @@ def test_retune_slot_amp_no_recompile(cosim):
     gate = ParamTable(0, 3e6, {"x90": pulse})
     prog = compile_kernel(k_fire, m, tables=dict(gate=gate), ts=Array(1))
     lines = pulse.packed_lines(m, 0)
-    dur, f, ph = len(lines), gate.freq_code(m), units.phase_to_code(pulse.phase)
+    dur, f, ph = len(lines), pulse.freq_code(m), units._phase_code(pulse.phase)
 
     def once(amp_override):
         rq.reset(drv, m, on=True)
@@ -413,8 +415,8 @@ def test_retune_slot_amp_no_recompile(cosim):
         return t_fire, t0, cap
 
     runs = build.CC_RUNS
-    for amp in (None, units.amp_to_code(0.25)):         # design 0.5, then retuned 0.25
-        want = units.amp_to_code(0.5) if amp is None else amp
+    for amp in (None, units._amp_code(0.25)):         # design 0.5, then retuned 0.25
+        want = units._amp_code(0.5) if amp is None else amp
         tf, t0, cap = once(amp)
         idx = tf - t0
         gold = golden.pulse_window(lines, want, f, ph, tf, dur)
@@ -445,7 +447,7 @@ def test_data_driven_slots_circuit(cosim):
     n = len(seq)
     prog = compile_kernel(k_circuit, m, tables=dict(gate=gate),
                           slots=Array(n, input=True), ts=Array(n))
-    f = gate.freq_code(m)
+    f = pulse.freq_code(m)
 
     rq.reset(drv, m, on=True)
     rq.load_program(drv, m, 0, prog.image)
@@ -468,8 +470,8 @@ def test_data_driven_slots_circuit(cosim):
         lines = p.packed_lines(m, 0)
         dur, idx = len(lines), ts[i] - t0
         assert 0 <= idx and idx + dur <= len(cap), f"step {i} window outside the capture"
-        gold = golden.pulse_window(lines, units.amp_to_code(p.amp), f,
-                                   units.phase_to_code(p.phase), ts[i], dur)
+        gold = golden.pulse_window(lines, units._amp_code(p.amp), f,
+                                   units._phase_code(p.phase), ts[i], dur)
         np.testing.assert_array_equal(cap[idx:idx + dur], gold,
                                       err_msg=f"step {i} ({name}) not bit-exact")
         outside[idx:idx + dur] = False

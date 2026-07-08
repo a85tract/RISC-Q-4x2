@@ -260,9 +260,11 @@ def test_spec_rabi_kernel_compiles(m):
     # ["x90"] -> slot 0
     assert "init_pulse_params(RF_CH0, gate, 2);" in c
     assert "init_pulse_params(RF_CH1, ro, 1);" in c
+    # .freq folds to the carrier as the SEATED register word (ParamTable.freq_code = freq_to_code,
+    # spec 12) — emitted raw, a one-`lui` load
     assert f"set_freq(RF_CH0, {gate_t.freq_code(m)});" in c
     assert f"set_freq(RF_CH1, {ro_t.freq_code(m)});" in c
-    assert "set_amp(RF_CH0, 0, amp);" in c
+    assert "set_amp(RF_CH0, 0, amp);" in c   # a param name emits verbatim; the host seats its value
     assert "play(RF_CH0, 0, t);" in c and "play(RF_CH1, 0," in c
 
     # both loops; #line mapping back to this file
@@ -271,9 +273,10 @@ def test_spec_rabi_kernel_compiles(m):
 
     # per-slot design-time codes for riscq.run + the per-channel envelope images
     assert set(prog.tables) == {"gate", "ro"}
+    # slot codes are stored PLAIN (load_tables seats them for the register, spec 12)
     assert prog.tables["gate"] == [
-        (units.phase_to_code(0.3), units.amp_to_code(0.5), 0, 16),   # x90: gaussian(64) -> 16 lines
-        (0, units.amp_to_code(1.0), 16, 16),                         # x180: distinct env at line 16
+        (units._phase_code(0.3), units._amp_code(0.5), 0, 16),   # x90: gaussian(64) -> 16 lines
+        (0, units._amp_code(1.0), 16, 16),                       # x180: distinct env at line 16
     ]
-    assert prog.tables["ro"] == [(0, units.amp_to_code(0.3), 0, 24)]  # probe: square(24), 1 spl
+    assert prog.tables["ro"] == [(0, units._amp_code(0.3), 0, 24)]  # probe: square(24), 1 spl
     assert set(prog.envelopes) == {0, 1}   # gate + ro channel indices

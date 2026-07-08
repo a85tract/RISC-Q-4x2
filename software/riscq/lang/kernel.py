@@ -669,6 +669,8 @@ class _FrontEnd:
         if isinstance(v, ast.Name) and v.id in self.table_params:
             tname = v.id
             if node.attr == "freq":
+                # carrier_code is already the seated register word (units.freq_to_code, spec 12), so
+                # set_freq(ch, ch.freq) emits it raw — and it loads in one `lui` (low 16 bits zero).
                 return ir.Const(self._resolve_table(node, tname).carrier_code), "int"
             if node.attr == "pulses":
                 self._err(node, f"{tname}.pulses is only valid as a call argument "
@@ -680,7 +682,7 @@ class _FrontEnd:
                 and v.value.id in self.table_params):
             rt, key = self._table_key(v, v.value.id)
             if node.attr == "freq":
-                return ir.Const(rt.carrier_code), "int"   # a pulse inherits the table carrier
+                return ir.Const(rt.carrier_code), "int"   # carrier: already the seated word (spec 12)
             idx = _SLOT_FIELD_IDX.get(node.attr)
             if idx is None:
                 self._err(node, f"unknown gate field '.{node.attr}' — one of "

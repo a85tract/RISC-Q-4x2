@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from riscq.map import SocMap, SocParams
+from riscq.map import SocMap, SocParams, pack16
 from riscq.pulses import EnvelopeAllocator, Pulse
 from riscq.pulses import envelopes, golden, units
 from riscq.pulses.envelopes import FULL
@@ -58,14 +58,16 @@ def test_square_and_arb():
 # ── units ──
 
 def test_freq_to_code_known_numbers():
-    # code = round(f * 2^16 / fs); fs = 1.6 GHz here
-    assert units.freq_to_code(0.0, M.params) == 0
-    assert units.freq_to_code(25e6, M.params) == 1024
-    assert units.freq_to_code(-50e6, M.params) == -2048
+    # _freq_code is the PLAIN code = round(f * 2^16 / fs) (fs = 1.6 GHz here); freq_to_code is the
+    # SEATED register word = pack16(plain) (spec 12).
+    assert units._freq_code(0.0, M.params) == 0
+    assert units._freq_code(25e6, M.params) == 1024
+    assert units._freq_code(-50e6, M.params) == -2048
+    assert units.freq_to_code(25e6, M.params) == pack16(1024)     # seated register word
     assert units.code_to_freq(1024, M.params) == pytest.approx(25e6)
     # a tone above Nyquist folds mod 2^16 to its negative-frequency code (49152 - 65536)
-    assert units.freq_to_code(0.75 * FS, M.params) == -16384
-    assert units.freq_to_code(0.75 * FS, M.params) == units.freq_to_code(-0.25 * FS, M.params)
+    assert units._freq_code(0.75 * FS, M.params) == -16384
+    assert units._freq_code(0.75 * FS, M.params) == units._freq_code(-0.25 * FS, M.params)
     with pytest.raises(ValueError):
         units.freq_to_code(FS, M.params)                # code 65536 == one full turn, still loud
 
@@ -75,34 +77,37 @@ def test_demod_freq_to_code_is_4x_dac():
     # so for one physical frequency the demod code is 4x the DAC's. The absolute factor is PINNED
     # by measurement in the cosim loopback test; this checks the derived relationship + roundtrip.
     for f in (25e6, -50e6, 12.5e6):
-        assert units.demod_freq_to_code(f, M.params) == 4 * units.freq_to_code(f, M.params)
-    assert units.demod_freq_to_code(25e6, M.params) == 4096
+        assert units._demod_code(f, M.params) == 4 * units._freq_code(f, M.params)
+    assert units._demod_code(25e6, M.params) == 4096
+    assert units.demod_freq_to_code(25e6, M.params) == pack16(4096)   # seated register word
     assert units.demod_code_to_freq(4096, M.params) == pytest.approx(25e6)
     # a tone above the demod's own Nyquist still folds mod 2^16 — the on-core set_freq(demod, 4*code)
     # writes the product into the same 16-bit register, so the code is 4*freq_to_code folded there.
     # (the demod band spans BATCH_SIZE/ADC_BATCH turns, so a DAC tone anywhere below fs is legal.)
     f = 0.375 * FS                                      # 1.5 demod turns -> must fold, not raise
-    fc = units.freq_to_code(f, M.params)
-    assert units.demod_freq_to_code(f, M.params) == ((4 * fc + (1 << 15)) & 0xFFFF) - (1 << 15)
-    assert units.demod_freq_to_code(f, M.params) == -(1 << 15)
+    fc = units._freq_code(f, M.params)
+    assert units._demod_code(f, M.params) == ((4 * fc + (1 << 15)) & 0xFFFF) - (1 << 15)
+    assert units._demod_code(f, M.params) == -(1 << 15)
     with pytest.raises(ValueError):
         units.demod_freq_to_code(4 * FS, M.params)      # past the demod band (16 turns), still loud
     # a frequency where rounding at the ADC rate INDEPENDENTLY lands 2 LSB (61 kHz) off 4x the DAC
     # code: the demod must track the tone the DAC actually synthesizes — its rounded code — or the
     # drive-demod offset rotates the readout phase shot to shot (the hardware iq_scatter ring).
     f = 0.30001 * FS
-    fc = units.freq_to_code(f, M.params)                 # 19661 (4x = 78644)
+    fc = units._freq_code(f, M.params)                   # 19661 (4x = 78644)
     assert round(f * (1 << 16) / (FS / 4)) == 78646      # what an independent round would give
-    assert units.demod_freq_to_code(f, M.params) == ((4 * fc + (1 << 15)) & 0xFFFF) - (1 << 15) == 13108
+    assert units._demod_code(f, M.params) == ((4 * fc + (1 << 15)) & 0xFFFF) - (1 << 15) == 13108
 
 
 def test_phase_to_code():
-    assert units.phase_to_code(0.0) == 0
-    assert units.phase_to_code(np.pi / 2) == 1 << 14
-    assert units.phase_to_code(np.pi) == -(1 << 15)     # +pi wraps to the -pi code
-    assert units.phase_to_code(-np.pi) == -(1 << 15)
-    assert units.phase_to_code(2 * np.pi) == 0
-    assert units.phase_to_code(5 * np.pi / 2) == units.phase_to_code(np.pi / 2)
+    # _phase_code is the PLAIN code; phase_to_code is the SEATED register word (spec 12)
+    assert units._phase_code(0.0) == 0
+    assert units._phase_code(np.pi / 2) == 1 << 14
+    assert units._phase_code(np.pi) == -(1 << 15)       # +pi wraps to the -pi code
+    assert units._phase_code(-np.pi) == -(1 << 15)
+    assert units._phase_code(2 * np.pi) == 0
+    assert units._phase_code(5 * np.pi / 2) == units._phase_code(np.pi / 2)
+    assert units.phase_to_code(np.pi / 2) == pack16(1 << 14)   # seated register word
 
 
 def test_amp_to_code_pinned_scale():
@@ -110,9 +115,10 @@ def test_amp_to_code_pinned_scale():
     # full scale (the same constant the hardware derives for its phasor magnitude).
     assert golden.AMP_SCALE == 19896 == golden.PHASOR_MAG
     assert golden.K_CORDIC == pytest.approx(1.6467602581, abs=1e-9)
-    assert units.amp_to_code(1.0) == 19896
-    assert units.amp_to_code(0.5) == 9948
-    assert units.amp_to_code(0.0) == 0
+    assert units._amp_code(1.0) == 19896            # the plain code (the scale pin)
+    assert units._amp_code(0.5) == 9948
+    assert units._amp_code(0.0) == 0
+    assert units.amp_to_code(0.5) == pack16(9948)   # the seated register word (spec 12)
     with pytest.raises(ValueError):
         units.amp_to_code(1.01)
 
@@ -179,7 +185,8 @@ def test_paramtable_slot_of_and_freq():
                            "x180": Pulse(envelopes.gaussian(64, 3.0), amp=1.0)})
     assert t.slot_of("x90") == 0 and t.slot_of("x180") == 1   # dict insertion order
     assert t.channel == 0
-    assert t.freq_code(M) == units.freq_to_code(25e6, M.params) == 1024
+    # the table carrier folds to the SEATED register word (spec 12) = freq_to_code = pack16(1024)
+    assert t.freq_code(M) == units.freq_to_code(25e6, M.params) == pack16(1024)
     with pytest.raises(KeyError):
         t.slot_of("nope")
 

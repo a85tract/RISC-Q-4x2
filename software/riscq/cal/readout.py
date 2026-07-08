@@ -152,7 +152,7 @@ class Separation:
         m = socmap(drv); bind_params(m)
         cfg, q = self.cfg, self.q
         ro, demod, _, dur = readout_tables(cfg, q)
-        c0 = units.freq_to_code(float(cfg[f"readout/{q}/freq"]), m.params)      # DAC-rate center code
+        c0 = units._freq_code(float(cfg[f"readout/{q}/freq"]), m.params)        # DAC-rate center code (plain, for sweep)
         c0q, dcq, xs = sweep_q16(c0 - self.span_code, c0 + self.span_code, self.points)  # on-core sweep
         npts = self.points
         period = grid_period(self.relax, 0, dur)                               # no qubit prep; idle head

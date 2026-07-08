@@ -5,8 +5,9 @@ a loop on the core, not a host loop of short runs (the design of record, README 
 
 Every swept knob is an affine sequence (`x_i = x0 + i·dx`), so the kernel COMPUTES it on-core instead
 of walking a host-preloaded input Array (spec 09): code knobs (amp/freq codes) accumulate a Q16 pair
-`(x0q, dxq)` and use `xq >> 16`; time/phase knobs accumulate a plain int pair. `out` is the only Array
-left. The knob advance sits at the END of the point: rows realize `[x0, x0+dx, x0+2dx, ...]`. There is
+`(x0q, dxq)` written to the register RAW — the integer code sits in `data[31:16]`, the low fraction
+is ignored by hardware (spec 12), so there is no `>> 16` extraction; time/phase knobs accumulate a
+plain int pair (phase pre-seated by the host). `out` is the only Array left. The knob advance sits at the END of the point: rows realize `[x0, x0+dx, x0+2dx, ...]`. There is
 no warm-up row — the cold-first-read guard it once absorbed was root-caused and retired (spec 11).
 
 Every shot fires on a fixed `period` grid whose idle head is the T1 relax reset (the model has no
@@ -39,7 +40,8 @@ RAW = 1
 @kernel
 def k_rabi(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts: int, shots: int,
            period: int, ngates: int, code: int, mode: int, a0q: int, daq: int, prep: int):
-    """Batched Rabi: sweep the X90 amplitude on-core (Q16 pair a0q/daq; realized code = aq >> 16),
+    """Batched Rabi: sweep the X90 amplitude on-core (Q16 pair a0q/daq; realized code = aq >> 16,
+    written raw — spec 12),
     `shots` shots/point on a fixed grid. `prep` gates the drive; the n-gate train is one `play` + N-1
     bare `fire`s (B0 startTime auto-advance). COUNTS → out[i] += classified bit; RAW → per-shot IQ
     (out sized 2·npts·shots), cursor k."""
@@ -55,7 +57,8 @@ def k_rabi(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts
     if mode == RAW:
         k = 0
     for i in range(npts):
-        set_amp(gate, gate["x90"], aq >> 16)  # noqa: F821  realized amp code, computed on-core
+        set_amp(gate, gate["x90"], aq)  # noqa: F821  raw Q16 accumulator: integer amp code sits in
+        #                                              data[31:16], the fraction is ignored by HW (spec 12)
         for s in range(shots):
             if prep == 1:
                 play(gate, gate["x90"], t_ro - SEP - ngates * d)  # noqa: F821  first gate of the train
@@ -80,8 +83,9 @@ def k_ramsey(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, np
              period: int, code: int, mode: int, w0: int, dw: int, p0: int, dp: int):
     """Batched Ramsey (covers Frequency / Phase / T2): per point X90 — wait w — virtual-Z(phi) — X90,
     `shots` shots/point on a fixed grid (`period` sized for the longest wait). The wait (w0/dw,
-    batches) and the virtual-Z phase (p0/dp, code) are computed on-core; the virtual-Z is a channel
-    phaseOffset (B1), so the calibrated x90 table phase is UNTOUCHED. Same COUNTS/RAW fold as
+    batches) is computed on-core; the virtual-Z phase (p0/dp) is a host-pre-seated pair accumulated
+    in the seated domain (spec 12) — the virtual-Z is a channel phaseOffset (B1), so the calibrated
+    x90 table phase is UNTOUCHED. Same COUNTS/RAW fold as
     k_rabi."""
     init_pulse_params(demod.pulses)  # noqa: F821
     set_freq(demod, code)  # noqa: F821
@@ -156,8 +160,9 @@ def k_t1(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts: 
 def k_vna(ro: ParamTable, demod: ParamTable, out: Array, npts: int, shots: int, period: int,
           sh: int, c0q: int, dcq: int):
     """Batched VNA (Separation) in iqsum mode: retune the readout drive and demod as a MATCHED PAIR
-    (`set_freq(ro, c)` + `set_freq(demod, 4*c)`, the ADC code is 4× the DAC code) over an on-core Q16
-    frequency sweep (c0q/dcq; realized code c = cq >> 16) and coherently sum `shots` per-point IQ
+    (`set_freq(ro, cq)` raw Q16 + `set_freq(demod, (4*c)<<16)`, the ADC code is 4× the DAC code seated
+    into data[31:16] — spec 12) over an on-core Q16 frequency sweep (c0q/dcq; realized code
+    c = cq >> 16) and coherently sum `shots` per-point IQ
     integrals (>> sh headroom). No qubit prep — a |0> readout sweep. The retune is scheduled a full
     `period` (≫ LEAD) ahead of its play (spec 08 §2.2, B1)."""
     init_pulse_params(demod.pulses)  # noqa: F821
@@ -167,8 +172,8 @@ def k_vna(ro: ParamTable, demod: ParamTable, out: Array, npts: int, shots: int, 
     j = 0
     for i in range(npts):
         c = cq >> 16
-        set_freq(ro, c)  # noqa: F821         DAC-rate drive code
-        set_freq(demod, 4 * c)  # noqa: F821  ADC-rate demod code (matched pair)
+        set_freq(ro, cq)  # noqa: F821          raw Q16 accumulator: DAC code in data[31:16] (spec 12)
+        set_freq(demod, (4 * c) << 16)  # noqa: F821  ADC code = 4x the rounded DAC code, seated (spec 12)
         for s in range(shots):
             play(ro, ro["meas"], t_ro)  # noqa: F821
             play(demod, demod["sq"], t_ro)  # noqa: F821
