@@ -5,27 +5,24 @@ software (`riscq.lang`/`riscq.run` to compile and run on-core kernels, `riscq.ca
 the calibrations) that runs on the ZCU216 board, here against a Verilated SoC instead of real
 hardware.
 
-Start with [`amplitude_sweep.ipynb`](amplitude_sweep.ipynb) — a minimal drive demo — then the two
-calibration notebooks, which run against a `TwoLevelModel` with **planted ground truth** instead of
-a real qubit (co-sim analogues of the hardware `Calibration_X6Y3` and `single_qubit_autocalibrate_v2`
-flows; specs [`05-simulation`](../specs/software/05-simulation.md),
+Start with [`amplitude_sweep.ipynb`](amplitude_sweep.ipynb) — a minimal drive demo — then the
+calibration notebook, which runs against a `TwoLevelModel` with **planted ground truth** instead of
+a real qubit (a co-sim analogue of the hardware `Calibration_X6Y3` flow; specs
+[`05-simulation`](../specs/software/05-simulation.md),
 [`06-calibrations`](../specs/software/06-calibrations.md)).
 
 | Notebook | What it shows |
 |---|---|
 | [`amplitude_sweep.ipynb`](amplitude_sweep.ipynb) | the smallest end-to-end example — an on-core `@kernel` fires a train of gate pulses with a ramping amplitude; the notebook captures the raw gate **DAC waveform** off the SoC and plots the pulse train, the pulse shape, and the (linear) peak-vs-amplitude. No qubit model — just the drive signal the hardware emits |
 | [`single_qubit_calibration.ipynb`](single_qubit_calibration.ipynb) | the `Calibration_X6Y3` flow, one experiment per cell — ReadoutCalibration → Separation → Fidelity → ReadoutFidelity → Frequency → Amplitude (coarse) → Amplitude (fine) → Phase — pulling a deliberately-detuned `Config` back to the planted `f_ge`/Rabi ground truth |
-| [`single_qubit_autocalibrate.ipynb`](single_qubit_autocalibrate.ipynb) | the `single_qubit_autocalibrate_v2` flow via [`autocal.py`](autocal.py): spectroscopy → Ramsey (frequency) → Rabi (amplitude) → T1, with an `expts_to_run` gating dict, incremental frequency updates, and the automatic **Ramsey-after-Amplitude re-run** (AC-Stark) rule |
+| [`calibration_x6y3_cosim.ipynb`](calibration_x6y3_cosim.ipynb) | the full **qcal-parity** version of the same chain (spec 13): the config of record is a qcal tree ([`calibration_x6y3_cosim.yaml`](calibration_x6y3_cosim.yaml)) round-tripped through `Config.from_qcal`/`save_qcal` every cell, `readout/herald: true` (every counts shot post-selected like qcal's transpiler), **both** cores calibrated simultaneously on the frequency-multiplexed readout, plus the reference notebook's per-qubit Phase loop and absolute pass |
 
-[`autocal.py`](autocal.py) is the plain host-python autocalibration **script** the second notebook
-imports — the between-experiment control flow (ordering, gating, the conditional re-run) needs no
-kernel DSL because it runs on the host.
-
-Four notebooks target **real hardware** instead of the co-sim and are therefore *not* executed in CI:
+Five notebooks target **real hardware** instead of the co-sim and are therefore *not* executed in CI:
 
 | Notebook | What it shows |
 |---|---|
 | [`remote_pulse.ipynb`](remote_pulse.ipynb) | the ZCU216 quickstart — connect to the board server with `RemoteDriver`, upload/load a gateware bundle, and fire a pulse train from an on-core `@kernel` on a real DAC. Server setup: [docs/software/board-server.md](../docs/software/board-server.md) |
+| [`calibration_x6y3.ipynb`](calibration_x6y3.ipynb) | the hardware `Calibration_X6Y3.ipynb` (qcal + QubiC) reproduced step-for-step on the real X6Y3 chip: the real qcal tree ([`cal-config-x6y3.yaml`](cal-config-x6y3.yaml)) through `Config.from_qcal`, all 8 qubits, the reference's exact knobs (± 2.5 MHz Separation, ± 0.005 readout-amp Fidelity, ± 2.5/± 5 MHz Ramsey detunings, coarse + relative-fine Amplitude, per-qubit + absolute Phase), heralded throughout. Its co-sim twin above is the CI-verified reference for every code path |
 | [`readout_robs.ipynb`](readout_robs.ipynb) | fire **one** readout-drive pulse at 2.76 GHz on qubit 1's readout channel (1) on the `xm650-loopback` board and plot the SoC's readout-observation buffer (`robs`) — the raw ADC-rate trace the hardware streams (per-lane sum of the mapped ADCs) for the whole time the pulse is valid, i.e. the looped-back readout tone coming back off the DAC (folded to ~0.76 GHz at the 2 GS/s ADC). The minimal `robs` demo — one `rq.run` + one `rq.read_robs` |
 | [`vna.ipynb`](vna.ipynb) | a wideband VNA on the `xm650-loopback` board — from-scratch on-core `@kernel`s sweep the readout carrier 0.1 → 7.9 GHz (the full 8 GS/s Nyquist zone, 781 points at 10 MHz) and plot the mean shot amplitude per frequency. Two implementations, both bounded by the 16 KB core RAM: one keeps **every** shot's raw IQ (6 MB → one `rq.rerun` per frequency, 781 reruns), the other **accumulates each shot's power** `re²+im²` on-core (phase-insensitive, 1 word/point, sweeping the frequency code on-core via a wrapping-Q16 accumulator → the whole sweep in one rerun); the notebook compares their data-collection time |
 | [`iq_scatter.ipynb`](iq_scatter.ipynb) | single-shot IQ at a **fixed** 2.75 GHz on the `xm650-loopback` board — the readout drive (ch 1) plays a measurement tone, the demod carrier (ch 2, `demod_freq_to_code` = 4× the drive code, folded above its own Nyquist) returns one `(I, Q)` per shot. Records **10,000 shots** (10 reruns of 1,000 — the 16 KB core RAM caps one `out` buffer at ~2,000 words) and draws the IQ **scatter**; the blob's 1-σ spread is the readout noise floor |
@@ -42,7 +39,6 @@ Execute one headless (this is exactly what CI does):
 ```bash
 jupyter nbconvert --to notebook --execute --inplace examples/amplitude_sweep.ipynb
 jupyter nbconvert --to notebook --execute --inplace examples/single_qubit_calibration.ipynb
-jupyter nbconvert --to notebook --execute --inplace examples/single_qubit_autocalibrate.ipynb
 ```
 
 or open them interactively:
@@ -51,8 +47,11 @@ or open them interactively:
 jupyter lab examples/
 ```
 
-Each notebook takes roughly 2–3 minutes headless (deliberately small sweep point/shot counts — the
-point is convergence to known truth, not fine sweeps).
+`amplitude_sweep.ipynb` runs in a couple of minutes. `single_qubit_calibration.ipynb` is slower
+(~30 min headless) and `calibration_x6y3_cosim.ipynb` slower again (~60 min: two qubits, heralded
+shots, three Phase passes): the readout-classifier cals need a long idle reset between shots
+(`relax ≫ T1`) so the `|0⟩`/`|1⟩` clusters separate under the qcal SNR metric — the point is
+convergence to known truth, not speed.
 
 ## Requirements
 

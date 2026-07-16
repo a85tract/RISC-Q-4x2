@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from riscq import run as rq
-from riscq.cal.base import SEP, bind_params, gate_sigma
+from riscq.cal.base import SEP, gate_sigma
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
 from riscq.map import LEAD, READOUT_LEAD, pack16
 from riscq.pulses import Pulse, envelopes, units
@@ -99,7 +99,6 @@ def _zero_after(cosim):
 
 def test_projective_bimodal_binomial(cosim):
     drv, m = cosim
-    bind_params(m)
     gate, ro, demod = _tables(m)
 
     # calibrate the model so the X90 rotates by exactly π/2 (→ bz=0), and the demod phase lands |0> on +real

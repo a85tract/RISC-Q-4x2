@@ -36,13 +36,19 @@ def test_drag():
     assert np.abs(d).max() == pytest.approx(FULL)
 
 
-def test_cos_edge_square():
-    e = envelopes.cos_edge_square(40, 0.25)
-    assert e[0] == 0 and e[20] == FULL and e[-1] == 0
-    assert np.allclose(e, e[::-1])
-    assert np.allclose(envelopes.cos_edge_square(16, 0.0), envelopes.square(16))
+def test_cosine_square():
+    """qcal's ramp convention (spec 13 Q0): each edge is n_ramp = round(n*ramp_fraction) samples of
+    (1 − cos(pi*k/n_ramp))/2 — the rising edge starts at 0, the flat top is FULL, and the falling edge
+    is the second half of the same cosine, so its LAST sample sits one step short of zero."""
+    e = envelopes.cosine_square(40, 0.25)
+    assert e[0] == 0 and e[20] == FULL
+    assert 0 < abs(e[-1]) < 0.05 * FULL                        # the edge closes one sample after the end
+    assert (np.diff(abs(e[:10])) > 0).all() and (np.diff(abs(e[-10:])) < 0).all()   # ramps up, ramps down
+    assert abs(e[10:30]) == pytest.approx(FULL)                # flat top of n − 2*n_ramp samples
+    assert np.allclose(envelopes.cosine_square(16, 0.0), envelopes.square(16))
+    assert envelopes.cos_edge_square is envelopes.cosine_square     # the old name still resolves
     with pytest.raises(ValueError):
-        envelopes.cos_edge_square(10, 0.6)
+        envelopes.cosine_square(10, 0.6)
 
 
 def test_square_and_arb():

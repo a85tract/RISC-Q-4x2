@@ -111,9 +111,46 @@ def fit_parabola(x, y) -> Fit:
     return Fit(True, vertex, math.sqrt(var) if var > 0 else math.nan, params)
 
 
+def fit_absolute_value(x, y) -> Fit:
+    """y ≈ a·|x − b| + c — qcal's V-fit (`FitAbsoluteValue`, fit_functions.absolute_value). value = b,
+    the vertex: Frequency fits the UNSIGNED fringe frequencies |δ + applied| against the applied
+    detuning, so the V bottoms out where the applied detuning cancels the config's error.
+
+    Seeded from the data (qcal seeds a=1, b=0, c=0, which only works because its x is in Hz and the
+    slope is then ≈1): the vertex at the extreme y, c that y, a the least-squares slope about it. BOTH
+    orientations are seeded — a V (vertex at min y) and a Λ (at max y) — and the lower-SSR fit wins:
+    the caller's negative-curvature guard (`a < 0` → fail, qcal's) can only be honest if the fit is
+    able to land on an inverted V at all."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+
+    def model(t, a, b, c):
+        return a * np.abs(t - b) + c
+
+    best = None
+    for sgn in (1.0, -1.0):
+        i = int(np.argmin(y)) if sgn > 0 else int(np.argmax(y))
+        b0, c0 = float(x[i]), float(y[i])
+        u = np.abs(x - b0)
+        denom = float(np.sum(u * u))
+        a0 = float(np.sum((y - c0) * u) / denom) if denom else sgn
+        try:
+            popt, pcov = curve_fit(model, x, y, p0=[a0 or sgn, b0, c0], maxfev=20000)
+        except _FAIL:
+            continue
+        ssr = float(np.sum((y - model(x, *popt)) ** 2))
+        if np.all(np.isfinite(popt)) and (best is None or ssr < best[0]):
+            best = (ssr, popt, np.sqrt(np.diag(pcov)))
+    if best is None:
+        return _NONE
+    _, (a, b, c), perr = best
+    ok = bool(np.all(np.isfinite(perr)))
+    return Fit(ok, float(b), float(perr[1]), {"a": a, "b": b, "c": c})
+
+
 def fit_linear(x, y) -> Fit:
     """y ≈ slope·x + intercept. value = slope; params carry the x-intercept (`root`, where y = 0)
-    for the Phase/Frequency crossing fits."""
+    for the Phase/Frequency crossing fits, and the unweighted reduced chi-squared (`redchi` =
+    SSR/(N−2)) that qcal's underfitting guard tests (`FitLinear.error > 10`, spec 13 §6)."""
     x, y = np.asarray(x, float), np.asarray(y, float)
     try:
         with warnings.catch_warnings():
@@ -122,7 +159,9 @@ def fit_linear(x, y) -> Fit:
     except (np.linalg.LinAlgError, *_FAIL):
         return _NONE
     ok = bool(np.all(np.isfinite([slope, intercept])) and np.all(np.isfinite(cov)) and slope != 0)
-    params = {"slope": slope, "intercept": intercept}
+    ssr = float(np.sum((y - (slope * x + intercept)) ** 2))
+    params = {"slope": slope, "intercept": intercept,
+              "redchi": ssr / (len(x) - 2) if len(x) > 2 else math.inf}
     if slope != 0:
         params["root"] = -intercept / slope
     return Fit(ok, slope, math.sqrt(cov[0, 0]) if np.isfinite(cov[0, 0]) else math.nan, params)
