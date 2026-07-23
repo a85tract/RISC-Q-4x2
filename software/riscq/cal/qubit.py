@@ -30,13 +30,14 @@ import numpy as np
 
 from riscq import run as rq
 from riscq.cal import fits, kernels
-from riscq.cal.base import (SEP, Result, batch_timeout, batches, gate_pulse, gate_sigma, grid_period,
-                            herald_offset, heralding, population, population_heralded, prep,
-                            qubit_freq, qubits_list, readout_tables, relax_batches, res_sign, seconds,
-                            socmap, sweep_counts, sweep_q16, x90_vz)
+from riscq.cal.base import (GATE_CH, SEP, Result, batch_timeout, batches, ef_pulse, ef_table,
+                            gate_pulse, gate_sigma, grid_period, herald_offset, heralding, population,
+                            population_heralded, prep, qubit_freq, qubits_list, readout_tables,
+                            relax_batches, rerun_levels, res_sign, seconds, socmap, sweep_counts,
+                            sweep_levels, sweep_q16, train_step, x90_vz)
 from riscq.lang import Array, ParamTable, compile_kernel
-from riscq.map import pack16
-from riscq.pulses import units
+from riscq.map import LEAD, pack16
+from riscq.pulses import Pulse, units
 
 TWO_PI = 2 * math.pi
 PERIOD_FRAC = {"X90": 0.25, "X": 0.5}    # qcal: the fraction of a Rabi period the gate rotates
@@ -112,13 +113,14 @@ class Amplitude:
             lo, hi = units._amp_code(span[0]), units._amp_code(span[1])
             a0q, daq, xs = sweep_q16(lo, hi, self.points)             # on-core Q16 sweep + exact x-axis
             d = pulse.dur_batches(m, table.channel)
-            seq = self.n_gates * d
+            step = train_step(d)                       # the paced train grid (spec 14 F1)
+            seq = (self.n_gates - 1) * step + d        # the last gate ends a clean SEP before t_ro
             period = grid_period(relax_batches(cfg, m), seq, dur, ddly, herald=herald)
             hoff = herald_offset(seq, ddly) if herald else 0
             progs[q] = compile_kernel(kernels.k_rabi, m, tables=dict(gate=table, ro=ro, demod=demod),
                                       out=Array(2 * self.points if herald else self.points),
                                       npts=self.points, shots=self.shots,
-                                      period=period, ngates=self.n_gates, code=code,
+                                      period=period, ngates=self.n_gates, step=step, code=code,
                                       mode=kernels.COUNTS, ddly=ddly, prep_gate=pg,
                                       herald=int(herald), hoff=hoff, **x90_vz(cfg, q))
             params[q] = {"a0q": int(a0q), "daq": int(daq), "prep": 1}
@@ -272,6 +274,45 @@ def _phase_sweep(lo: float, hi: float, n: int) -> tuple[int, int, np.ndarray]:
     return c0, dc, codes * math.pi / (1 << 15)
 
 
+def _line_crossing(x, p_y, p_x, chi2_max):
+    """qcal Phase's two-line crossing (spec 13 §6), shared by the GE and EF Phase cals: linear-fit
+    the two sequences' populations and cross them at phi = (b1 − b0)/(m0 − m1), with qcal's guards —
+    a failed fit or an out-of-range crossing fails (no write, README principle 6); an underfit
+    (reduced chi2 > `chi2_max`) falls back to the argmin of (p_y − p_x)² over the grid. Returns
+    ((fit_y, fit_x), phi, fallback, ok), phi = nan when not ok."""
+    f_y, f_x = fits.fit_linear(x, p_y), fits.fit_linear(x, p_x)
+    if f_y.ok and f_x.ok:
+        m0, b0 = f_y.params["slope"], f_y.params["intercept"]
+        m1, b1 = f_x.params["slope"], f_x.params["intercept"]
+        phi = (b1 - b0) / (m0 - m1) if m0 != m1 else math.nan
+        if x[0] <= phi <= x[-1]:                       # in range (qcal's `in_range`)
+            if max(f_y.params["redchi"], f_x.params["redchi"]) > chi2_max:
+                return (f_y, f_x), float(x[int(np.argmin((p_y - p_x) ** 2))]), True, True
+            return (f_y, f_x), float(phi), False, True
+    return (f_y, f_x), math.nan, False, False
+
+
+def _cosine_axis(x, y, centre):
+    """qcal Phase(gate='X')'s cosine fit (spec 14 §3.3), shared by the GE and EF X-phase cals. The
+    `X90 · X · X90` population is A·cos(2π·f·phi + ϑ) + C (fit_cosine canonicalises A ≥ 0), MINIMAL
+    at (π − ϑ)/(2π·f) — the aligned axis, since the composite only returns to the prepared level
+    there. The fringe runs at TWICE the swept axis (a π rotation's axis enters a Bloch rotation as
+    2φ), so its period is π and the two solutions a period apart are the same gate
+    (R_{φ+π}(π) = −R_φ(π)): take the one nearest the sweep `centre` so an already-calibrated qubit
+    does not jump. qcal's guards follow the line-crossing ones — a failed fit or an out-of-range
+    solution fails (no write) and falls back to the grid argmin. Returns (fit, phi, fallback, ok)."""
+    f = fits.fit_cosine(x, y)
+    phi, ok = 0.0, bool(f.ok and f.params["freq"] > 0)
+    if ok:
+        per = 1.0 / f.params["freq"]
+        base = (math.pi - f.params["phase"]) / (2 * math.pi * f.params["freq"])
+        phi = base - round((base - centre) / per) * per
+    ok = ok and bool(x[0] <= phi <= x[-1])                  # qcal's in_range guard
+    if not ok:                                              # ... and its argmin fallback
+        return f, float(x[int(np.argmin(y))]), True, False
+    return f, float(phi), False, True
+
+
 class Phase:
     """X90 virtual-Z (Stark) phase calibration — qcal's line crossing (spec 13 §6,
     single_qubit.py:862-1088). An X90 that drives the qubit also ac-Stark-shifts it, so the pulse
@@ -291,23 +332,43 @@ class Phase:
     a crossing outside the swept range fails (ok=False, no proposal — we do not update on a failed
     fit, README principle 6), and an underfit (reduced chi2 > 10, qcal's `FitLinear.error > 10`) falls
     back to the argmin of (P0 - P1)^2 over the grid. NOTE: with unweighted populations in [0, 1] the
-    reduced chi2 is SSR/(N-2) << 1, so that threshold is as good as unreachable — in qcal too."""
+    reduced chi2 is SSR/(N-2) << 1, so that threshold is as good as unreachable — in qcal too.
+
+    `gate='X'` calibrates the OTHER pulse and the OTHER knob (qcal's second Phase mode, spec 14 §3.3):
+    one circuit, `X90 · X · X90`, over the X's own AXIS phase (`qubit/{q}/x/phase`, the FAST_DRAG's
+    `phase` — not a virtual-Z pair; the X6Y3 X carries none). The three pulses make a 2π rotation that
+    returns to |0> only when the X sits on the X90s' axis, so P(1) is cosinusoidal in the swept axis
+    and the calibrated phase is its MINIMUM (qcal fits the same cosine to P(0) − P(1) and takes the
+    maximum). The default sweep is a full turn, as in the reference notebook."""
 
     CHI2_MAX = 10.0             # qcal's underfitting guard (single_qubit.py:1067)
 
-    def __init__(self, cfg, qubits, points=21, span=0.25, shots=120, relative_phase=False):
-        self.cfg, self.qubits = cfg, qubits_list(qubits)
-        self.points, self.span = int(points), float(span)
+    def __init__(self, cfg, qubits, gate="X90", points=21, span=None, shots=120,
+                 relative_phase=False):
+        assert gate in ("X90", "X"), f"Phase calibrates 'X90' or 'X', got {gate!r}"
+        self.cfg, self.qubits, self.gate = cfg, qubits_list(qubits), gate
+        self.points = int(points)
+        self.span = float(math.pi if span is None and gate == "X" else 0.25 if span is None else span)
         self.shots, self.relative_phase = int(shots), bool(relative_phase)
         self.data, self.fit, self.recovered_vz, self.fallback = {}, {}, {}, {}
 
+    def _centre(self, cfg, q) -> float:
+        """The sweep's centre: qcal's `relative_phase` re-centres on the knob's CURRENT value."""
+        if not self.relative_phase:
+            return 0.0
+        if self.gate == "X":
+            return float(cfg.get(f"qubit/{q}/x/phase", 0.0))
+        return float(cfg.get(f"qubit/{q}/x90/vz", [0.0, 0.0])[0])
+
     def run(self, drv) -> Result:
+        if self.gate == "X":
+            return self._run_x(drv)
         m = socmap(drv)
         cfg = self.cfg
         herald = heralding(cfg)
         axis, signs = {}, {}
         for q in self.qubits:
-            centre = float(cfg.get(f"qubit/{q}/x90/vz", [0.0, 0.0])[0]) if self.relative_phase else 0.0
+            centre = self._centre(cfg, q)
             axis[q] = _phase_sweep(centre - self.span, centre + self.span, self.points)
             signs[q] = res_sign(cfg, q)
         pops = {}                                              # seq -> {q: P}
@@ -325,7 +386,7 @@ class Phase:
                                           out=Array(2 * self.points if herald else self.points),
                                           npts=self.points, shots=self.shots,
                                           period=period, code=code, ddly=ddly, seq=seq,
-                                          hpi=pack16(units._phase_code(math.pi / 2)),
+                                          hpi=pack16(units._phase_code(math.pi / 2)), vz0=0, vzsum=0,
                                           herald=int(herald), hoff=hoff)
                 p0, dp, _ = axis[q]
                 par[q] = {"p0": pack16(p0), "dp": pack16(dp)}   # the swept virtual-Z, host-seated (spec 12)
@@ -336,28 +397,58 @@ class Phase:
         for q in self.qubits:
             _, _, x = axis[q]
             p_y, p_x = pops[kernels.Y180_X90][q], pops[kernels.X180_Y90][q]   # Y180_X90, X180_Y90
-            diff2 = (p_y - p_x) ** 2                            # qcal's sweep_results (the argmin metric)
-            f_y, f_x = fits.fit_linear(x, p_y), fits.fit_linear(x, p_x)
-            data[q] = {"x": x, "y": diff2, "p0": p_y, "p1": p_x}
-            fit_out[q] = (f_y, f_x)
-            self.fallback[q], self.recovered_vz[q] = False, math.nan
-            ok, prop = False, {}
-            if f_y.ok and f_x.ok:
-                m0, b0 = f_y.params["slope"], f_y.params["intercept"]
-                m1, b1 = f_x.params["slope"], f_x.params["intercept"]
-                phi = (b1 - b0) / (m0 - m1) if m0 != m1 else math.nan
-                if x[0] <= phi <= x[-1]:                       # in range (qcal's `in_range`)
-                    if max(f_y.params["redchi"], f_x.params["redchi"]) > self.CHI2_MAX:
-                        phi = float(x[int(np.argmin(diff2))])  # underfit → qcal's argmin fallback
-                        self.fallback[q] = True
-                    self.recovered_vz[q] = float(phi)
-                    v = self.recovered_vz[q]
-                    prop = {f"qubit/{q}/x90/vz": [v, v]}       # qcal: ONE crossing, BOTH slots
-                    ok = True
+            data[q] = {"x": x, "y": (p_y - p_x) ** 2, "p0": p_y, "p1": p_x}   # qcal's argmin metric
+            fit_out[q], phi, self.fallback[q], ok = _line_crossing(x, p_y, p_x, self.CHI2_MAX)
+            self.recovered_vz[q] = phi
             oks[q] = ok
-            proposal.update(prop)
+            if ok:
+                proposal[f"qubit/{q}/x90/vz"] = [phi, phi]     # qcal: ONE crossing, BOTH slots
         self.data, self.fit = data, fit_out
         return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Phase {self.qubits}")
+
+    def _run_x(self, drv) -> Result:
+        """gate='X': one X90 · X · X90 run, cosine-fitted; the X's axis phase is the fringe MINIMUM."""
+        m = socmap(drv)
+        cfg = self.cfg
+        herald = heralding(cfg)
+        progs, par, signs, axis = {}, {}, {}, {}
+        timeout = 0
+        for q in self.qubits:
+            centre = self._centre(cfg, q)
+            axis[q] = _phase_sweep(centre - self.span, centre + self.span, self.points)
+            signs[q] = res_sign(cfg, q)
+            x90 = gate_pulse(cfg, q, m)                 # keeps its own axis phase: the reference
+            xp = gate_pulse(cfg, q, m, "x")
+            # the swept phi REPLACES the X's stored axis (qcal writes the pulse's own phase kwarg),
+            # so the slot is built at 0 and the on-core phase offset carries the whole axis
+            table = ParamTable(0, qubit_freq(cfg, q),
+                               {"x90": x90, "x": Pulse(xp.env, freq_hz=xp.freq_hz, amp=xp.amp)})
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            d = table.pulses["x90"].dur_batches(m, table.channel)
+            xd = table.pulses["x"].dur_batches(m, table.channel)
+            period = grid_period(relax_batches(cfg, m), 2 * d + xd, dur, ddly, herald=herald)
+            hoff = herald_offset(2 * d + xd, ddly) if herald else 0
+            progs[q] = compile_kernel(kernels.k_phase, m, tables=dict(gate=table, ro=ro, demod=demod),
+                                      out=Array(2 * self.points if herald else self.points),
+                                      npts=self.points, shots=self.shots, period=period, code=code,
+                                      ddly=ddly, seq=kernels.X90_X_X90,
+                                      hpi=pack16(units._phase_code(math.pi / 2)),
+                                      herald=int(herald), hoff=hoff, **x90_vz(cfg, q))
+            p0, dp, _ = axis[q]
+            par[q] = {"p0": pack16(p0), "dp": pack16(dp)}
+            timeout = max(timeout, batch_timeout(self.points * self.shots * period))
+        P = sweep_counts(drv, m, progs, par, self.shots, timeout, signs, herald=herald)
+
+        data, fit_out, proposal, oks = {}, {}, {}, {}
+        for q in self.qubits:
+            _, _, x = axis[q]
+            data[q] = {"x": x, "y": P[q]}
+            fit_out[q], phi, self.fallback[q], ok = _cosine_axis(x, P[q], self._centre(cfg, q))
+            self.recovered_vz[q], oks[q] = phi, ok
+            if ok:
+                proposal[f"qubit/{q}/x/phase"] = float(phi)
+        self.data, self.fit = data, fit_out
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Phase {self.qubits} X")
 
 
 class T1:
@@ -473,3 +564,326 @@ class T2:
             proposal.update(prop)
         self.data, self.fit = data, fit_out
         return Result(all(oks.values()), data, fit_out, proposal, cfg, f"T2 {self.qubits}")
+
+
+# ── EF subspace (spec two-qubit/01 §4.1): the CZ-frequency prerequisite ──
+
+def _classifiers(classifier, qubits) -> dict:
+    """Normalize the EF cals' `classifier` argument to a {q: ClassifierN} dict — a bare ClassifierN is
+    accepted for the single-qubit case (the pre-trained 3-level readout each qubit needs, spec 01 §5)."""
+    if isinstance(classifier, dict):
+        return classifier
+    if len(qubits) != 1:
+        raise ValueError("one classifier needs exactly one qubit — pass a {q: ClassifierN} dict")
+    return {qubits[0]: classifier}
+
+
+class EFAmplitude:
+    """EF (|1>->|2>) amplitude calibration — qcal's `Amplitude(subspace='EF')` (spec 01 §4.1), the
+    prerequisite that seeds f_02 for the CZ frequency and prepares |2> for 3-level readout. A GE pi
+    populates |1> (k_ef_rabi's fixed prep, at the GE carrier), the gate carrier retunes to f_ef, and the
+    swept EF drive rotates |1>->|2>; the host reads P(|2>) off the 3-level clusters (`classifier`) and
+    fits it EXACTLY as the GE Rabi does — P(|2>) = (1 − cos(rabi_ef·σ))/2. `gate` picks the pulse and
+    the target angle, mirroring the GE Amplitude's knob (spec 04 §2 / X4): 'X90' (default) calibrates
+    `qubit/{q}/EF/x90/amp` toward π/2; 'X' the EF π `qubit/{q}/EF/x/amp` — the pulse the (5,6)/(6,7)
+    sandwich CZ shelves with. n_gates=1 → a cosine whose period gives the EF Rabi RATE and the
+    amplitude that rotates by the gate's angle; n_gates>1 → a parabola vertex (4·EF-X90 = 2·EF-X = 2π
+    back to |1>, so P(|2>) MINIMISES at the tuned amp, an upward parabola). Also writes the recovered
+    `qubit/{q}/EF/rabi`.
+
+    `classifier` is core q's pre-trained ClassifierN (a bare one for a single qubit, else a
+    {q: ClassifierN} dict): the EF readout needs |1> vs |2>, which the hardware res bit cannot separate.
+    Mirrors Amplitude's knobs — `amp_span` (normalized, or MULTIPLES of the current EF amp when
+    relative_amp) and qcal's repetition guard (n_gates % 4 for X90, % 2 for X). Documented deviation:
+    the GE prep stays X90·X90 for BOTH gates (qcal preps the X-gate variant with a single GE X — the
+    same π, ours keeps k_ef_rabi's one prep)."""
+
+    def __init__(self, cfg, qubits, classifier, gate="X90", n_gates=1, amp_span=(0.03, 0.97),
+                 points=21, relative_amp=False, shots=48):
+        assert gate in PERIOD_FRAC, f"gate must be 'X90' or 'X', got {gate!r}"
+        if int(n_gates) > 1:                          # 4·EF-X90 = 2·EF-X = 2π back to |1> (qcal's guard)
+            step = 4 if gate == "X90" else 2
+            assert int(n_gates) % step == 0, \
+                f"n_gates must be a multiple of {step} for the EF {gate}, got {n_gates}"
+        self.cfg, self.qubits = cfg, qubits_list(qubits)
+        self.classifiers = _classifiers(classifier, self.qubits)
+        self.gate, self.n_gates, self.points = gate, int(n_gates), int(points)
+        self.amp_span, self.relative_amp = amp_span, bool(relative_amp)
+        self.shots = int(shots)
+        self.target_angle = TWO_PI * PERIOD_FRAC[gate]
+        self.data, self.fit, self.recovered_rabi = {}, {}, {}
+
+    def run(self, drv) -> Result:
+        m = socmap(drv)
+        cfg = self.cfg
+        name = "x90" if self.gate == "X90" else "x"
+        progs, params, meta = {}, {}, {}
+        timeout = 0
+        for q in self.qubits:
+            path = f"qubit/{q}/EF/{name}/amp"
+            table, ge_freq, ef_freq = ef_table(cfg, q, m, name)
+            efp, f_ef = ef_pulse(cfg, q, m, name), float(cfg[f"qubit/{q}/EF/freq"])
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            span = self.amp_span
+            if self.relative_amp:                     # qcal: the sweep is a MULTIPLE of the current amp
+                span = (span[0] * float(cfg[path]), span[1] * float(cfg[path]))
+            lo, hi = units._amp_code(span[0]), units._amp_code(span[1])
+            a0q, daq, xs = sweep_q16(lo, hi, self.points)
+            ge = table.pulses["x90"].dur_batches(m, GATE_CH)
+            ef = table.pulses["ef"].dur_batches(m, GATE_CH)
+            step = train_step(ef)                          # the paced train grid (spec 14 F1)
+            seq = SEP + (self.n_gates - 1) * step + ef + LEAD + 2 * ge   # earliest pulse → t_ro
+            period = grid_period(relax_batches(cfg, m), seq, dur, ddly)
+            progs[q] = compile_kernel(kernels.k_ef_rabi, m, tables=dict(gate=table, ro=ro, demod=demod),
+                                      out=Array(2 * self.points * self.shots), npts=self.points,
+                                      shots=self.shots, period=period, ngates=self.n_gates,
+                                      step=step, code=code,
+                                      ddly=ddly, ge_freq=ge_freq, ef_freq=ef_freq, **x90_vz(cfg, q))
+            params[q] = {"a0q": int(a0q), "daq": int(daq)}
+            sig = np.array([gate_sigma(m, efp, f_ef, int(a)) for a in xs]) * self.n_gates
+            meta[q] = (np.array(xs, float), sig, path)
+            timeout = max(timeout, batch_timeout(self.points * self.shots * period))
+        P = sweep_levels(drv, m, progs, params, self.points, self.shots, timeout, self.classifiers)
+
+        data, fit, proposal, oks = {}, {}, {}, {}
+        for q in self.qubits:
+            xs, sig, path = meta[q]
+            Pq = P[q]
+            data[q] = {"x": xs, "y": Pq, "sig": sig}
+            ok, prop = False, {}
+            if self.n_gates == 1:
+                fq = fits.fit_cosine(sig, Pq)                    # P(|2>) = (1 − cos(rabi·sig))/2
+                if fq.ok:
+                    rabi = float(TWO_PI * fq.value)
+                    g = sig[-1] / (int(xs[-1]) * self.n_gates)   # sig per amp-code (linear)
+                    a_star = (self.target_angle / rabi) / g
+                    ok = int(xs[0]) <= a_star <= int(xs[-1])     # the fitted gate amp must be in the sweep
+                    if ok:
+                        self.recovered_rabi[q] = rabi
+                        prop = {path: float(np.clip(a_star / units.AMP_SCALE, 0.0, 1.0)),
+                                f"qubit/{q}/EF/rabi": rabi}
+            else:
+                fq = fits.fit_parabola(xs, Pq)                   # P(|2>) MINIMISES at the tuned amp
+                in_range = int(xs[0]) <= fq.value <= int(xs[-1])
+                if fq.ok and fq.params["a"] > 0 and in_range:    # upward vertex (min P), within the sweep
+                    prop = {path: float(np.clip(fq.value / units.AMP_SCALE, 0.0, 1.0))}
+                    ok = True
+            fit[q], oks[q] = fq, ok
+            proposal.update(prop)
+        self.data, self.fit = data, fit
+        return Result(all(oks.values()), data, fit, proposal, cfg,
+                      f"EFAmplitude {self.qubits} {self.gate} n_gates={self.n_gates}")
+
+
+class EFFrequency:
+    """EF Ramsey vs artificial detuning — qcal's `Frequency(subspace='EF')` V-fit (spec 01 §4.1). GE pi
+    prep, retune to f_ef, then two EF X90s around a swept wait with a per-wait virtual-Z detuning; the
+    host reads P(|2>) off the 3-level clusters (`classifier`) and fits each fringe (damped cosine), then
+    the UNSIGNED fringe frequencies |δ + applied| against the applied detuning to qcal's a·|x − b| + c —
+    the V bottoms out where the applied detuning cancels the config's EF error (b = −δ). The corrected
+    carrier `qubit/{q}/EF/freq` = carrier + b, identical to the GE Frequency lock-step (spec 13 §7).
+    `detune`/`n_detune`/`t0`/`dt` are the GE Frequency knobs; the fringe frequency's sign is folded away
+    (the V takes |·|), so no res-sign enters — the 3-level classifier reads P(|2>) directly."""
+
+    def __init__(self, cfg, qubits, classifier, detune=5e6, n_detune=4, points=14, t0=80e-9, dt=40e-9,
+                 shots=48):
+        self.cfg, self.qubits = cfg, qubits_list(qubits)
+        self.classifiers = _classifiers(classifier, self.qubits)
+        self.detune, self.n_detune = float(detune), int(n_detune)
+        self.points, self.t0, self.dt = int(points), float(t0), float(dt)
+        self.shots = int(shots)
+        self.data, self.fit, self.recovered_detuning_code = {}, {}, {}
+
+    def run(self, drv) -> Result:
+        m = socmap(drv)
+        cfg = self.cfg
+        t0, dt = batches(self.t0, m), batches(self.dt, m)
+        waits = [t0 + i * dt for i in range(self.points)]            # exact x-axis (host mirror)
+        wf = np.array(waits, float)
+        D = units._freq_code(self.detune, m.params)
+        d_codes = [dc for k in range(1, self.n_detune // 2 + 1) for dc in (-k * D, k * D)]
+        progs, carriers = {}, {}
+        timeout = 0
+        for q in self.qubits:
+            carrier = float(cfg[f"qubit/{q}/EF/freq"])
+            table, ge_freq, ef_freq = ef_table(cfg, q, m)
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            ge = table.pulses["x90"].dur_batches(m, GATE_CH)
+            ef = table.pulses["ef"].dur_batches(m, GATE_CH)
+            seq = SEP + 2 * ef + waits[-1] + LEAD + 2 * ge          # earliest pulse → t_ro (longest wait)
+            period = grid_period(relax_batches(cfg, m), seq, dur, ddly)
+            # compile ONCE: the waits (w0/dw) are baked; only the virtual-Z detuning pair (p0/dp) changes
+            # per fringe — leave it unbound, rewrite per rerun (as GE Frequency does).
+            progs[q] = compile_kernel(kernels.k_ef_ramsey, m,
+                                      tables=dict(gate=table, ro=ro, demod=demod),
+                                      out=Array(2 * self.points * self.shots), npts=self.points,
+                                      shots=self.shots, period=period, code=code, ddly=ddly,
+                                      ge_freq=ge_freq, ef_freq=ef_freq, w0=t0, dw=dt, **x90_vz(cfg, q))
+            carriers[q] = carrier
+            timeout = max(timeout, batch_timeout(self.points * self.shots * period))
+        rq.setup(drv, m, progs)
+
+        acc = {q: {"applied": [], "obs": [], "fringes": {}} for q in self.qubits}
+        for dc in d_codes:                                          # one rerun per detuning — no reload
+            par = {q: {"p0": pack16(16 * dc * t0),                  # phase pair, seated (spec 12)
+                       "dp": pack16(16 * dc * dt)} for q in self.qubits}
+            P = rerun_levels(drv, m, progs, par, self.points, self.shots, timeout, self.classifiers)
+            for q in self.qubits:
+                fit = fits.fit_damped_cosine(wf, P[q])
+                acc[q]["fringes"][dc] = (wf, P[q], fit)
+                if fit.ok:                                          # cycles/batch → an UNSIGNED code:
+                    acc[q]["applied"].append(dc)                    # the |δ + applied| qcal's V-fit takes
+                    acc[q]["obs"].append(CODE_PER_CYCLE_PER_BATCH * fit.value)
+
+        data, fit_out, proposal, oks = {}, {}, {}, {}
+        for q in self.qubits:
+            x, y = np.array(acc[q]["applied"], float), np.array(acc[q]["obs"], float)
+            data[q] = {"applied": x, "obs": y, "fringes": acc[q]["fringes"]}
+            v = fits.fit_absolute_value(x, y)                       # qcal's a·|x − b| + c
+            fit_out[q] = v
+            ok, prop = False, {}
+            if v.ok and len(x) >= 3 and v.params["a"] > 0 and x.min() <= v.value <= x.max():
+                dcode = -float(v.value)                             # δ = −b: the EF carrier's error
+                self.recovered_detuning_code[q] = dcode
+                delta_hz = units.code_to_freq(dcode, m.params)
+                prop = {f"qubit/{q}/EF/freq": carriers[q] - delta_hz}   # == qcal's `old + b`
+                ok = True
+            oks[q] = ok
+            proposal.update(prop)
+        self.data, self.fit = data, fit_out
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFFrequency {self.qubits}")
+
+
+class EFPhase:
+    """EF X90 virtual-Z pair — qcal's `Phase(subspace='EF')` (spec 04 §2 / X4, single_qubit.py:788-
+    1088). Driving the EF X90 Stark-shifts the {|1>, |2>} frame exactly as the GE X90 shifts the GE
+    one; qcal corrects it with the virtual-Z pair bracketing the pulse (`qubit/{q}/EF/x90/vz` — the
+    X6Y3 config carries a calibrated pair on every qubit) and calibrates the pair with the SAME
+    two-sequence line crossing as the GE Phase: qcal's EF circuits only PREPEND the GE π (X90·X90)
+    that reaches the subspace, then play Y180_X90 / X180_Y90 on the EF X90 (k_ef_phase's `seq` fold,
+    the swept phi as the pair — vz0 = vz1 = phi, written to BOTH slots at the crossing,
+    single_qubit.py:1081). The host reads P(|2>) off the pre-trained 3-level `classifier` (the
+    EFAmplitude pattern — the hardware res bit cannot tell |1> from |2>); the two populations are
+    linear in phi with opposite slopes and cross at the calibrated phase (`_line_crossing`, the GE
+    guards verbatim: in-range, chi2-argmin fallback).
+
+    Knobs are the GE Phase's: `span` (rad) around 0, or around the CURRENT vz[0] with
+    `relative_phase` (qcal's `phases + config[param]`); `classifier` is EFAmplitude's (a bare
+    ClassifierN for one qubit, else {q: ClassifierN}). The sweep is `_phase_sweep`'s monotone axis —
+    NOT the full-turn `_phi_sweep` of the Ramsey-peak cals: a line crossing needs a narrow linear
+    window, and a full turn would wrap the lines. Writes `qubit/{q}/EF/x90/vz` = [phi, phi].
+
+    `gate='X'` is the EF twin of `Phase(gate='X')` (spec 14 §3.3): one circuit, EF-X90 · EF-X · EF-X90
+    after the same GE π prep, over the EF X's own AXIS phase (`qubit/{q}/EF/x/phase` — not a
+    virtual-Z pair). The two EF X90s play in a fresh 0 frame, so the swept phi is measured against
+    THEIR axis; the composite is a 2π rotation inside {|1>, |2>} that returns to |1> only on
+    alignment, so P(|2>) is cosinusoidal in phi with its MINIMUM at the calibrated value (qcal fits
+    the same cosine to P(1) − P(2) and takes the maximum). The default sweep is a full turn."""
+
+    CHI2_MAX = 10.0             # qcal's underfitting guard (single_qubit.py:1067)
+
+    def __init__(self, cfg, qubits, classifier, gate="X90", points=21, span=None, shots=48,
+                 relative_phase=False):
+        assert gate in ("X90", "X"), f"EFPhase calibrates 'X90' or 'X', got {gate!r}"
+        self.cfg, self.qubits, self.gate = cfg, qubits_list(qubits), gate
+        self.classifiers = _classifiers(classifier, self.qubits)
+        self.points = int(points)
+        self.span = float(math.pi if span is None and gate == "X" else 0.25 if span is None else span)
+        self.shots, self.relative_phase = int(shots), bool(relative_phase)
+        self.data, self.fit, self.recovered_vz, self.fallback = {}, {}, {}, {}
+
+    def _centre(self, cfg, q) -> float:
+        """The sweep's centre: qcal's `relative_phase` re-centres on the knob's CURRENT value."""
+        if not self.relative_phase:
+            return 0.0
+        if self.gate == "X":
+            return float(cfg.get(f"qubit/{q}/EF/x/phase", 0.0))
+        return float(cfg.get(f"qubit/{q}/EF/x90/vz", [0.0, 0.0])[0])
+
+    def run(self, drv) -> Result:
+        if self.gate == "X":
+            return self._run_x(drv)
+        m = socmap(drv)
+        cfg = self.cfg
+        hpi = pack16(units._phase_code(math.pi / 2))
+        axis = {}
+        for q in self.qubits:
+            centre = self._centre(cfg, q)
+            axis[q] = _phase_sweep(centre - self.span, centre + self.span, self.points)
+        pops = {}                                              # seq -> {q: P(|2>)}
+        for seq in (kernels.Y180_X90, kernels.X180_Y90):       # one compile + run per qcal sequence
+            progs, par = {}, {}
+            timeout = 0
+            for q in self.qubits:
+                table, ge_freq, ef_freq = ef_table(cfg, q, m)
+                ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+                ge = table.pulses["x90"].dur_batches(m, GATE_CH)
+                ef = table.pulses["ef"].dur_batches(m, GATE_CH)
+                seq_len = SEP + 3 * ef + LEAD + 2 * ge         # earliest pulse (GE prep) → t_ro
+                period = grid_period(relax_batches(cfg, m), seq_len, dur, ddly)
+                progs[q] = compile_kernel(kernels.k_ef_phase, m,
+                                          tables=dict(gate=table, ro=ro, demod=demod),
+                                          out=Array(2 * self.points * self.shots), npts=self.points,
+                                          shots=self.shots, period=period, code=code, ddly=ddly,
+                                          ge_freq=ge_freq, ef_freq=ef_freq, seq=seq, hpi=hpi,
+                                          **x90_vz(cfg, q))
+                p0, dp, _ = axis[q]
+                par[q] = {"p0": pack16(p0), "dp": pack16(dp)}  # the swept EF pair, host-seated
+                timeout = max(timeout, batch_timeout(self.points * self.shots * period))
+            pops[seq] = sweep_levels(drv, m, progs, par, self.points, self.shots, timeout,
+                                     self.classifiers)
+
+        data, fit_out, proposal, oks = {}, {}, {}, {}
+        for q in self.qubits:
+            _, _, x = axis[q]
+            p_y, p_x = pops[kernels.Y180_X90][q], pops[kernels.X180_Y90][q]
+            data[q] = {"x": x, "y": (p_y - p_x) ** 2, "p0": p_y, "p1": p_x}
+            fit_out[q], phi, self.fallback[q], ok = _line_crossing(x, p_y, p_x, self.CHI2_MAX)
+            self.recovered_vz[q] = phi
+            oks[q] = ok
+            if ok:
+                proposal[f"qubit/{q}/EF/x90/vz"] = [phi, phi]  # qcal: ONE crossing, BOTH slots
+        self.data, self.fit = data, fit_out
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFPhase {self.qubits}")
+
+    def _run_x(self, drv) -> Result:
+        """gate='X': one EF-X90 · EF-X · EF-X90 run; the EF X's axis phase is the P(|2>) MINIMUM."""
+        m = socmap(drv)
+        cfg = self.cfg
+        progs, par, axis = {}, {}, {}
+        timeout = 0
+        for q in self.qubits:
+            centre = self._centre(cfg, q)
+            axis[q] = _phase_sweep(centre - self.span, centre + self.span, self.points)
+            table, ge_freq, ef_freq = ef_table(cfg, q, m)      # "x90" GE prep + "ef" EF X90
+            efx = ef_pulse(cfg, q, m, "x")
+            # the swept phi REPLACES the EF X's stored axis (qcal writes the pulse's own phase kwarg),
+            # so the slot is built at 0 and the on-core phase offset carries the whole axis
+            table.pulses["efx"] = Pulse(efx.env, amp=efx.amp)
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            ge = table.pulses["x90"].dur_batches(m, GATE_CH)
+            ef = table.pulses["ef"].dur_batches(m, GATE_CH)
+            xd = table.pulses["efx"].dur_batches(m, GATE_CH)
+            seq_len = SEP + 2 * ef + xd + LEAD + 2 * ge         # earliest pulse (GE prep) → t_ro
+            period = grid_period(relax_batches(cfg, m), seq_len, dur, ddly)
+            progs[q] = compile_kernel(kernels.k_ef_phase, m,
+                                      tables=dict(gate=table, ro=ro, demod=demod),
+                                      out=Array(2 * self.points * self.shots), npts=self.points,
+                                      shots=self.shots, period=period, code=code, ddly=ddly,
+                                      ge_freq=ge_freq, ef_freq=ef_freq, seq=kernels.X90_X_X90,
+                                      hpi=pack16(units._phase_code(math.pi / 2)), **x90_vz(cfg, q))
+            p0, dp, _ = axis[q]
+            par[q] = {"p0": pack16(p0), "dp": pack16(dp)}       # the swept EF X axis, host-seated
+            timeout = max(timeout, batch_timeout(self.points * self.shots * period))
+        P = sweep_levels(drv, m, progs, par, self.points, self.shots, timeout, self.classifiers)
+
+        data, fit_out, proposal, oks = {}, {}, {}, {}
+        for q in self.qubits:
+            _, _, x = axis[q]
+            data[q] = {"x": x, "y": P[q]}
+            fit_out[q], phi, self.fallback[q], ok = _cosine_axis(x, P[q], self._centre(cfg, q))
+            self.recovered_vz[q], oks[q] = phi, ok
+            if ok:
+                proposal[f"qubit/{q}/EF/x/phase"] = float(phi)
+        self.data, self.fit = data, fit_out
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFPhase {self.qubits} X")

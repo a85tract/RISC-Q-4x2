@@ -16,9 +16,12 @@ import numpy as np
 import pytest
 
 from riscq.cal import (Amplitude, Classifier, Config, Fidelity, Frequency, Phase,
-                       ReadoutCalibration, ReadoutFidelity, Separation, T1, T2, Window,
+                       Punchout, ReadoutCalibration, ReadoutFidelity, Separation, T1, T2, Window,
                        calibration_x6y3)
 from riscq.cal import fits
+from riscq.cal.base import batch_timeout
+from riscq.cal.readout import _ro_amp_prog
+from riscq import run as rq
 from riscq.cal.base import batches, gate_sigma, socmap, x90_vz, GATE_ENV
 from riscq.map import SocMap, SocParams, pack16
 from riscq.pulses import Pulse, units
@@ -429,6 +432,41 @@ def test_phase_recovers_the_stark_shift(cosim, demod_phase):
     assert "qubit/0/x90/phase" not in r.proposal, "the FAST_DRAG's own axis phase is not the knob"
 
 
+@pytest.mark.cosim
+@pytest.mark.parametrize("planted", [0.0, 0.5])
+def test_phase_x_gate_recovers_the_planted_axis(cosim, demod_phase, planted):
+    """spec 14 F1 — `Phase(gate='X')`, qcal's second Phase mode. Its circuit is X90 · X · X90, a 2π
+    rotation that returns to |0> only when the X's own AXIS matches the X90s'. Plant that axis by
+    giving the X90s a phase of `planted`: the X's calibrated axis must follow them, and the proposal
+    lands on `qubit/0/x/phase` (an axis phase — NOT the virtual-Z pair the X90 mode writes). The X is
+    the X6Y3 shape (double LENGTH, same amplitude, spec 13 §4).
+
+    The fringe runs at 2φ, so it has period π and the recovered axis is only defined mod π (the two
+    solutions are the same gate) — which is what is checked. Like every counts-mode cal here it needs
+    the measured `demod_phase`: without it the discriminator's polarity is whatever the grid period
+    leaves the demod LO at, and the recovered axis lands half a fringe out."""
+    drv, m = cosim
+    x90 = Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5)
+    sigma = gate_sigma(m, x90, F_GE, units._amp_code(0.5))
+    drv.sim.set_model(_model(float((math.pi / 2) / sigma), t1=400, t2=3000, noise=300.0, seed=3,
+                             collapse=True))
+    cfg = _cfg(m, F_GE, x90_amp=0.5, relax=1000)
+    cfg["readout/0/demod/phase"] = demod_phase    # the measured discrimination phase (counts mode)
+    cfg["qubit/0/x90/phase"] = planted            # the reference axis both X90s sit on
+    cfg["qubit/0/x/env"] = "square"               # the X: double LENGTH, same amp → π (spec 13 §4)
+    cfg["qubit/0/x/dur"] = _s(8, m)
+    cfg["qubit/0/x/amp"] = 0.5
+    cfg["qubit/0/x/phase"] = 0.0                  # deliberately off the X90s when planted != 0
+    cal = Phase(cfg, 0, gate="X", points=13, shots=96)
+    r = cal.run(drv)
+    got = r.proposal.get("qubit/0/x/phase")
+    print(f"\n[phase-X] planted axis={planted:+.3f} recovered={got} "
+          f"fallback={cal.fallback.get(0)}\n  P(1)={np.round(r.data[0]['y'], 3).tolist()}")
+    assert r.ok and "qubit/0/x90/vz" not in r.proposal   # the X mode writes the axis, not the pair
+    assert abs(math.remainder(got - planted, math.pi)) < 0.25, \
+        f"recovered {got:+.4f} rad, the X90s sit at {planted:+.4f} (mod π)"
+
+
 # ── acquire_shots: ReadoutCalibration captures bimodal |0>/|1> clusters (raw mode) ──
 
 @pytest.mark.cosim
@@ -637,6 +675,109 @@ def test_window_picks_the_longer_integration(cosim, demod_phase):
 
 
 # ── multi-qubit simultaneous: both cores calibrated in ONE run (spec 13 Q5 / §8) ──
+
+# ── the readout TIMING knobs (spec 14 F2) ──
+
+@pytest.mark.cosim
+@pytest.mark.parametrize("knob", ["demod/delay"])
+def test_readout_timing_knob_moves_the_readout(cosim, demod_phase, knob):
+    """(F2 gate) The demod DELAY — when the integration window opens after the drive starts, qcal's
+    `demod/delay` — swept through `Window`'s machinery: compile once at the longest candidate, then
+    retune per point. Unlike the two durations it is NOT a table field (the kernel adds it to the
+    demod's play time), so it is compiled as a per-run param instead, which is what this exercises.
+
+    Gated on the large, unambiguous effect: the projective model emits its readout tone only while the
+    DRIVE is on, so a delay that opens the window past the END of the drive integrates silence and
+    discrimination collapses. Differences between the two prompt points are within binomial noise at
+    these shot counts (~0.07 per point), so only the collapse is asserted.
+
+    The readout DRIVE length (`readout/{q}/dur`) shares this machinery but gets no scored gate: this
+    model latches the shot's level at the drive's RISING EDGE and then emits the tone for the whole
+    window, so the drive's LENGTH is unobservable here (a sweep over it returns the same three numbers
+    it returns for any other candidates). `test_readout_drive_length_reaches_the_dac` gates that knob
+    where it IS observable — on the converter."""
+    drv, m = cosim
+    q = 0
+    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=300.0, seed=11, collapse=True))
+    cfg = _cfg(m, F_GE, relax=RO_RELAX)
+    cfg[f"readout/{q}/demod/phase"] = demod_phase
+    cfg[f"readout/{q}/demod/dur"] = _s(40, m)
+    cfg[f"readout/{q}/dur"] = _s(56, m)
+    durs = [_s(n, m) for n in (0, 24, 96)]         # 96 opens the window past the 56-batch drive
+    bad = 2
+    r = Window(cfg, q, durs=durs, shots=48, knob=knob).run(drv)
+    y = r.data[q]["y"]
+    good = [k for k in range(len(durs)) if k != bad]
+    print(f"\n[{knob}] fidelity={np.round(y, 3).tolist()} -> {r.proposal[f'readout/{q}/{knob}']:.2e}")
+    assert y[bad] < min(y[k] for k in good) - 0.2, \
+        f"{knob}: the starved point did not collapse the readout: {y}"
+    assert int(np.argmax(y)) in good, f"{knob} picked the starved point: {y}"
+    assert r.proposal[f"readout/{q}/{knob}"] == pytest.approx(durs[int(np.argmax(y))], rel=0.05)
+
+
+@pytest.mark.cosim
+def test_punchout_maps_frequency_against_drive_power(cosim):
+    """(F2 gate) The punchout map — walkthrough stage 1.2, the one readout stage we had no tool for.
+    One k_vna program per qubit, then a `write_slot("ro", 0, "amp")` + a |0> rerun per amplitude, so
+    the map is (amps × points) of |S21| at the |0> resonator.
+
+    On this model the resonator is LINEAR: its response scales with the drive and its dressed peak
+    does NOT walk with power (real punchout needs a nonlinear cavity, which the model does not have).
+    So what is gated is what this model can actually show, and it is exactly what would be broken by a
+    mis-wired amp loop: every row peaks at the same dressed frequency (f_r + χ), and the rows scale
+    with the drive amplitude in the right order."""
+    drv, m = cosim
+    q = 0
+    disp = _dispersive(m, chi_code=60, kappa_code=170)
+    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=60.0, seed=4, collapse=False,
+                             **disp))
+    cfg = _cfg(m, F_GE, relax=RO_RELAX)
+    amps = [0.1, 0.3, 0.6]
+    r = Punchout(cfg, q, amps=amps, span=2.5e6, points=21, shots=16).run(drv)
+    mag, freqs = r.data[q]["mag"], r.data[q]["x"]
+    peaks = [int(np.argmax(row)) for row in mag]
+    c_r = units._freq_code(_readout_freq(m), m.params)
+    print(f"\n[punchout] amps={amps}\n  peak idx per row={peaks} (f_r code={c_r}, |0> peak={c_r + 60})"
+          f"\n  row max={np.round([row.max() for row in mag], 1).tolist()}")
+    assert mag.shape == (len(amps), 21)
+    assert len(set(peaks)) == 1, f"the dressed peak moved with power on a LINEAR resonator: {peaks}"
+    rowmax = np.array([row.max() for row in mag])
+    assert np.all(np.diff(rowmax) > 0), f"the response did not grow with drive amplitude: {rowmax}"
+    # ... and it grows about linearly, which is the amp knob actually reaching the drive
+    assert rowmax[2] / rowmax[0] == pytest.approx(amps[2] / amps[0], rel=0.25)
+
+
+@pytest.mark.cosim
+def test_readout_drive_length_reaches_the_dac(cosim):
+    """(F2 gate) The readout DRIVE length knob, gated where it is observable: the converter. `Window`
+    compiles the drive at the longest candidate and retunes the slot per point, so the readout DAC's
+    active window must be exactly the batches written — the proof the knob is applied even though the
+    projective model (which latches on the drive's rising edge) cannot see it."""
+    drv, m = cosim
+    q = 0
+    drv.sim.set_model({"kind": "zero"})               # the readout DAC carries only the core's drive
+    cfg = _cfg(m, F_GE, relax=400)
+    cfg[f"readout/{q}/dur"] = _s(56, m)
+    cfg[f"readout/{q}/demod/dur"] = _s(40, m)
+    a = units._amp_code(float(cfg[f"readout/{q}/amp"]))
+    prog, period = _ro_amp_prog(m, cfg, q, "X90", 1, 1, a << 16, 0)
+    for want in (56, 24, 8):
+        rq.setup(drv, m, {q: prog})
+        rq.write_slot(drv, m, q, prog, "ro", 0, "dur", want)
+        rq.check_magic(drv, m, q, prog)
+        rq.write_var(drv, m, q, prog, "__rq_status", 0)
+        rq.write_params(drv, m, q, prog, {"prep": 0})
+        h = drv.sim.dac_capture_arm(m.ro_dac(q), 20000)
+        rq.reset(drv, m, on=False)
+        rq.poll_done(drv, m, q, prog, timeout=batch_timeout(period))
+        rq.reset(drv, m, on=True)
+        _, cap = drv.sim.dac_capture_get(h)
+        active = cap.any(axis=1)
+        runs = [i for i in range(len(active)) if active[i]]
+        got = (runs[-1] - runs[0] + 1) if runs else 0
+        print(f"\n[ro-dur] wrote {want} batches, DAC drive = {got}")
+        assert got == want, f"wrote dur={want}, the readout DAC played {got} batches"
+
 
 @pytest.mark.cosim
 def test_multiqubit_both_cores_recover(cosim):

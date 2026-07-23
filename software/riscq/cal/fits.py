@@ -48,6 +48,8 @@ def fit_cosine(x, y) -> Fit:
         return _NONE
     perr = np.sqrt(np.diag(pcov))
     A, f, phi, C = popt
+    if A < 0:                 # canonicalise to A ≥ 0 (A·cos(θ+φ) = |A|·cos(θ+φ+π)) so `phase` alone
+        phi = phi + np.pi     # locates the maximum, at x = −phase/(2π·freq)
     params = {"amp": abs(A), "freq": abs(f), "phase": phi, "offset": C}
     ok = bool(np.all(np.isfinite(popt)) and np.all(np.isfinite(perr)))
     return Fit(ok, abs(f), float(perr[1]), params)

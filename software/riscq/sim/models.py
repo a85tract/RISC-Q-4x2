@@ -347,6 +347,384 @@ class TwoLevelModel:
         self._b[2] = bz * c + (cp * by - sp * bx) * s
 
 
+class ThreeLevelModel:
+    """A driven qutrit (|0>, |1>, |2>) for the EF calibration and 3-level readout (spec two-qubit/01
+    §4.1, §5). Two transitions share the core's gate DAC, ONE carrier at a time (the kernel re-programs
+    the channel freq around the EF segment): a GE-resonant drive rotates {|0>, |1>}, an EF-resonant one
+    rotates {|1>, |2>}. Each batch the model demodulates the gate DAC against BOTH f_ge and f_ef and
+    drives whichever transition the carrier matches — by the same amp_est·rate angle and demod-recovered
+    axis TwoLevelModel uses — so a mis-scaled EF amplitude under/over-rotates (EF Amplitude recovers it)
+    and a detuned EF carrier ramps the axis (the EF Ramsey fringe, EF Frequency).
+
+    Readout: each level emits the readout tone at a distinct phase (`level_phases`), so |0>/|1>/|2>
+    land as three separated IQ clusters a ClassifierN tells apart. In `collapse` mode the readout
+    drive's rising edge samples a definite level from |psi|^2, collapses to it, and latches that level's
+    tone for the window (bi/trimodal shot statistics); soft mode emits the population-weighted phasor.
+
+    Pure-state numpy evolution, no decoherence: the light co-sim gates recover a planted EF freq / amp
+    from an undamped fringe / Rabi, which is all Q1 needs (full-physics runs are manual, notebook-style)."""
+
+    _DRIVE_FLOOR = 100.0                                    # amp_est below this = idle batch (as TwoLevelModel)
+    _DEFAULT_PHASES = (0.0, 2.0 * math.pi / 3.0, 4.0 * math.pi / 3.0)   # 3 tones 120° apart → 3 clusters
+
+    def __init__(self, m, core: int = 0, f_ge: float = 0.0, f_ef: float = 0.0,
+                 rabi_ge_rad_per_amp: float = 0.0, rabi_ef_rad_per_amp: float = 0.0,
+                 readout_code: int = 2048, readout_amp: float = 20000.0, readout_phase: float = 0.0,
+                 level_phases=None, init_level: int = 0, collapse: bool = False,
+                 t1: float | None = None, noise_scale: float = 0.0, noise_seed: int = 0):
+        self.params = m.params
+        self.gate_dac = m.gate_dac(core)
+        self.ro_dac = m.ro_dac(core)
+        self.adc = m.adc_of(core)
+        self.rabi = {(0, 1): float(rabi_ge_rad_per_amp), (1, 2): float(rabi_ef_rad_per_amp)}
+        self._code = {(0, 1): units._freq_code(float(f_ge), m.params),      # plain reference codes
+                      (1, 2): units._freq_code(float(f_ef), m.params)}
+        self.readout_code = int(readout_code)
+        self.readout_amp = float(readout_amp)
+        self.readout_phase = float(readout_phase)
+        self.level_phases = tuple(self._DEFAULT_PHASES if level_phases is None else level_phases)
+        self._psi = np.zeros(3, dtype=complex)
+        self._psi[int(init_level)] = 1.0
+        # amplitude damping toward |0> per IDLE batch (t1 in BATCHES): the batched cals fire on a fixed
+        # grid whose idle head is ≫ t1, so each shot starts from |0> — WITHOUT it the model (which has no
+        # auto-reset) carries the previous shot's collapsed level into the next prep and the sweep scrambles
+        # (spec two-qubit/01 §6, the counterpart of TwoLevelModel's t1/t2). Pure-state: the excited
+        # amplitudes shrink and the lost norm flows to |0>, so the idle head relaxes |1>/|2> away.
+        self.t1 = t1
+        self._t1_decay = math.exp(-1.0 / t1) if t1 else 1.0
+        self.collapse = bool(collapse)
+        self._noise_scale = float(noise_scale)
+        self._rng = np.random.default_rng(noise_seed)
+        self._crng = np.random.default_rng(noise_seed + 0xC0BE)
+        self._ro_active = False
+        self._shot_level = None            # latched sampled level (collapse mode); None ⇒ silent
+
+    def dac_ids(self) -> list[int]:
+        return [self.gate_dac, self.ro_dac] if self.collapse else [self.gate_dac]
+
+    def populations(self) -> np.ndarray:
+        return np.abs(self._psi) ** 2
+
+    def _demod(self, t: int, samples: np.ndarray, code: int) -> complex:
+        """The gate DAC demodulated against `code` over this batch (mirrors TwoLevelModel._drive_axis):
+        magnitude tells which carrier is on, arg is the drive axis. Phase reduced mod 2^16 as ints."""
+        k = np.arange(BATCH_SIZE)
+        ph = (code * (BATCH_SIZE * t + k)) % (1 << 16)
+        return complex(np.sum(samples * np.exp(-1j * math.pi * ph / (1 << 15))))
+
+    def _rotate(self, pair, theta: float, phi: float) -> None:
+        """Rotate the {a, b} 2-level subspace of psi by Bloch angle `theta` about xy-axis `phi`
+        (U = exp(-i θ/2 (cosφ σx + sinφ σy)) embedded in C^3), leaving the third level untouched."""
+        a, b = pair
+        c, s = math.cos(theta / 2), math.sin(theta / 2)
+        em, ep = cmath.exp(-1j * phi), cmath.exp(1j * phi)
+        pa, pb = self._psi[a], self._psi[b]
+        self._psi[a] = c * pa - 1j * em * s * pb
+        self._psi[b] = -1j * ep * s * pa + c * pb
+
+    def adc_batch(self, t, dac):
+        samples = dac[self.gate_dac].astype(float)
+        amp_est = math.sqrt(2.0 * float(np.mean(samples * samples)))
+        if amp_est > self._DRIVE_FLOOR:
+            b01, b12 = (self._demod(t, samples, self._code[(0, 1)]),
+                        self._demod(t, samples, self._code[(1, 2)]))
+            pair, b = ((0, 1), b01) if abs(b01) >= abs(b12) else ((1, 2), b12)
+            if self.rabi[pair]:
+                self._rotate(pair, self.rabi[pair] * amp_est, math.atan2(b.imag, b.real))
+        elif self.t1:
+            self._relax()          # idle batch: amplitude-damp |1>/|2> toward |0> (the grid reset)
+
+        phasor = self._projective_phasor(dac) if self.collapse else \
+            sum(self.populations()[k] * cmath.exp(1j * self.level_phases[k]) for k in range(3))
+        k = np.arange(ADC_BATCH)
+        ang = math.pi * self.readout_code * (ADC_BATCH * t + k) / (1 << 15) + self.readout_phase
+        lanes = self.readout_amp * (phasor.real * np.cos(ang) - phasor.imag * np.sin(ang))
+        if self._noise_scale:
+            lanes = lanes + self._rng.normal(0.0, self._noise_scale, ADC_BATCH)
+        return {self.adc: _clip16(lanes)}
+
+    def _relax(self) -> None:
+        """Amplitude-damp toward |0> one idle batch: shrink the |1>/|2> amplitudes by the t1 factor and
+        pour the lost norm back into |0> (phase-preserving, so the state stays pure). Over the grid's
+        idle head (≫ t1) |1>/|2> vanish and the qubit resets to |0> — the reset the batched sweep needs."""
+        self._psi[1] *= self._t1_decay
+        self._psi[2] *= self._t1_decay
+        lost = 1.0 - float(np.vdot(self._psi, self._psi).real)          # norm bled off |1>/|2>
+        if lost > 0.0:
+            a0 = self._psi[0]
+            mag0 = math.sqrt(max(0.0, abs(a0) ** 2 + lost))
+            self._psi[0] = mag0 * (a0 / abs(a0)) if abs(a0) > 1e-12 else mag0
+
+    def _projective_phasor(self, dac) -> complex:
+        """On the readout drive's rising edge sample a definite level from |psi|^2, collapse to it, and
+        latch that level's tone phasor for the window (silent when undriven)."""
+        ro = dac[self.ro_dac].astype(float)
+        ro_on = math.sqrt(2.0 * float(np.mean(ro * ro))) > self._DRIVE_FLOOR
+        if ro_on and not self._ro_active:
+            p = self.populations()
+            lvl = int(self._crng.choice(3, p=p / p.sum()))
+            self._psi[:] = 0.0
+            self._psi[lvl] = 1.0
+            self._shot_level = lvl
+        elif not ro_on:
+            self._shot_level = None
+        self._ro_active = ro_on
+        return 0j if self._shot_level is None else cmath.exp(1j * self.level_phases[self._shot_level])
+
+
+class TwoQubitModel:
+    """Two qutrits + a flux coupler for the CZ calibration (spec two-qubit/01 §6). ONE model holds the
+    JOINT 3x3 state psi[a, b] (a = control level, b = target level) — the CZ entangles the pair, so it
+    cannot be two independent per-qubit models. It reads three DACs (both gate channels + the coupler
+    drive) and drives both qubits' readout tones, frequency-multiplexed onto the shared ADC.
+
+    Every rotation is the SAME demodulate-then-rotate mechanism the one-qubit models use (a resonant
+    carrier gives a fixed axis, a detuned one ramps it — the Ramsey/off-resonant-Rabi physics with no
+    explicit precession term), lifted to the joint state:
+
+      - single-qubit GE/EF drive: demod that qubit's gate DAC against its f_ge/f_ef, rotate its {0,1}
+        or {1,2} subspace for every level of the partner (a product-preserving embedded rotation),
+        exactly as ThreeLevelModel does for one qutrit.
+      - parametric CZ (`coupler` set — the default): demod the coupler DAC against f_CZ =
+        |f_EF(target) - f_GE(control)| (the |11>-|02> detuning, spec 01 §4.2) and rotate the
+        {|11>, |02>} PSEUDO-QUBIT by rabi_cz*amp_est about the recovered axis. On resonance (coupler
+        carrier == f_CZ) the axis is fixed, so the subspace Rabi-flops |11>->|02>->|11> and a full
+        2*pi round trip is -I on {|11>, |02>} — i.e. |11> picks up the conditional pi phase that IS
+        the CZ, while |00>/|01>/|10> are untouched. A detuned coupler carrier ramps the axis, which
+        is exactly the off-resonant Rabi Ω²/(Ω²+Δ²) (rotating about a ramping equatorial axis at
+        ramp-rate Δ == a static (Ω/2)σx-(Δ/2)σz), so the transfer peaks at f_CZ — the resonance the
+        CZ Frequency cal finds.
+      - two-qubit-drive CZ (`coupler=None`; a `build_model` spec WITHOUT a "coupler" key — the X6Y3
+        form, spec 04 §4.6): no coupler exists, the CZ is two simultaneous in-band tones on the
+        pair's OWN gate channels at f_CZ = (f_11 + f_02)/4 = (f_ge[0] + 2·f_ge[1] + f_ef[1])/4 (the
+        drive-form seed arithmetic, spec 04 §1 — computed from the model's own spectrum, like the
+        coupler path's detuning). Each gate DAC gains a THIRD demod, against f_CZ, and the per-batch
+        argmax over {GE, EF, CZ} decides which drive that line is (the same comparative mechanism
+        that already separates GE from EF); a batch whose carrier is the CZ tone contributes the
+        phasor A_i·e^{iφ_i} (A_i = the line's RMS amplitude — detuning-blind, as the coupler path's
+        amp_est; φ_i = its f_CZ-demod arg). The EFFECTIVE drive is the COHERENT SUM of the two lines,
+        E = A_c·e^{iφ_c} + A_t·e^{iφ_t}, and the {|11>, |02>} pseudo-qubit rotates by rabi_cz·|E|
+        about axis arg E — the SAME `_rotate(2, ...)` mechanics as the coupler path, so the detuning
+        response (both NCOs retune LOCKSTEP, both demod args ramp together → the Ω²/(Ω²+Δ²) transfer
+        peaking at f_CZ) and the conditional-π round trip are identical. What the closed form ADDS is
+        the relative-phase dependence: equal lines give |E| = 2A·cos(Δφ/2) — maximal when the two
+        absolute-time-referenced tones align (Δφ = 0), extinguished at Δφ = π — the real optimum the
+        RelativePhase calibration finds. One line alone still activates at half strength.
+      - residual ZZ (`zz_rad_per_batch`): the static ζ|11><11| term, a phase e^{-iζ} on |11> EVERY
+        batch. In a target Ramsey it shifts the fringe frequency by ζ only when the control is |1>, so
+        JAZZ recovers ζ = f(control=1) - f(control=0) (spec 01 §4.3). Default 0 = the part-1 zero-bias
+        point (DC hardware, part 3, wires a nonzero ζ in later).
+
+    Readout: each qubit emits the readout tone at a phase set by its level (`level_phases`, 3 tones
+    120° apart -> 3 IQ clusters a ClassifierN tells apart); the two tones ride distinct readout codes
+    and SUM on the shared ADC (frequency-multiplexed, each core's demod integrating out its own). Soft
+    mode emits the population-weighted phasor of each qubit's MARGINAL; `collapse` mode samples one
+    JOINT (a, b) from |psi|² on the readout-drive rising edge, collapses the pair to it, and latches
+    each qubit's level for the window — so the two cores' per-shot bits are drawn from the correlated
+    pair state and zip into the joint P(00..11) (spec 01 §5).
+
+    Pure-state numpy evolution; optional `t1` amplitude-damps the pair toward |00> on IDLE batches so
+    the batched grid's idle head resets each shot (the counterpart of ThreeLevelModel's reset). The
+    light co-sim gates recover planted f_CZ / ζ / conditional phase; full physics is manual (§6)."""
+
+    _DRIVE_FLOOR = 100.0
+    _DEFAULT_PHASES = (0.0, 2.0 * math.pi / 3.0, 4.0 * math.pi / 3.0)
+
+    def __init__(self, m, control: int = 0, target: int = 1, coupler: int | None = 2,
+                 f_ge=(0.0, 0.0), f_ef=(0.0, 0.0), rabi_ge=(0.0, 0.0), rabi_ef=(0.0, 0.0),
+                 rabi_cz_rad_per_amp: float = 0.0, zz_rad_per_batch: float = 0.0,
+                 readout_code=(2048, 2048), readout_amp=(20000.0, 20000.0), readout_phase=(0.0, 0.0),
+                 level_phases=None, init=(0, 0), collapse: bool = False, t1: float | None = None,
+                 noise_scale: float = 0.0, noise_seed: int = 0):
+        self.params = m.params
+        self.gate = [m.gate_dac(control), m.gate_dac(target)]
+        self.coupler_dac = None if coupler is None else m.gate_dac(coupler)
+        self.ro_dac = m.ro_dac(control)                # the shared readout-drive DAC (window trigger)
+        self.adc = [m.adc_of(control), m.adc_of(target)]
+        self.rabi = [{(0, 1): float(rabi_ge[i]), (1, 2): float(rabi_ef[i])} for i in (0, 1)]
+        self._code = [{(0, 1): units._freq_code(float(f_ge[i]), m.params),   # plain reference codes
+                       (1, 2): units._freq_code(float(f_ef[i]), m.params)} for i in (0, 1)]
+        if coupler is None:                            # drive form: the in-band (f_11 + f_02)/4 tone
+            f_cz = (float(f_ge[0]) + 2.0 * float(f_ge[1]) + float(f_ef[1])) / 4.0
+        else:                                          # |11>-|02> parametric resonance (spec 01 §4.2)
+            f_cz = abs(float(f_ef[1]) - float(f_ge[0]))
+        self._cz_code = units._freq_code(f_cz, m.params)
+        self.rabi_cz = float(rabi_cz_rad_per_amp)
+        self.zz = float(zz_rad_per_batch)
+        self.readout_code = [int(readout_code[0]), int(readout_code[1])]
+        self.readout_amp = [float(readout_amp[0]), float(readout_amp[1])]
+        self.readout_phase = [float(readout_phase[0]), float(readout_phase[1])]
+        self.level_phases = tuple(self._DEFAULT_PHASES if level_phases is None else level_phases)
+        self._psi = np.zeros((3, 3), dtype=complex)
+        self._psi[int(init[0]), int(init[1])] = 1.0
+        self.t1 = t1
+        self._t1_decay = math.exp(-1.0 / t1) if t1 else 1.0
+        self.collapse = bool(collapse)
+        self._noise_scale = float(noise_scale)
+        self._rng = np.random.default_rng(noise_seed)
+        self._crng = np.random.default_rng(noise_seed + 0xC0BE)
+        self._ro_active = False
+        self._shot = None                              # latched joint shot (a, b); None ⇒ silent
+
+    def dac_ids(self) -> list[int]:
+        ids = [self.gate[0], self.gate[1]]
+        if self.coupler_dac is not None:
+            ids.append(self.coupler_dac)
+        if self.collapse and self.ro_dac not in ids:
+            ids.append(self.ro_dac)
+        return ids
+
+    def populations(self) -> np.ndarray:
+        return np.abs(self._psi) ** 2                  # [a, b] joint pops
+
+    def marginals(self):
+        p = self.populations()
+        return p.sum(axis=1), p.sum(axis=0)            # (control, target) single-qubit populations
+
+    def _demod(self, t: int, samples: np.ndarray, code: int) -> complex:
+        """The DAC demodulated against `code` over this batch (as ThreeLevelModel._demod): magnitude
+        tells whether the carrier is on, arg is the drive axis. Phase reduced mod 2^16 as ints."""
+        k = np.arange(BATCH_SIZE)
+        ph = (code * (BATCH_SIZE * t + k)) % (1 << 16)
+        return complex(np.sum(samples * np.exp(-1j * math.pi * ph / (1 << 15))))
+
+    def _rotate(self, who: int, pair, theta: float, phi: float) -> None:
+        """Rotate a 2-level subspace by Bloch angle `theta` about xy-axis `phi`
+        (U = exp(-i θ/2 (cosφ σx + sinφ σy))). who=0/1 rotates the control/target qutrit's `pair`
+        subspace across every partner level (a product-preserving embedded rotation); who=2 rotates the
+        {|11>, |02>} pseudo-qubit (the parametric coupling)."""
+        c, s = math.cos(theta / 2), math.sin(theta / 2)
+        em, ep = cmath.exp(-1j * phi), cmath.exp(1j * phi)
+        if who == 2:                                   # the {|11>, |02>} coupling
+            pa, pb = self._psi[1, 1], self._psi[0, 2]
+            self._psi[1, 1] = c * pa - 1j * em * s * pb
+            self._psi[0, 2] = -1j * ep * s * pa + c * pb
+            return
+        a, b = pair
+        if who == 0:                                   # control subspace: rows a, b
+            pa, pb = self._psi[a, :].copy(), self._psi[b, :].copy()
+            self._psi[a, :] = c * pa - 1j * em * s * pb
+            self._psi[b, :] = -1j * ep * s * pa + c * pb
+        else:                                          # target subspace: columns a, b
+            pa, pb = self._psi[:, a].copy(), self._psi[:, b].copy()
+            self._psi[:, a] = c * pa - 1j * em * s * pb
+            self._psi[:, b] = -1j * ep * s * pa + c * pb
+
+    def _drive_qubit(self, idx: int, samples: np.ndarray, t: int):
+        """Drive qubit `idx` from its gate DAC this batch: demod against its f_ge and f_ef, rotate
+        whichever transition the carrier matches (as ThreeLevelModel). In the drive form (no coupler)
+        the same channel also carries the pair's CZ line, so a THIRD demod against f_CZ joins the
+        argmax: a CZ-carrier batch rotates nothing here and instead returns its line phasor
+        A·e^{iφ} (A = the RMS amplitude, φ = the f_CZ-demod arg) for `_drive_cz_lines` to combine.
+        Returns (driven, cz_phasor-or-None)."""
+        samples = samples.astype(float)
+        amp_est = math.sqrt(2.0 * float(np.mean(samples * samples)))
+        if amp_est <= self._DRIVE_FLOOR:
+            return False, None
+        b01 = self._demod(t, samples, self._code[idx][(0, 1)])
+        b12 = self._demod(t, samples, self._code[idx][(1, 2)])
+        if self.coupler_dac is None:                   # drive form: the CZ tone rides this channel too
+            bcz = self._demod(t, samples, self._cz_code)
+            if abs(bcz) > abs(b01) and abs(bcz) > abs(b12):
+                return True, amp_est * cmath.exp(1j * math.atan2(bcz.imag, bcz.real))
+        pair, b = ((0, 1), b01) if abs(b01) >= abs(b12) else ((1, 2), b12)
+        if self.rabi[idx][pair]:
+            self._rotate(idx, pair, self.rabi[idx][pair] * amp_est, math.atan2(b.imag, b.real))
+        return True, None
+
+    def _drive_coupler(self, samples: np.ndarray, t: int) -> bool:
+        """Drive the {|11>, |02>} coupling from the coupler DAC: demod against f_CZ, rotate the
+        pseudo-qubit by rabi_cz*amp_est about the recovered axis. Returns whether it was driven."""
+        samples = samples.astype(float)
+        amp_est = math.sqrt(2.0 * float(np.mean(samples * samples)))
+        if amp_est <= self._DRIVE_FLOOR:
+            return False
+        if self.rabi_cz:
+            b = self._demod(t, samples, self._cz_code)
+            self._rotate(2, None, self.rabi_cz * amp_est, math.atan2(b.imag, b.real))
+        return True
+
+    def _drive_cz_lines(self, e0, e1) -> None:
+        """Drive-form CZ activation (spec 04 §4.6): combine the two gate lines' phasors COHERENTLY —
+        E = A_c·e^{iφ_c} + A_t·e^{iφ_t} — and rotate the {|11>, |02>} pseudo-qubit by rabi_cz·|E|
+        about axis arg E (the exact `_drive_coupler` mechanics with |E| in place of the one line's
+        amp_est). Anti-phase lines cancel (|E| under the drive floor ⇒ no rotation) — the Δφ = π
+        null of the 2A·cos(Δφ/2) closed form."""
+        if not self.rabi_cz:
+            return
+        e = (e0 if e0 is not None else 0j) + (e1 if e1 is not None else 0j)
+        if abs(e) <= self._DRIVE_FLOOR:
+            return
+        self._rotate(2, None, self.rabi_cz * abs(e), math.atan2(e.imag, e.real))
+
+    def adc_batch(self, t, dac):
+        d0, e0 = self._drive_qubit(0, dac[self.gate[0]], t)
+        d1, e1 = self._drive_qubit(1, dac[self.gate[1]], t)
+        if self.coupler_dac is not None:               # coupler form: the dedicated CZ-drive channel
+            dc = self._drive_coupler(dac[self.coupler_dac], t)
+        else:                                          # drive form: the two gate lines combine
+            dc = False
+            self._drive_cz_lines(e0, e1)
+        if self.zz:                                    # the static ζ|11><11| term (spec 01 §4.3)
+            self._psi[1, 1] *= cmath.exp(-1j * self.zz)
+        if not (d0 or d1 or dc) and self.t1:
+            self._relax()                              # idle batch: reset the pair toward |00>
+        if self.collapse:
+            self._update_shot(dac)
+        return self._emit(t)
+
+    def _emit(self, t: int) -> dict:
+        """Both qubits' readout tones, frequency-multiplexed and summed on the shared ADC."""
+        out: dict[int, np.ndarray] = {}
+        k = np.arange(ADC_BATCH)
+        for idx in (0, 1):
+            phasor = self._phasor(idx)
+            ang = math.pi * self.readout_code[idx] * (ADC_BATCH * t + k) / (1 << 15) \
+                + self.readout_phase[idx]
+            lanes = self.readout_amp[idx] * (phasor.real * np.cos(ang) - phasor.imag * np.sin(ang))
+            a = self.adc[idx]
+            out[a] = lanes if a not in out else out[a] + lanes
+        if self._noise_scale:
+            for a in out:
+                out[a] = out[a] + self._rng.normal(0.0, self._noise_scale, ADC_BATCH)
+        return {a: _clip16(v) for a, v in out.items()}
+
+    def _phasor(self, idx: int) -> complex:
+        """Qubit `idx`'s readout phasor: its collapsed level's tone (collapse mode) or the
+        population-weighted sum over its marginal (soft mode)."""
+        if self.collapse:
+            return 0j if self._shot is None else cmath.exp(1j * self.level_phases[self._shot[idx]])
+        pops = self.marginals()[idx]
+        return sum(pops[L] * cmath.exp(1j * self.level_phases[L]) for L in range(3))
+
+    def _update_shot(self, dac) -> None:
+        """On the readout drive's rising edge sample one JOINT (a, b) from |psi|², collapse the pair to
+        it, and latch it for the window (both qubits read the same correlated shot); silent when undriven."""
+        ro = dac[self.ro_dac].astype(float)
+        on = math.sqrt(2.0 * float(np.mean(ro * ro))) > self._DRIVE_FLOOR
+        if on and not self._ro_active:
+            p = self.populations().ravel()
+            i = int(self._crng.choice(9, p=p / p.sum()))
+            self._psi[:] = 0.0
+            self._psi[i // 3, i % 3] = 1.0
+            self._shot = (i // 3, i % 3)
+        elif not on:
+            self._shot = None
+        self._ro_active = on
+
+    def _relax(self) -> None:
+        """Amplitude-damp the pair toward |00> one idle batch: shrink every amplitude but |00>'s by the
+        t1 factor and pour the lost norm back into |00> (phase-preserving). Over the idle head (≫ t1)
+        the pair resets to |00> — the reset the batched sweep needs (ThreeLevelModel._relax, lifted)."""
+        a00 = self._psi[0, 0]
+        self._psi *= self._t1_decay
+        self._psi[0, 0] = a00
+        lost = 1.0 - float(np.vdot(self._psi, self._psi).real)
+        if lost > 0.0:
+            mag = math.sqrt(max(0.0, abs(a00) ** 2 + lost))
+            self._psi[0, 0] = mag * (a00 / abs(a00)) if abs(a00) > 1e-12 else mag
+
+
 class MultiModel:
     """Several independent QuantumModels driven together (spec 13 §8): each sub-model reads its OWN
     core's gate DAC and drives its OWN core's readout tone. On this build several cores SHARE a readout
@@ -399,4 +777,28 @@ def build_model(spec: dict, m) -> QuantumModel:
             collapse=spec.get("collapse", False), f_r=spec.get("f_r", 0.0),
             kappa=spec.get("kappa", 0.0), chi=spec.get("chi", 0.0),
             stark_rad_per_sigma=spec.get("stark_rad_per_sigma", 0.0))
+    if kind == "threelevel":
+        return ThreeLevelModel(
+            m, core=spec.get("core", 0), f_ge=spec.get("f_ge", 0.0), f_ef=spec.get("f_ef", 0.0),
+            rabi_ge_rad_per_amp=spec.get("rabi_ge_rad_per_amp", 0.0),
+            rabi_ef_rad_per_amp=spec.get("rabi_ef_rad_per_amp", 0.0),
+            readout_code=spec.get("readout_code", 2048), readout_amp=spec.get("readout_amp", 20000.0),
+            readout_phase=spec.get("readout_phase", 0.0), level_phases=spec.get("level_phases"),
+            init_level=spec.get("init_level", 0), collapse=spec.get("collapse", False),
+            t1=spec.get("t1"), noise_scale=spec.get("noise_scale", 0.0),
+            noise_seed=spec.get("noise_seed", 0))
+    if kind == "twoqubit":
+        return TwoQubitModel(   # no "coupler" key ⇒ the two-qubit-drive form (spec 04 §4.6)
+            m, control=spec.get("control", 0), target=spec.get("target", 1),
+            coupler=spec.get("coupler"), f_ge=spec.get("f_ge", (0.0, 0.0)),
+            f_ef=spec.get("f_ef", (0.0, 0.0)), rabi_ge=spec.get("rabi_ge", (0.0, 0.0)),
+            rabi_ef=spec.get("rabi_ef", (0.0, 0.0)),
+            rabi_cz_rad_per_amp=spec.get("rabi_cz_rad_per_amp", 0.0),
+            zz_rad_per_batch=spec.get("zz_rad_per_batch", 0.0),
+            readout_code=spec.get("readout_code", (2048, 2048)),
+            readout_amp=spec.get("readout_amp", (20000.0, 20000.0)),
+            readout_phase=spec.get("readout_phase", (0.0, 0.0)),
+            level_phases=spec.get("level_phases"), init=spec.get("init", (0, 0)),
+            collapse=spec.get("collapse", False), t1=spec.get("t1"),
+            noise_scale=spec.get("noise_scale", 0.0), noise_seed=spec.get("noise_seed", 0))
     raise ValueError(f"unknown QuantumModel kind {kind!r}")

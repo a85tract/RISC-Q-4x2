@@ -8,9 +8,10 @@ Every value is in PHYSICAL units — Hz, seconds, normalized amplitude in [-1, 1
 batches and hardware codes are derived inside a calibration's `run()`, never stored.
 
 `from_qcal` / `save_qcal` are the one-way adapter to the qcal YAML tree (the artefact of record —
-`build/qcal-x6y3-config/config.yaml`): `from_qcal` maps it into our paths, `save_qcal` writes the
-calibrated fields back into the loaded tree and leaves everything else (two-qubit gates, EF, reset
-pulses) untouched. Nothing else in the stack knows qcal's layout.
+`build/qcal-x6y3-config/config.yaml`): `from_qcal` maps it into our paths — GE + EF + readout +
+herald + relax, and the whole `two_qubit` section carried verbatim (spec 04 §2) — and `save_qcal`
+writes the calibrated fields back into the loaded tree, leaving everything else untouched. Nothing
+else in the stack knows qcal's layout.
 """
 
 from __future__ import annotations
@@ -49,7 +50,12 @@ class Config:
         the pair straddling the pulse is the virtual-Z frame `vz` = [before, after] and the FAST_DRAG's
         own axis phase is `x90/phase` — two separate knobs (both nonzero/asymmetric on X6Y3, so neither
         folds into the other). Its X is a SINGLE FAST_DRAG of double duration — not a double-amplitude
-        X90 — so both are read as real pulses. Times are seconds, the demod phase DEGREES here, radians there."""
+        X90 — so both are read as real pulses. Times are seconds, the demod phase DEGREES here, radians there.
+
+        The EF subspace loads like GE (`qubit/{q}/EF/{freq, T1, T2, x90, x}` — the EF X90 carries a
+        virtual-Z pair too), and each `two_qubit` pair's subtree is carried VERBATIM under
+        `two_qubit/(i, j)/...` (spec 04 §2): pulse lists with string-reference entries, path-valued
+        `freq` keys inside vz entries, `dynamical_decoupling` — all opaque, so unknown fields round-trip."""
         with open(path) as f:
             tree = yaml.safe_load(f)
         cfg = cls()
@@ -61,6 +67,13 @@ class Config:
             cfg[f"qubit/{q}/T2"] = float(ge["T2*"])
             cfg._read_gate(f"qubit/{q}/x90", ge["X90"]["pulse"])
             cfg._read_gate(f"qubit/{q}/x", ge["X"]["pulse"])
+
+            ef = tree["single_qubit"][q]["EF"]
+            cfg[f"qubit/{q}/EF/freq"] = float(ef["freq"])
+            cfg[f"qubit/{q}/EF/T1"] = float(ef["T1"])
+            cfg[f"qubit/{q}/EF/T2"] = float(ef["T2*"])
+            cfg._read_gate(f"qubit/{q}/EF/x90", ef["X90"]["pulse"])
+            cfg._read_gate(f"qubit/{q}/EF/x", ef["X"]["pulse"])
 
             ro = tree["readout"][q]
             _, _, ro_kw = _amp_phase(ro.get("kwargs"))
@@ -77,6 +90,9 @@ class Config:
             cfg[f"readout/{q}/demod/env"] = dm["env"]
             cfg[f"readout/{q}/demod/amp"] = dm_amp
             cfg[f"readout/{q}/demod/kwargs"] = dm_kw
+
+        for pk, sub in (tree.get("two_qubit") or {}).items():
+            cfg[f"two_qubit/{pk}"] = copy.deepcopy(sub)              # verbatim — the pair key has no '/'
 
         cfg["readout/herald"] = bool(tree["readout"]["herald"])
         cfg["reset/relax"] = float(tree["reset"]["passive"]["delay"])   # 500 us on X6Y3
@@ -106,10 +122,13 @@ class Config:
             self[f"{path}/vz"] = [float(p["kwargs"]["phase"]) for p in vz]
 
     def save_qcal(self, path) -> None:
-        """Write the CALIBRATED fields back into the qcal tree this Config was loaded from (GE freq /
-        T1 / T2*, the X90 and X amp + phase + virtual-Z pair, the readout freq/amp, and the demod
-        window + phase). Everything else — two-qubit gates, EF, reset pulses, hardware — round-trips
-        untouched."""
+        """Write the CALIBRATED fields back into the qcal tree this Config was loaded from: GE and EF
+        freq / T1 / T2*, the X90 and X amp + phase + envelope kwargs + virtual-Z pair (both
+        subspaces), the readout freq/amp, the demod window + phase, and each `two_qubit` pair's WHOLE
+        subtree — our copy is authoritative (it was carried verbatim on load), so `CZ/pulse`'s
+        string-reference entries survive AND config-added keys like JAZZ's `ZZ11` reach the artefact
+        (spec 14 F0). Everything outside those paths — the `reset` section, `readout/esp`, `hardware`
+        — round-trips untouched, so an uncalibrated load → save is verbatim."""
         if self._qcal is None:
             raise RuntimeError("save_qcal needs a Config loaded by from_qcal")
         tree = copy.deepcopy(self._qcal)
@@ -120,23 +139,48 @@ class Config:
             ge["T2*"] = float(self[f"qubit/{q}/T2"])
             for gate, name in ((ge["X90"], "x90"), (ge["X"], "x")):
                 self._write_gate(f"qubit/{q}/{name}", gate["pulse"])
+            ef = tree["single_qubit"][q]["EF"]
+            ef["freq"] = float(self[f"qubit/{q}/EF/freq"])
+            ef["T1"] = float(self[f"qubit/{q}/EF/T1"])
+            ef["T2*"] = float(self[f"qubit/{q}/EF/T2"])
+            for gate, name in ((ef["X90"], "EF/x90"), (ef["X"], "EF/x")):
+                self._write_gate(f"qubit/{q}/{name}", gate["pulse"])
             ro = tree["readout"][q]
             ro["freq"] = float(self[f"readout/{q}/freq"])
             ro["amp"] = float(self[f"readout/{q}/amp"])
             ro["demod"]["time"] = float(self[f"readout/{q}/demod/dur"])
-            ro["demod"]["phase"] = math.degrees(float(self[f"readout/{q}/demod/phase"]))
+            # degrees↔radians is not float-exact both ways — rewrite only a RECALIBRATED phase, so an
+            # untouched one stays verbatim (the load → save round-trip contract).
+            if float(self[f"readout/{q}/demod/phase"]) != math.radians(float(ro["demod"]["phase"])):
+                ro["demod"]["phase"] = math.degrees(float(self[f"readout/{q}/demod/phase"]))
+        for pk in (tree.get("two_qubit") or {}):
+            tree["two_qubit"][pk] = copy.deepcopy(self[f"two_qubit/{pk}"])
         with open(path, "w") as f:
             yaml.safe_dump(tree, f, default_flow_style=False, sort_keys=False)
 
     def _write_gate(self, path: str, pulses: list) -> None:
-        """The inverse of _read_gate: the drive pulse's amp + phase and, in order, the virtual-Z pair."""
-        vz = iter(self.get(f"{path}/vz", []))
+        """The inverse of _read_gate: the drive pulse's amp + phase + envelope kwargs (the FAST_DRAG
+        `N` / `weights` / `alpha` / `anh` the DRAG optimizer tunes) and, in order, the virtual-Z pair.
+
+        A calibrated pair on a gate that had NONE (qcal's X is a bare FAST_DRAG, but `Phase(gate='X')`
+        calibrates its frame too — spec 14 §3.3) is written as two new virtualz entries bracketing the
+        drive, shaped like the X90's. An all-zero pair is a no-op frame, so it is not inserted — a
+        load → save with nothing calibrated stays verbatim."""
+        vz = [float(v) for v in self.get(f"{path}/vz", [])]
+        if any(vz) and not any(p["env"] == "virtualz" for p in pulses):
+            drive = next(p for p in pulses if p["env"] != "virtualz")
+            blank = {"channel": drive["channel"], "env": "virtualz", "time": 0.0,
+                     "kwargs": {"phase": 0.0}}
+            pulses.insert(0, copy.deepcopy(blank))
+            pulses.append(copy.deepcopy(blank))
+        it = iter(vz)
         for p in pulses:
             if p["env"] == "virtualz":
-                p["kwargs"]["phase"] = float(next(vz))
+                p["kwargs"]["phase"] = float(next(it))
             else:
-                p["kwargs"]["amp"] = float(self[f"{path}/amp"])
-                p["kwargs"]["phase"] = float(self[f"{path}/phase"])
+                p["kwargs"].update(self.get(f"{path}/kwargs", {}),
+                                   amp=float(self[f"{path}/amp"]),
+                                   phase=float(self[f"{path}/phase"]))
 
     def check_hardware(self, params) -> None:
         """Assert the qcal tree's `hardware` section describes THIS build (spec 13 §3): the converter

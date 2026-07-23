@@ -334,3 +334,483 @@ def test_stark_rotates_the_phase_with_the_drive():
         tl.adc_batch(n, {M.gate_dac(0): np.full(16, int(c), dtype=np.int64)})
         assert abs(math.atan2(tl._b[1], tl._b[0]) - n * eps) < 1e-9      # +z rotation, linear in σ
         assert abs(np.linalg.norm(tl._b) - 1.0) < 1e-12 and abs(tl._b[2]) < 1e-12
+
+
+# ── ThreeLevelModel: the driven qutrit for EF cal + 3-level readout (spec two-qubit/01) ──
+
+from riscq.map import ADC_BATCH, BATCH_SIZE   # noqa: E402
+
+
+def _qtone(code, amp, t):
+    """One batch of a DAC carrier at `code` (SF16), amplitude `amp`, at absolute batch `t`."""
+    n = BATCH_SIZE * t + np.arange(BATCH_SIZE)
+    return {0: np.rint(amp * np.cos(math.pi * code * n / (1 << 15))).astype(np.int64)}
+
+
+def test_threelevel_ladder_rotations_move_population():
+    """The subspace unitaries climb the ladder: a GE Bloch-π takes |0>→|1>, an EF Bloch-π |1>→|2>,
+    each leaving the third level untouched (subspace-selective)."""
+    tl = models.ThreeLevelModel(M, core=0, f_ge=50e6, f_ef=25e6)
+    assert np.allclose(tl.populations(), [1, 0, 0])
+    tl._rotate((0, 1), math.pi, 0.0)
+    assert np.allclose(tl.populations(), [0, 1, 0], atol=1e-9)
+    tl._rotate((1, 2), math.pi, 0.0)
+    assert np.allclose(tl.populations(), [0, 0, 1], atol=1e-9)
+
+
+def test_threelevel_carrier_selects_the_transition():
+    """The demod picks the driven transition by carrier: a GE-frequency drive rotates {0,1} (and does
+    NOT touch |2>), an EF-frequency drive from |1> rotates {1,2}. amp_est·rate = Bloch angle."""
+    A = 10000.0
+    ge, ef = 2048, 1024                              # well-separated codes (f_ge, f_ef)
+    f_ge, f_ef = units.code_to_freq(ge, M.params), units.code_to_freq(ef, M.params)
+    tl = models.ThreeLevelModel(M, core=0, f_ge=f_ge, f_ef=f_ef,
+                                rabi_ge_rad_per_amp=math.pi / A, rabi_ef_rad_per_amp=math.pi / A)
+    tl.adc_batch(0, _qtone(ge, A, 0))                 # one GE π batch: |0> → |1>
+    assert np.allclose(tl.populations(), [0, 1, 0], atol=0.02)
+    tl.adc_batch(1, _qtone(ef, A, 1))                 # one EF π batch: |1> → |2>
+    assert np.allclose(tl.populations(), [0, 0, 1], atol=0.02)
+
+
+def _readout_iq(level, code=2048, nbatches=24):
+    """The soft-mode demod IQ of a qutrit sitting in `level` (integrate the emitted tone against the
+    readout code over `nbatches`)."""
+    tl = models.ThreeLevelModel(M, core=0, readout_code=code, init_level=level)
+    acc = 0j
+    for t in range(nbatches):
+        lanes = tl.adc_batch(t, {0: np.zeros(BATCH_SIZE, dtype=np.int64)})[tl.adc].astype(float)
+        k = np.arange(ADC_BATCH)
+        acc += np.sum(lanes * np.exp(-1j * math.pi * code * (ADC_BATCH * t + k) / (1 << 15)))
+    return acc
+
+
+def test_threelevel_readout_three_distinct_clusters():
+    """|0>/|1>/|2> emit the readout tone at three distinct phases (default 120° apart), so the demod
+    IQ lands as three separated points of similar magnitude — the 3-level clouds a ClassifierN tells
+    apart."""
+    iq = [_readout_iq(L) for L in range(3)]
+    mags = [abs(z) for z in iq]
+    assert min(mags) > 0.5 * max(mags)                    # similar magnitude
+    angs = [math.atan2(z.imag, z.real) for z in iq]
+    for a, b in ((0, 1), (1, 2), (0, 2)):
+        sep = abs((angs[a] - angs[b] + math.pi) % (2 * math.pi) - math.pi)
+        assert sep > math.radians(90), f"levels {a},{b} phases too close: {math.degrees(sep):.0f}°"
+
+
+def test_threelevel_multimodel_and_dac_ids():
+    """The qutrit slots into MultiModel like the two-level one; soft mode reads only the gate DAC,
+    collapse mode adds the readout DAC (the window trigger)."""
+    soft = models.ThreeLevelModel(M, core=0)
+    coll = models.ThreeLevelModel(M, core=0, collapse=True)
+    assert soft.dac_ids() == [M.gate_dac(0)]
+    assert set(coll.dac_ids()) == {M.gate_dac(0), M.ro_dac(0)}
+    built = models.build_model({"kind": "threelevel", "core": 0, "f_ge": 50e6, "f_ef": 25e6}, M)
+    assert isinstance(built, models.ThreeLevelModel)
+
+
+# ── TwoQubitModel: two qutrits + a flux coupler for the CZ cal (spec two-qubit/01 §6) ──
+
+M2Q = SocMap(SocParams.load(Path(__file__).resolve().parents[1] / "configs" / "sim-2q1c.json"))
+# f_GE(control) at code 500 and f_EF(target) at code 2548 put the |11>-|02> resonance at code 2048:
+# f_CZ = |f_EF(target) - f_GE(control)| = code_to_freq(2048). The partner frequencies (f_GE(target),
+# f_EF(control)) are distinct codes that never get driven in the coupler-only tests.
+_CZ_CODE = 2048
+_FG = (units.code_to_freq(500, M2Q.params), units.code_to_freq(3000, M2Q.params))
+_FE = (units.code_to_freq(5000, M2Q.params), units.code_to_freq(2548, M2Q.params))
+
+
+def _tq_tone(code, amp, t, n=BATCH_SIZE):
+    """One batch of a square-envelope DAC carrier at `code` (SF16), amplitude `amp`, at batch `t`."""
+    k = BATCH_SIZE * t + np.arange(n)
+    return np.rint(amp * np.cos(math.pi * code * k / (1 << 15))).astype(np.int64)
+
+
+def _tq(**kw):
+    return models.TwoQubitModel(M2Q, f_ge=_FG, f_ef=_FE, **kw)
+
+
+def _coupler_dac(code, amp, t):
+    """A DAC dict with the coupler channel (DAC 3) driven and both gate channels (DAC 0, 1) idle."""
+    z = np.zeros(BATCH_SIZE, dtype=np.int64)
+    return {0: z, 1: z, 3: _tq_tone(code, amp, t)}
+
+
+def _drive_coupler(md, code, amp, batches):
+    for t in range(batches):
+        md.adc_batch(t, _coupler_dac(code, amp, t))
+
+
+def test_twoqubit_dac_ids_and_build():
+    """Reads both gate DACs + the coupler drive; collapse adds the shared readout DAC (window trigger).
+    build_model constructs it from a JSON-serializable spec (tuple params arrive as lists)."""
+    soft = _tq()
+    coll = _tq(collapse=True)
+    assert soft.dac_ids() == [M2Q.gate_dac(0), M2Q.gate_dac(1), M2Q.gate_dac(2)]
+    assert coll.dac_ids() == [M2Q.gate_dac(0), M2Q.gate_dac(1), M2Q.gate_dac(2), M2Q.ro_dac(0)]
+    built = models.build_model({"kind": "twoqubit", "f_ge": [50e6, 60e6], "f_ef": [30e6, 35e6],
+                                "rabi_cz_rad_per_amp": 1e-4}, M2Q)
+    assert isinstance(built, models.TwoQubitModel)
+
+
+def test_twoqubit_single_qubit_drive_is_product_preserving():
+    """A gate drive on one qubit rotates only its subspace and leaves the partner's state exactly put —
+    the state stays a PRODUCT (no spurious entanglement). Control GE-π excites control while the target
+    marginal stays |0>; then target GE-π reaches |11>."""
+    A = 10000.0
+    md = _tq(rabi_ge=(math.pi / A, math.pi / A))
+    md.adc_batch(0, _coupler_dac(0, 0, 0) | {0: _tq_tone(500, A, 0)})   # GE drive on control
+    mc, mt = md.marginals()
+    assert mc[1] > 0.7 and mc[2] < 1e-9, f"control not excited into |1>: {mc}"
+    assert np.allclose(mt, [1, 0, 0], atol=1e-12), f"target disturbed by control's drive: {mt}"
+    # product state: psi factorizes (rank-1), i.e. the joint pops are the outer product of marginals
+    assert np.allclose(md.populations(), np.outer(mc, mt), atol=1e-12), "state is not a product"
+    md.adc_batch(1, _coupler_dac(0, 0, 1) | {1: _tq_tone(3000, A, 1)})  # GE drive on target
+    mc, mt = md.marginals()
+    assert mc[1] > 0.7 and mt[1] > 0.7, f"pair did not reach |11>: ctrl {mc} tgt {mt}"
+
+
+def test_twoqubit_cz_resonance_centered_at_fcz():
+    """The parametric drive Rabi-flops |11>-|02> and the transfer peaks when the coupler carrier hits
+    f_CZ = |f_EF(target) - f_GE(control)| — the resonance the CZ Frequency cal argmaxes. Off resonance
+    the transfer falls off symmetrically; on resonance it reaches full transfer."""
+    A, N = 10000.0, 40
+    rabi_cz = math.pi / (N * A)                                    # resonant π at N batches
+    sweep = list(range(_CZ_CODE - 80, _CZ_CODE + 81, 20))
+    p02 = []
+    for code in sweep:
+        md = _tq(rabi_cz_rad_per_amp=rabi_cz)
+        md._psi[:] = 0.0; md._psi[1, 1] = 1.0
+        _drive_coupler(md, code, A, N)
+        p02.append(md.populations()[0, 2])
+    assert sweep[int(np.argmax(p02))] == _CZ_CODE, f"resonance not at f_CZ: P02={np.round(p02, 3)}"
+    assert p02[len(sweep) // 2] > 0.99, f"no full transfer on resonance: {p02[len(sweep) // 2]:.3f}"
+    assert p02[0] < 0.2 and p02[-1] < 0.2, "transfer did not fall off away from resonance"
+
+
+def test_twoqubit_offresonant_transfer_matches_rabi_formula():
+    """Detuning the coupler carrier reduces the |11>->|02> transfer as the off-resonant Rabi law
+    Ω²/(Ω²+Δ²)·sin²(√(Ω²+Δ²)·N/2), with Ω the resonant rotation rate and Δ the demod axis-ramp rate —
+    the closed form that emerges from rotating about a ramping equatorial axis (spec 01 §6)."""
+    A, N = 10000.0, 40
+    rabi_cz = math.pi / (N * A)
+    Om = rabi_cz * A                                              # rad/batch on resonance
+    for dc in (20, 40, 60):
+        md = _tq(rabi_cz_rad_per_amp=rabi_cz)
+        md._psi[:] = 0.0; md._psi[1, 1] = 1.0
+        _drive_coupler(md, _CZ_CODE + dc, A, N)
+        obs = md.populations()[0, 2]
+        dlt = dc * BATCH_SIZE * math.pi / (1 << 15)               # axis-ramp per batch (the detuning)
+        g = math.hypot(Om, dlt)
+        pred = (Om ** 2 / g ** 2) * math.sin(g * N / 2) ** 2
+        assert abs(obs - pred) < 0.02, f"dc={dc}: obs P02={obs:.4f} vs Rabi-law {pred:.4f}"
+
+
+def test_twoqubit_cz_conditional_phase():
+    """The gate: a full 2π |11>->|02>->|11> round trip is -I on the {|11>, |02>} subspace, so |11>
+    returns with a π phase while |00>/|01>/|10> are untouched — a conditional-π (CZ). Prep an equal
+    superposition of the four computational states, drive a resonant 2π, and only |11> flips sign."""
+    A, N = 10000.0, 40
+    md = _tq(rabi_cz_rad_per_amp=math.pi / (N * A))
+    md._psi[:] = 0.0
+    for a in (0, 1):
+        for b in (0, 1):
+            md._psi[a, b] = 0.5
+    _drive_coupler(md, _CZ_CODE, A, 2 * N)                        # 2π total → -I on {|11>, |02>}
+    got = {(a, b): md._psi[a, b] for a in (0, 1) for b in (0, 1)}
+    assert abs(got[(0, 0)] - 0.5) < 1e-3 and abs(got[(0, 1)] - 0.5) < 1e-3, "single-excitation states moved"
+    assert abs(got[(1, 0)] - 0.5) < 1e-3, "single-excitation state moved"
+    assert abs(got[(1, 1)] + 0.5) < 1e-3, f"|11> did not pick up the conditional π: {got[(1, 1)]:+.4f}"
+    assert md.populations()[0, 2] < 1e-3, "population did not return from |02>"
+
+
+def test_twoqubit_zz_shifts_only_the_control_1_branch():
+    """The static ζ|11><11| term (JAZZ, spec 01 §4.3): a target Ramsey precesses at rate ζ ONLY when the
+    control is |1> (phase accrues on |11>), and not at all with the control in |0> — so ZZ = f(c=1) −
+    f(c=0) recovers ζ. Verified as accumulated phase over N idle batches (t1 off)."""
+    zeta, N = 0.05, 30
+    dphi = {}
+    for ctrl in (0, 1):
+        md = _tq(zz_rad_per_batch=zeta)
+        md._psi[:] = 0.0
+        md._psi[ctrl, 0] = md._psi[ctrl, 1] = 1.0 / math.sqrt(2)
+        z = np.zeros(BATCH_SIZE, dtype=np.int64)
+        for t in range(N):
+            md.adc_batch(t, {0: z, 1: z, 3: z})                  # idle: only ZZ acts
+        dphi[ctrl] = math.atan2(md._psi[ctrl, 1].imag, md._psi[ctrl, 1].real) - \
+            math.atan2(md._psi[ctrl, 0].imag, md._psi[ctrl, 0].real)
+    assert abs(dphi[0]) < 1e-9, f"control |0> branch precessed: {dphi[0]}"
+    assert abs(dphi[1] - (-N * zeta)) < 1e-9, f"control |1> branch: {dphi[1]} vs {-N * zeta}"
+
+
+def test_twoqubit_readout_is_frequency_multiplexed():
+    """Each qubit emits its readout tone at a distinct code, summed on the shared ADC; demodulating
+    against each code recovers that qubit's level phase (soft mode). Prep |1,0>: control reads the |1>
+    tone (120°), target the |0> tone (0°)."""
+    code = (2048, 1024)
+
+    def demod(md, c, nb=24):
+        z = np.zeros(BATCH_SIZE, dtype=np.int64)
+        acc = 0j
+        for t in range(nb):
+            lanes = md.adc_batch(t, {0: z, 1: z, 3: z})[md.adc[0]].astype(float)
+            k = np.arange(ADC_BATCH)
+            acc += np.sum(lanes * np.exp(-1j * math.pi * c * (ADC_BATCH * t + k) / (1 << 15)))
+        return acc
+
+    a = _tq(readout_code=code); a._psi[:] = 0; a._psi[1, 0] = 1.0
+    b = _tq(readout_code=code); b._psi[:] = 0; b._psi[1, 0] = 1.0
+    ang0 = math.degrees(math.atan2((z0 := demod(a, 2048)).imag, z0.real))
+    ang1 = math.degrees(math.atan2((z1 := demod(b, 1024)).imag, z1.real))
+    assert abs((ang0 - 120 + 180) % 360 - 180) < 25, f"control |1> tone at {ang0:.0f}° (want 120°)"
+    assert abs((ang1 - 0 + 180) % 360 - 180) < 25, f"target |0> tone at {ang1:.0f}° (want 0°)"
+
+
+def test_twoqubit_collapse_samples_the_joint_pair_state():
+    """Projective readout draws one JOINT (a, b) per window from |psi|² and collapses the pair to it, so
+    the two cores' per-shot bits are correlated draws from the pair state (the joint counts, spec 01 §5).
+    Repeatedly re-prep a known joint superposition and the sampled histogram matches |psi|²."""
+    md = _tq(collapse=True, noise_seed=2)
+    target = np.zeros((3, 3), complex)
+    target[0, 0], target[1, 1], target[0, 1] = math.sqrt(0.5), math.sqrt(0.3), math.sqrt(0.2)
+    z, on = np.zeros(BATCH_SIZE, dtype=np.int64), np.full(BATCH_SIZE, 8000, dtype=np.int64)
+    n, counts = 8000, {}
+    for i in range(n):
+        md._psi[:] = target
+        md._ro_active = False
+        md.adc_batch(2 * i, {0: z, 1: z, 3: z, 2: z})            # ro idle → arm the edge
+        md.adc_batch(2 * i + 1, {0: z, 1: z, 3: z, 2: on})       # rising edge → sample + collapse
+        counts[md._shot] = counts.get(md._shot, 0) + 1
+    for cell, amp in (((0, 0), 0.5), ((1, 1), 0.3), ((0, 1), 0.2)):
+        assert abs(counts.get(cell, 0) / n - amp) < 0.03, f"{cell}: {counts.get(cell, 0) / n:.3f} vs {amp}"
+    assert set(counts) <= {(0, 0), (1, 1), (0, 1)}, f"sampled a zero-amplitude state: {set(counts)}"
+
+
+def test_twoqubit_jazz_zz_physics():
+    """The ζ|11><11| term under the BIRD echo drives the JAZZ measurement (spec two-qubit/01 §4.3): an
+    ideal echo Ramsey on the target (X90 · idle w · π-on-both · idle w · Rz · close) with the control in
+    |0>/|1> gives the target a control-conditional fringe whose frequency splits by the ZZ. This is the
+    ground truth the `JAZZ` cal recovers — verified here with ideal ops so it is deterministic and
+    decoupled from co-sim readout SNR: f(control=1) − f(control=0) tracks the planted ζ SIGN and
+    vanishes at ζ=0 (a control-independent target ⇒ no split)."""
+    PI = math.pi
+    ws = np.arange(2, 82, 2)
+
+    def shot(zeta_b, ctrl, w, phi, quad):
+        md = models.TwoQubitModel(M2Q, f_ge=(50e6, 50e6), f_ef=(25e6, 25e6), zz_rad_per_batch=zeta_b)
+        md._psi[:] = 0.0
+        md._psi[0, 0] = 1.0
+        if ctrl == 1:
+            md._rotate(0, (0, 1), PI, 0.0)                        # control |0> → |1>
+        md._rotate(1, (0, 1), PI / 2, 0.0)                        # target X90
+        for _ in range(2 * int(w)):                               # 2 idle halves; π-echo negates half 1
+            md._psi[1, 1] *= complex(math.cos(zeta_b), -math.sin(zeta_b))
+            if _ == int(w) - 1:
+                md._rotate(0, (0, 1), PI, 0.0)                    # echo π on both at the midpoint
+                md._rotate(1, (0, 1), PI, 0.0)
+        md._rotate(1, (0, 1), PI / 2, phi + (PI / 2 if quad else 0.0))   # Rz(phi)+close (Y90 if quad)
+        return float(md.marginals()[1][1])                        # target P(|1>)
+
+    def split_freq(zeta_b, ctrl):
+        phis = 2 * PI * 0.02 * ws                                 # a small applied detuning per w
+        I = np.array([shot(zeta_b, ctrl, w, p, 0) for w, p in zip(ws, phis)])
+        Q = np.array([shot(zeta_b, ctrl, w, p, 1) for w, p in zip(ws, phis)])
+        z = (I - I.mean()) - 1j * (Q - Q.mean())
+        return np.fft.fftfreq(len(ws), d=ws[1] - ws[0])[int(np.argmax(np.abs(np.fft.fft(z))))]
+
+    for zz in (0.12, -0.12):                                      # planted ζ (rad/batch), both signs
+        zz_split = split_freq(zz, 1) - split_freq(zz, 0)
+        assert np.sign(zz_split) == -np.sign(zz), f"ZZ split sign did not track ζ={zz}: {zz_split}"
+        assert abs(zz_split) > 0.02, f"ZZ split vanished for ζ={zz}: {zz_split}"
+    assert abs(split_freq(0.0, 1) - split_freq(0.0, 0)) < 1e-9    # ζ=0 ⇒ no control-conditional split
+
+
+def test_twoqubit_cz_conditionality_R_peaks_at_the_cz():
+    """The conditionality metric R (spec two-qubit/01 §4.5) reaches its MAX at the CZ's π-phase point:
+    the target Ramsey `Y90 · CZ^n · close` measured with the control in |0>/|1> gives R = √((ΔP0_X)² +
+    (ΔP0_Y)²) = 1 only when the coupler drive is a full |11>→|02>→|11> round trip (2π), which stamps a
+    conditional π on |11>. This is the ground truth `CZFrequency`/`CZAmplitude` argmax/vertex on — the
+    fit MATH is exercised host-pure in test_twoqubit; here the MODEL physics: R vanishes with no drive
+    (the control can't touch the target), peaks at the full round trip, and a half trip (population
+    stranded in |02>) is NOT the max. Ideal Ramsey ops + the real parametric coupler drive, no readout
+    SNR (deterministic, decoupled from co-sim relaxation — the spec 01 §4.3 pattern)."""
+    PI, A, N = math.pi, 10000.0, 40
+    rabi_cz = PI / (N * A)                                        # resonant π at N batches (half trip)
+
+    def p0_target(ctrl, quad, cz_batches):
+        md = _tq(rabi_cz_rad_per_amp=rabi_cz)
+        md._psi[:] = 0.0
+        md._psi[0, 0] = 1.0
+        if ctrl == 1:
+            md._rotate(0, (0, 1), PI, 0.0)                       # control |0> → |1>
+        md._rotate(1, (0, 1), PI / 2, PI / 2)                    # target Y90
+        _drive_coupler(md, _CZ_CODE, A, cz_batches)              # CZ^n as a resonant coupler drive
+        md._rotate(1, (0, 1), PI / 2, PI / 2 if quad == 0 else 0.0)   # close Y90 (X-seq) / X90 (Y-seq)
+        return float(md.marginals()[1][0])                       # target P(0)
+
+    def R(cz_batches):
+        p = {(c, q): p0_target(c, q, cz_batches) for c in (0, 1) for q in (0, 1)}
+        return math.hypot(p[(1, 0)] - p[(0, 0)], p[(1, 1)] - p[(0, 1)])
+
+    r_none, r_half, r_full = R(0), R(N), R(2 * N)                 # no CZ, half trip (|02>), full 2π
+    assert r_none < 0.05, f"R with no CZ should vanish (control can't touch the target): {r_none:.3f}"
+    assert r_full > 0.95, f"R at the full round trip (conditional π) should be ≈1: {r_full:.3f}"
+    assert r_full > r_half + 0.3, f"R must MAX at the full trip, not the half trip: {r_half:.3f} vs {r_full:.3f}"
+
+
+# ── TwoQubitModel drive form (spec two-qubit/04 §4.6 / X3): the two-line CZ activation ──
+
+# Drive-form f_CZ = (f_11 + f_02)/4 = (f_ge0 + 2·f_ge1 + f_ef1)/4 → code (2048 + 2·2048 + 10240)/4
+# = 4096, well separated from every per-qubit GE/EF code so the 3-way demod argmax is unambiguous
+# (and 4096's counter-rotating demod term integrates to EXACTLY zero over a 16-sample batch, so the
+# recovered phases/amplitudes are numerically exact and the closed-form asserts can be tight).
+_DFG = (units.code_to_freq(2048, M.params), units.code_to_freq(2048, M.params))
+_DFE = (units.code_to_freq(6000, M.params), units.code_to_freq(10240, M.params))
+_DCZ_CODE = 4096
+
+
+def _tqd(**kw):
+    """A drive-form TwoQubitModel on the 2-core sim-2q map (no coupler anywhere — the X6Y3 layout)."""
+    return models.TwoQubitModel(M, coupler=None, f_ge=_DFG, f_ef=_DFE, **kw)
+
+
+def _two_line_dac(code, amp0, amp1, dphi, t):
+    """Both gate DACs (sim-2q: DAC 0/1) driving the CZ tone at `code` — line 0 at phase 0, line 1 at
+    the relative phase `dphi` — at absolute batch `t` (the carriers are time-referenced, as on HW)."""
+    k = BATCH_SIZE * t + np.arange(BATCH_SIZE)
+    mk = lambda a, p: np.rint(a * np.cos(math.pi * code * k / (1 << 15) + p)).astype(np.int64)
+    return {0: mk(amp0, 0.0), 1: mk(amp1, dphi)}
+
+
+def test_twoqubit_drive_form_dac_ids_and_build():
+    """coupler=None selects the drive form: no coupler DAC — the CZ activation reads the pair's own
+    gate DACs; build_model maps an ABSENT "coupler" key to the drive form (X6Y3 has no couplers) and
+    an explicit one to the coupler path, byte-identical."""
+    md = _tqd()
+    assert md.dac_ids() == [M.gate_dac(0), M.gate_dac(1)]
+    built = models.build_model({"kind": "twoqubit", "f_ge": [50e6, 60e6], "f_ef": [30e6, 35e6]}, M)
+    assert isinstance(built, models.TwoQubitModel) and built.coupler_dac is None
+    withc = models.build_model({"kind": "twoqubit", "coupler": 2,
+                                "f_ge": [50e6, 60e6], "f_ef": [30e6, 35e6]}, M2Q)
+    assert withc.coupler_dac == M2Q.gate_dac(2)
+
+
+def test_twoqubit_drive_form_fcz_from_own_spectrum():
+    """The drive-form activation frequency comes from the model's OWN f_ge/f_ef — the in-band
+    (f_11 + f_02)/4 tone (the calc_cz_frequency(form='drive') arithmetic, spec 04 §1) — never
+    planted; the coupler path keeps its parametric |f_EF(t) − f_GE(c)| detuning untouched."""
+    assert _tqd()._cz_code == _DCZ_CODE
+    assert _tqd()._cz_code == units._freq_code((_DFG[0] + 2 * _DFG[1] + _DFE[1]) / 4, M.params)
+    assert _tq()._cz_code == _CZ_CODE                             # coupler path: unchanged
+
+
+def test_twoqubit_drive_form_activation_peaks_at_fcz():
+    """(X3 gate) the drive-form transfer peaks at f_CZ: both gate lines swept LOCKSTEP around the
+    in-band resonance Rabi-flop |11>↔|02> exactly as the coupler path does — full transfer on
+    resonance, symmetric falloff off it (both demod args ramp together, so the axis-ramp mechanics
+    and the Ω²/(Ω²+Δ²) law carry over verbatim)."""
+    A, N = 10000.0, 40
+    rabi_cz = math.pi / (N * 2 * A)                               # two aligned lines: |E| = 2A → π at N
+    sweep = list(range(_DCZ_CODE - 80, _DCZ_CODE + 81, 20))
+    p02 = []
+    for code in sweep:
+        md = _tqd(rabi_cz_rad_per_amp=rabi_cz)
+        md._psi[:] = 0.0; md._psi[1, 1] = 1.0
+        for t in range(N):
+            md.adc_batch(t, _two_line_dac(code, A, A, 0.0, t))
+        p02.append(md.populations()[0, 2])
+    assert sweep[int(np.argmax(p02))] == _DCZ_CODE, f"resonance not at f_CZ: P02={np.round(p02, 3)}"
+    assert p02[len(sweep) // 2] > 0.99, f"no full transfer on resonance: {p02[len(sweep) // 2]:.3f}"
+    assert p02[0] < 0.2 and p02[-1] < 0.2, "transfer did not fall off away from resonance"
+
+
+def test_twoqubit_drive_form_rate_is_the_coherent_two_line_sum():
+    """(X3 gate) the effective drive is the COHERENT sum of the two lines' phasors: |E| =
+    |A_c + A_t·e^{iΔφ}| = 2A·cos(Δφ/2) for equal lines. Δφ = 0 doubles a single line (a full π at N
+    batches); Δφ = π extinguishes the activation entirely (|11> does not move at all); intermediate
+    Δφ follows the closed form — the relative-phase lever RelativePhase turns; one line alone still
+    activates at half rate."""
+    A, N = 10000.0, 40
+    rabi_cz = math.pi / (N * 2 * A)
+
+    def p02(dphi, amp1=A):
+        md = _tqd(rabi_cz_rad_per_amp=rabi_cz)
+        md._psi[:] = 0.0; md._psi[1, 1] = 1.0
+        for t in range(N):
+            md.adc_batch(t, _two_line_dac(_DCZ_CODE, A, amp1, dphi, t))
+        return float(md.populations()[0, 2])
+
+    assert p02(0.0) > 0.99, f"aligned lines must reach a full π: {p02(0.0):.3f}"
+    assert p02(math.pi) < 1e-6, f"anti-phase lines must cancel (E = 0): {p02(math.pi):.2e}"
+    for dphi in (math.pi / 2, 2.0):
+        theta = math.pi * math.cos(dphi / 2)                      # rabi_cz·|E|·N = π·cos(Δφ/2)
+        assert abs(p02(dphi) - math.sin(theta / 2) ** 2) < 0.02, \
+            f"Δφ={dphi}: P02={p02(dphi):.4f} vs closed form {math.sin(theta / 2) ** 2:.4f}"
+    assert abs(p02(0.0, amp1=0.0) - 0.5) < 0.02                   # one line: θ = π/2 → P02 = 1/2
+
+
+def test_twoqubit_drive_form_conditional_pi_round_trip():
+    """(X3 gate) the round trip is the SAME {|11>, |02>} rotation mechanics as the coupler path
+    (test_twoqubit_cz_conditional_phase): a resonant 2π on the two aligned lines is −I on the
+    subspace — |11> flips sign, |00>/|01>/|10> untouched (the argmax reads the in-band tone as the
+    CZ carrier, never as a GE/EF drive), population returned from |02>."""
+    A, N = 10000.0, 40
+    md = _tqd(rabi_cz_rad_per_amp=math.pi / (N * 2 * A))
+    md._psi[:] = 0.0
+    for a in (0, 1):
+        for b in (0, 1):
+            md._psi[a, b] = 0.5
+    for t in range(2 * N):                                        # 2π total → −I on {|11>, |02>}
+        md.adc_batch(t, _two_line_dac(_DCZ_CODE, A, A, 0.0, t))
+    got = {(a, b): md._psi[a, b] for a in (0, 1) for b in (0, 1)}
+    assert abs(got[(0, 0)] - 0.5) < 1e-3 and abs(got[(0, 1)] - 0.5) < 1e-3, "single-excitation states moved"
+    assert abs(got[(1, 0)] - 0.5) < 1e-3, "single-excitation state moved"
+    assert abs(got[(1, 1)] + 0.5) < 1e-3, f"|11> did not pick up the conditional π: {got[(1, 1)]:+.4f}"
+    assert md.populations()[0, 2] < 1e-3, "population did not return from |02>"
+
+
+def test_twoqubit_drive_form_R_extremal_at_optimal_relative_phase():
+    """(X3 gate C) the RelativePhase physics probe: with amp/duration tuned for a full 2π round trip
+    at the model's OPTIMAL relative phase (Δφ = 0, where the absolute-time-referenced lines add
+    coherently), the conditionality R(Δφ) is extremal there — R ≈ 1 at the optimum, starved as
+    |E| = 2A·cos(Δφ/2) shortens the round trip, and 0 at the anti-phase null. Ideal Ramsey ops + the
+    real two-line drive (the test_twoqubit_cz_conditionality_R_peaks_at_the_cz pattern)."""
+    PI, A, N = math.pi, 10000.0, 40
+    rabi_cz = PI / (N * 2 * A)
+
+    def p0_target(ctrl, quad, dphi):
+        md = _tqd(rabi_cz_rad_per_amp=rabi_cz)
+        md._psi[:] = 0.0
+        md._psi[0, 0] = 1.0
+        if ctrl == 1:
+            md._rotate(0, (0, 1), PI, 0.0)                        # control |0> → |1>
+        md._rotate(1, (0, 1), PI / 2, PI / 2)                     # target Y90
+        for t in range(2 * N):                                    # the CZ: a full 2π at Δφ = 0
+            md.adc_batch(t, _two_line_dac(_DCZ_CODE, A, A, dphi, t))
+        md._rotate(1, (0, 1), PI / 2, PI / 2 if quad == 0 else 0.0)   # close Y90 / X90
+        return float(md.marginals()[1][0])                        # target P(0)
+
+    def R(dphi):
+        p = {(c, q): p0_target(c, q, dphi) for c in (0, 1) for q in (0, 1)}
+        return math.hypot(p[(1, 0)] - p[(0, 0)], p[(1, 1)] - p[(0, 1)])
+
+    r = {d: R(d) for d in (0.0, 2.0, -2.0, math.pi)}
+    assert r[0.0] > 0.95, f"R at the optimal relative phase should be ≈1: {r[0.0]:.3f}"
+    assert r[0.0] > r[2.0] + 0.3 and r[0.0] > r[-2.0] + 0.3, \
+        f"R must peak at the optimum: {r[0.0]:.3f} vs ±2.0 rad {r[2.0]:.3f}/{r[-2.0]:.3f}"
+    assert r[math.pi] < 0.05, f"R at the anti-phase null should vanish: {r[math.pi]:.3f}"
+
+
+# ── ClassifierN: the N-cluster readout GMM (nearest-mean over labelled clusters) ──
+
+def test_classifiern_separates_three_clusters():
+    from riscq.cal import ClassifierN
+    rng = np.random.default_rng(0)
+    c0 = rng.normal([1000, 0], 60, (50, 2))
+    c1 = rng.normal([-500, 866], 60, (50, 2))            # 120° around the origin
+    c2 = rng.normal([-500, -866], 60, (50, 2))
+    clf = ClassifierN([c0, c1, c2])
+    assert clf.means.shape == (3, 2)
+    conf = clf.confusion()
+    assert np.all(np.diag(conf) > 0.95)                  # each level classified as itself
+    assert np.allclose(conf.sum(1), 1.0)
+    assert clf.separation > 1.0                          # well separated (qcal SNR)

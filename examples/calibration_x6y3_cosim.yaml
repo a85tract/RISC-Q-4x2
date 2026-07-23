@@ -34,6 +34,30 @@ single_qubit:
           env: square
           time: 8.0e-08
           kwargs: {amp: 0.495, phase: 0.0}
+    EF:                       # the EF subspace (spec 04 §2 / X0 — from_qcal REQUIRES it);
+      freq: 450000000.0       # placeholder scale — the 1Q chain never plays it
+      T1: 6.0e-06
+      T2*: 3.0e-05
+      X90:
+        pulse:
+        - channel: Q0.qdrv
+          env: virtualz
+          time: 0.0
+          kwargs: {phase: 0.0}
+        - channel: Q0.qdrv
+          env: square
+          time: 4.0e-08
+          kwargs: {amp: 0.4, phase: 0.0}
+        - channel: Q0.qdrv
+          env: virtualz
+          time: 0.0
+          kwargs: {phase: 0.0}
+      X:
+        pulse:
+        - channel: Q0.qdrv
+          env: square
+          time: 8.0e-08
+          kwargs: {amp: 0.4, phase: 0.0}
   1:
     GE:
       freq: 50000000.0
@@ -60,6 +84,30 @@ single_qubit:
           time: 8.0e-08
           kwargs: {amp: 0.495, phase: 0.0}
 
+    EF:                       # the EF subspace (spec 04 §2 / X0 — from_qcal REQUIRES it);
+      freq: 650000000.0       # placeholder scale — the 1Q chain never plays it
+      T1: 6.0e-06
+      T2*: 3.0e-05
+      X90:
+        pulse:
+        - channel: Q1.qdrv
+          env: virtualz
+          time: 0.0
+          kwargs: {phase: 0.0}
+        - channel: Q1.qdrv
+          env: square
+          time: 4.0e-08
+          kwargs: {amp: 0.4, phase: 0.0}
+        - channel: Q1.qdrv
+          env: virtualz
+          time: 0.0
+          kwargs: {phase: 0.0}
+      X:
+        pulse:
+        - channel: Q1.qdrv
+          env: square
+          time: 8.0e-08
+          kwargs: {amp: 0.4, phase: 0.0}
 readout:
   0:
     channel: 0

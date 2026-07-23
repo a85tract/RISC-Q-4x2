@@ -99,6 +99,12 @@ class SocParams:
     link_pipe: int
     with_mul: bool
     dsp_freq_hz: float
+    # Optional per-build converter maps (the same GenPulseTableSocJson reads to wire the elaboration; None
+    # = the generic ZCU216 SocChannelMap layout). Software reads them too so the co-sim model drives/reads
+    # the SAME converters the hardware wired: dac_map[core] = (gateDac, readoutDriveDac); adc_map[core] =
+    # the core's demod ADC. Held as tuples (a frozen dataclass must stay hashable).
+    dac_map: tuple | None = None
+    adc_map: tuple | None = None
 
     @classmethod
     def load(cls, json_path: str | Path) -> "SocParams":
@@ -113,8 +119,8 @@ class SocParams:
         raw.setdefault("demod_interp", 4)   # optional (added with the envelope-shaped demod); default 4
         raw.setdefault("with_mul", True)    # optional; Zmmul multiply is on by default (RiscqParam.withMul)
         raw.setdefault("rob_depth", 1024)   # optional; readout-trace ROB depth default (PulseTableSoc)
-        raw.pop("dac_map", None)            # hardware-only converter maps (GenPulseTableSocJson);
-        raw.pop("adc_map", None)            # software addresses every converter by dac_num/adc_num
+        dac_map = raw.pop("dac_map", None)  # optional converter maps: kept (the channel-role mapping — the
+        adc_map = raw.pop("adc_map", None)  # co-sim model needs them), unlike the hardware-only knobs below
         raw.pop("queue_depth", None)        # hardware-only TimedQueue depth; software uses slot count, not depth
         unknown = set(raw) - set(_FIELDS)
         if unknown:
@@ -122,10 +128,20 @@ class SocParams:
         missing = set(_FIELDS) - set(raw)
         if missing:
             raise ValueError(f"missing SocParams fields: {sorted(missing)}")
-        return cls(**{k: _FIELDS[k](raw[k]) for k in _FIELDS})
+        kwargs = {k: _FIELDS[k](raw[k]) for k in _FIELDS}
+        if dac_map is not None:
+            kwargs["dac_map"] = tuple(tuple(int(x) for x in row) for row in dac_map)
+        if adc_map is not None:
+            kwargs["adc_map"] = tuple(int(x) for x in adc_map)
+        return cls(**kwargs)
 
     def to_json(self) -> str:
-        return json.dumps({k: getattr(self, k) for k in _FIELDS}, indent=4)
+        out = {k: getattr(self, k) for k in _FIELDS}
+        if self.dac_map is not None:
+            out["dac_map"] = [list(row) for row in self.dac_map]
+        if self.adc_map is not None:
+            out["adc_map"] = list(self.adc_map)
+        return json.dumps(out, indent=4)
 
 
 @dataclass(frozen=True)
@@ -285,16 +301,29 @@ class SocMap:
         self.channel(index)   # validate the index (ValueError on unknown)
         return (self.gate_env, self.ro_env, self.demod_env)[index](core)
 
-    # ── channel -> converter map (mirrors SocChannelMap in PulseTableSoc.scala) ──
+    # ── channel -> converter map: the build's dac_map/adc_map when it carries them (sim-2q1c and any
+    # per-build JSON), else the generic ZCU216 SocChannelMap layout (PulseTableSoc.scala) the default
+    # configs elaborate. The co-sim model reads these to drive/read the converters the hardware wired. ──
     def gate_dac(self, core: int) -> int:
-        return self._core(core)
+        core = self._core(core)
+        if self.params.dac_map is not None:
+            return self.params.dac_map[core][0]
+        return core
 
     def ro_dac(self, core: int) -> int:
-        """Readout-drive DAC, shared/summed: cores 0-6 -> DAC 14, 7+ -> DAC 15."""
-        return 14 if self._core(core) < 7 else 15
+        """Readout-drive DAC, shared/summed. Config dac_map when present; else the default layout
+        (cores 0-6 -> DAC 14, 7+ -> DAC 15)."""
+        core = self._core(core)
+        if self.params.dac_map is not None:
+            return self.params.dac_map[core][1]
+        return 14 if core < 7 else 15
 
     def adc_of(self, core: int) -> int:
-        return 0 if self._core(core) < 7 else 4
+        """Demod ADC. Config adc_map when present; else the default layout (cores 0-6 -> ADC 0, 7+ -> 4)."""
+        core = self._core(core)
+        if self.params.adc_map is not None:
+            return self.params.adc_map[core]
+        return 0 if core < 7 else 4
 
     def dac_pipe(self, dac_id: int) -> int:
         """dspClk register stages from a channel's scheduled pulse to its io_dac port. `PulseTableSoc`

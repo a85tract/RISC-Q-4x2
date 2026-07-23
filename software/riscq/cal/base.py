@@ -36,6 +36,33 @@ GATE_ENV = envelopes.square(16)   # default gate envelope (4 batches at gateInte
 GATE_CH = 0                       # the gate channel (the x90/x pulse table's channel)
 X90, X = 0, 1                     # the kernels' compile-time `prep_gate` binding (spec 13 §4)
 
+# ── deep-gate-train pacing (spec 14 F1) ──
+# Every PulseGenerator parameter sits behind a depth-4 TimedQueue on the posted RF link, and a push
+# into a FULL queue is silently DROPPED (no backpressure reaches the core), so a train may never have
+# more than TRAIN_AHEAD gates scheduled ahead of the one now playing. An UNPACED train therefore
+# plays its first 4 gates and drops every one after — measured in co-sim, exactly 4 of 96.
+#
+# Pacing alone is not enough: the core must also SUSTAIN one gate's pushes per train step, or the
+# params land after their pulse has begun and the gate plays TRUNCATED. Measured on the real kernels
+# at ngates=96 (co-sim gate DAC, tests/test_deep_trains): a step of 30 batches truncates ~56% of the
+# gates, 32 is the first clean step, so TRAIN_STEP carries a margin over that.
+#
+# For a 35 ns X6Y3 X90 (18 batches) the step therefore leaves an IDLE GAP between gates — a
+# documented deviation from qcal's back-to-back train. It costs wall time, not physics: the ladder's
+# amplified rotation is unchanged, and the extra decoherence is a UNIFORM contrast factor across the
+# sweep (every point sits on the same fixed grid), which leaves the parabola vertex — the calibrated
+# amplitude — where it was. Pulses at or above TRAIN_STEP (the 70 ns X, the 400 ns CZ) are already
+# slow enough and stay back-to-back.
+TRAIN_AHEAD = 4         # gates scheduled ahead of the playing one (the depth-4 queue contract)
+TRAIN_STEP = 36         # min batches per train gate: the core's sustained push rate (32) + margin
+
+
+def train_step(dur_batches: int) -> int:
+    """The grid step of an n-gate train: the pulse's own length when it is long enough for the core to
+    keep up, else TRAIN_STEP (an idle gap follows each gate). `TRAIN_AHEAD * step` is also the fire's
+    scheduling lead, which stays ≥ LEAD for every step this returns."""
+    return max(int(dur_batches), TRAIN_STEP)
+
 
 def qubits_list(qubits) -> list:
     """A calibration's `qubits` argument (spec 13 §8): a bare int is one qubit, so single-qubit
@@ -295,6 +322,32 @@ def x90_vz(cfg, q: int) -> dict:
     return {"vz0": pack16(c0), "vzsum": pack16(c0 + c1)}
 
 
+# ── EF-subspace gate table (spec two-qubit/01 §4.1) ──
+
+def ef_pulse(cfg, q: int, m, name: str = "x90") -> Pulse:
+    """The Config's own EF gate pulse `qubit/{q}/EF/{name}` ('x90' or 'x' — the X6Y3 EF X the
+    sandwich CZ shelves with, spec 04 §1) — its envelope (`env` + `kwargs`, default square) and
+    normalized `amp`/`phase`, BASEBAND (freq_hz=None): the EF carrier is programmed at runtime by
+    set_freq, not baked into the pulse, so it can share the gate channel with the GE prep."""
+    path = f"qubit/{q}/EF/{name}"
+    env = GATE_ENV if f"{path}/env" not in cfg \
+        else _channel_env(cfg, path, batches(cfg[f"{path}/dur"], m), GATE_CH, m)
+    return Pulse(env, amp=float(cfg[f"{path}/amp"]), phase=float(cfg.get(f"{path}/phase", 0.0)))
+
+
+def ef_table(cfg, q: int, m, name: str = "x90") -> tuple[ParamTable, int, int]:
+    """The gate table + SEATED carrier words for the EF calibrations → (table, ge_freq, ef_freq). The
+    table carries the GE prep X90 (slot "x90") and the EF gate `name` (slot "ef" — the X90 by
+    default, the config's EF X for the π-amplitude cal), BOTH baseband so the kernel drives each
+    segment at its own carrier: `ge_freq` = the config's GE carrier, `ef_freq` its EF carrier
+    (`qubit/{q}/EF/freq`). ONE NCO per channel, retuned between segments (spec 01 §4.1)."""
+    ge = gate_pulse(cfg, q, m)                                   # the config GE X90
+    ge = Pulse(ge.env, amp=ge.amp, phase=ge.phase)              # strip freq_hz → baseband
+    table = ParamTable(GATE_CH, qubit_freq(cfg, q), {"x90": ge, "ef": ef_pulse(cfg, q, m, name)})
+    return (table, units.freq_to_code(qubit_freq(cfg, q), m.params),
+            units.freq_to_code(float(cfg[f"qubit/{q}/EF/freq"]), m.params))
+
+
 # ── batched sweeps: one run is the whole sweep (spec 08 §2, §6; spec 09 computed knobs) ──
 
 def population(counts, shots: int, sign: int = 1) -> np.ndarray:
@@ -340,6 +393,33 @@ def rerun_counts(drv, m, progs, params, shots: int, timeout: int, signs, herald:
     Returns `{q: P}`."""
     out = rq.rerun(drv, m, progs, params=params, results=["out"], timeout=timeout)
     return {q: _counts_to_pop(out, q, shots, signs, herald) for q in progs}
+
+
+def _levels_pop(out_arr, npts: int, shots: int, classifier, level: int) -> np.ndarray:
+    """P(`level`) per point from a RAW capture's IQ (out sized 2·npts·shots, the point-major cursor the
+    RAW kernels write): reshape to (npts, shots, 2), classify every shot into a level with the 3-level
+    ClassifierN, and take the fraction that landed in `level` (spec two-qubit/01 §4.1 — the {|1>, |2>}
+    readout the hardware res sign cannot do, so it is host-side over the RAW shots)."""
+    iq = np.asarray(out_arr, dtype=float).reshape(npts, shots, 2)
+    return np.array([float(np.mean(classifier.classify(iq[i]) == level)) for i in range(npts)])
+
+
+def sweep_levels(drv, m, progs, params, npts: int, shots: int, timeout: int, classifiers,
+                 level: int = 2) -> dict:
+    """Batched RAW-mode sweep across ALL cores → `{q: P(level)}` via each core's pre-trained 3-level
+    ClassifierN (spec 01 §4.1): ONE `rq.run` of every core's `progs[q]`, the swept knob COMPUTED on-core
+    from the scalar `params[q]`. `classifiers[q]` is core q's ClassifierN, `level` the level to count
+    (2 → P(|2>), the target of an EF drive)."""
+    out = rq.run(drv, m, progs, params=params, results=["out"], timeout=timeout)
+    return {q: _levels_pop(out[q]["out"], npts, shots, classifiers[q], level) for q in progs}
+
+
+def rerun_levels(drv, m, progs, params, npts: int, shots: int, timeout: int, classifiers,
+                 level: int = 2) -> dict:
+    """Like `sweep_levels` but a `rq.rerun` of already-`setup` cores (the per-detuning reruns EFFrequency
+    issues over one resident image, mirroring `rerun_counts`). Returns `{q: P(level)}`."""
+    out = rq.rerun(drv, m, progs, params=params, results=["out"], timeout=timeout)
+    return {q: _levels_pop(out[q]["out"], npts, shots, classifiers[q], level) for q in progs}
 
 
 def acquire_shots(drv, m, progs, prep: int, shots: int, timeout: int) -> dict:

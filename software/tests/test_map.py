@@ -64,6 +64,43 @@ def test_sim_2q_numbers():
     assert m.demod_env(1) == 0x60000 + 0x1000
 
 
+def test_sim_2q1c_converter_map():
+    """sim-2q1c carries an explicit dac_map/adc_map (spec two-qubit/01 §1: core 2 = coupler C0_1).
+    SocParams retains them and SocMap's gate_dac/ro_dac/adc_of read them, so the co-sim model drives
+    and reads the same converters GenPulseTableSocJson wired — not the hardcoded ZCU216 default."""
+    m = _map("sim-2q1c")
+    assert m.params.qubit_num == 3
+    assert m.params.dac_map == ((0, 2), (1, 2), (3, 2))
+    assert m.params.adc_map == (0, 0, 0)
+    # gate on DAC 0/1/3 (core 2 = coupler on DAC 3), readout drives summed on DAC 2, all demod on ADC 0
+    assert [m.gate_dac(c) for c in range(3)] == [0, 1, 3]
+    assert [m.ro_dac(c) for c in range(3)] == [2, 2, 2]
+    assert [m.adc_of(c) for c in range(3)] == [0, 0, 0]
+    # three cores: region sized for 3 (pow2ceil(0x10000 * 3) = 0x40000)
+    assert m.region_size == 0x40000
+    assert m.imem(2) == 2 * 0x10000
+
+
+def test_converter_map_round_trips_through_json():
+    """The optional maps survive to_json/from_json (the co-sim get_params path serves the raw config,
+    but the remote runner ships to_json — either way the client SocMap must reconstruct them)."""
+    m = _map("sim-2q1c")
+    back = SocParams.from_json(m.params.to_json())
+    assert back == m.params
+    assert back.dac_map == ((0, 2), (1, 2), (3, 2)) and back.adc_map == (0, 0, 0)
+
+
+def test_default_converter_map_unchanged_without_maps():
+    """A config with no dac_map/adc_map (sim-2q, zcu216-14q) keeps the generic ZCU216 layout: gate on
+    the core's own DAC, readout drive on 14/15, demod on ADC 0/4."""
+    m = _map("sim-2q")
+    assert m.params.dac_map is None and m.params.adc_map is None
+    assert (m.gate_dac(0), m.gate_dac(1)) == (0, 1)
+    assert (m.ro_dac(0), m.adc_of(0)) == (14, 0)
+    m14 = _map("zcu216-14q")
+    assert (m14.gate_dac(13), m14.ro_dac(7), m14.adc_of(7)) == (13, 15, 4)
+
+
 def test_core_local_constants():
     m = _map("sim-2q")
     assert (m.CTRL_TIME_CMP, m.CTRL_WAIT_TIME_CMP, m.CTRL_TIME) == (0x4000, 0x4008, 0xBFF8)

@@ -15,6 +15,7 @@ from riscq.pulses import envelopes, units
 
 SW_ROOT = Path(__file__).resolve().parents[1]
 QCAL_YAML = SW_ROOT.parent / "build" / "qcal-x6y3-config" / "config.yaml"   # the artefact of record
+X6Y3_YAML = SW_ROOT.parent / "examples" / "cal-config-x6y3.yaml"            # its tracked twin
 PARAMS = SocParams.load(SW_ROOT / "configs" / "zcu216-14q.json")            # the X6Y3-class build
 
 
@@ -165,8 +166,8 @@ def test_from_qcal_hardware_matches_socparams(qcal_cfg):
 def test_save_qcal_writes_back_only_the_calibrated_fields(qcal_cfg, qcal_tree, tmp_path):
     """save_qcal re-emits a tree that still loads: the calibrated fields carry the new values (the
     X90's amp + its virtual-Z PAIR, the X's amp, GE freq/T1/T2*, the readout freq/amp, the demod
-    window + its phase back in DEGREES) and everything else — two-qubit gates, EF, reset pulses —
-    round-trips untouched."""
+    window + its phase back in DEGREES) and everything else round-trips as-loaded — reset pulses
+    untouched, EF/two_qubit written back with their unchanged values (X0)."""
     cal = qcal_cfg.copy()
     cal["qubit/3/freq"] = 5.4321e9
     cal["qubit/3/x90/amp"] = 0.123
@@ -207,6 +208,151 @@ def test_save_qcal_writes_back_only_the_calibrated_fields(qcal_cfg, qcal_tree, t
     assert back["qubit/3/x90/amp"] == 0.123
     assert back["readout/3/demod/phase"] == pytest.approx(math.radians(-30.0))
     assert back.to_dict() == cal.to_dict()
+
+
+def test_from_qcal_save_qcal_uncalibrated_is_verbatim(tmp_path):
+    """(X0 gate) load → touch nothing → save == input as PARSED TREES: EF and the whole `two_qubit`
+    section now round-trip THROUGH the adapter, not around it — string-reference pulse entries,
+    path-valued vz `freq` keys, `dynamical_decoupling`, all opaque — and the degrees-valued demod
+    phase stays verbatim unless recalibrated (degrees↔radians is not float-exact both ways: q4's
+    31.16847° would drift in the last ulp)."""
+    cfg = Config.from_qcal(X6Y3_YAML)
+    out = tmp_path / "config.yaml"
+    cfg.save_qcal(out)
+    with open(X6Y3_YAML) as f:
+        a = yaml.safe_load(f)
+    with open(out) as f:
+        b = yaml.safe_load(f)
+    assert b == a
+
+
+def test_from_qcal_loads_ef_and_two_qubit_and_writes_back(tmp_path):
+    """(X0 gate) the EF keys land on the paths the EF consumers read (base.ef_pulse:
+    `qubit/{q}/EF/x90/...`), the two_qubit subtrees are carried verbatim, and a calibrated EF/CZ
+    value survives save_qcal."""
+    cfg = Config.from_qcal(X6Y3_YAML)
+    with open(X6Y3_YAML) as f:
+        tree = yaml.safe_load(f)
+
+    ef = tree["single_qubit"][5]["EF"]
+    drive = [p for p in ef["X90"]["pulse"] if p["env"] != "virtualz"][0]
+    assert cfg["qubit/5/EF/freq"] == ef["freq"]
+    assert cfg["qubit/5/EF/T1"] == ef["T1"] and cfg["qubit/5/EF/T2"] == ef["T2*"]
+    assert cfg["qubit/5/EF/x90/env"] == "FAST_DRAG"
+    assert cfg["qubit/5/EF/x90/amp"] == drive["kwargs"]["amp"]
+    assert cfg["qubit/5/EF/x90/vz"] == [p["kwargs"]["phase"] for p in ef["X90"]["pulse"]
+                                        if p["env"] == "virtualz"]           # the EF frame pair
+    assert cfg["qubit/5/EF/x/dur"] == ef["X"]["pulse"][0]["time"]            # the EF X, a real pulse
+    assert cfg["two_qubit/(0, 1)"] == tree["two_qubit"]["(0, 1)"]            # verbatim subtree
+    assert cfg["two_qubit/(5, 6)/CZ/pulse"][0] == "single_qubit/6/EF/X/pulse"   # string reference
+    assert cfg["two_qubit/(0, 1)/CZ/pulse"][2]["freq"] == "single_qubit/0/GE/freq"  # path-valued freq
+
+    cfg["qubit/5/EF/freq"] = 5.36e9
+    cfg["qubit/5/EF/x90/amp"] = 0.111
+    cfg["qubit/5/EF/x90/vz"] = [0.03, 0.04]
+    cfg["two_qubit/(0, 1)/CZ/freq"] = 5.31e9
+    pl = cfg.copy()["two_qubit/(5, 6)/CZ/pulse"]                 # a fresh list (the proposal shape)
+    pl[2]["kwargs"]["phase"] = 0.777                             # the target drive's relative phase
+    cfg["two_qubit/(5, 6)/CZ/pulse"] = pl
+    out = tmp_path / "config.yaml"
+    cfg.save_qcal(out)
+    with open(out) as f:
+        back = yaml.safe_load(f)
+
+    ef = back["single_qubit"][5]["EF"]
+    assert ef["freq"] == 5.36e9
+    assert [p["kwargs"]["amp"] for p in ef["X90"]["pulse"] if p["env"] != "virtualz"] == [0.111]
+    assert [p["kwargs"]["phase"] for p in ef["X90"]["pulse"] if p["env"] == "virtualz"] == [0.03, 0.04]
+    assert back["two_qubit"]["(0, 1)"]["CZ"]["freq"] == 5.31e9
+    got = back["two_qubit"]["(5, 6)"]["CZ"]["pulse"]
+    assert got[2]["kwargs"]["phase"] == 0.777
+    assert got[0] == got[3] == "single_qubit/6/EF/X/pulse"       # the sandwich survives the write
+    assert back["two_qubit"]["(1, 2)"] == tree["two_qubit"]["(1, 2)"]        # untouched pair verbatim
+
+
+# ── adapter completeness (spec 14 F0) ──
+
+def test_save_qcal_persists_config_added_pair_keys(tmp_path):
+    """(F0 gate) A pair subtree is written back WHOLESALE, so a key a calibration ADDS under
+    `two_qubit/(i, j)/` — JAZZ's `ZZ11`, an exploratory `bSWAP` — reaches the artefact of record
+    instead of being dropped (spec 14 §3.2), and the CZ list still round-trips with its
+    string-reference entries."""
+    cfg = Config.from_qcal(X6Y3_YAML)
+    cfg["two_qubit/(0, 1)/ZZ11"] = 1.234e5                      # JAZZ's characterization output
+    cfg["two_qubit/(5, 6)/bSWAP"] = {"freq": 1.1e10, "time": 4e-7}
+    cfg["two_qubit/(0, 1)/CZ/freq"] = 5.33e9
+    out = tmp_path / "config.yaml"
+    cfg.save_qcal(out)
+    with open(out) as f:
+        back = yaml.safe_load(f)
+
+    assert back["two_qubit"]["(0, 1)"]["ZZ11"] == 1.234e5
+    assert back["two_qubit"]["(5, 6)"]["bSWAP"] == {"freq": 1.1e10, "time": 4e-7}
+    assert back["two_qubit"]["(0, 1)"]["CZ"]["freq"] == 5.33e9
+    assert back["two_qubit"]["(5, 6)"]["CZ"]["pulse"][0] == "single_qubit/6/EF/X/pulse"
+    # and they survive a reload — the new keys are opaque on the way back in
+    assert Config.from_qcal(out)["two_qubit/(0, 1)/ZZ11"] == 1.234e5
+
+
+def test_save_qcal_writes_gate_kwargs_and_an_inserted_vz_pair(tmp_path):
+    """(F0 gate) The envelope kwargs the DRAG optimizer tunes (`N`, `weights`) are written back, and a
+    vz pair calibrated on a gate that HAD none (the X is a bare FAST_DRAG in qcal) becomes two real
+    virtualz entries bracketing the drive — the `Phase(gate='X')` write-back path (spec 14 §3.3)."""
+    cfg = Config.from_qcal(X6Y3_YAML)
+    kw = dict(cfg["qubit/2/x90/kwargs"])
+    kw["N"], kw["weights"] = 3, [0.2, 0.05, 0.01]
+    cfg["qubit/2/x90/kwargs"] = kw
+    cfg["qubit/2/x/vz"] = [0.11, 0.22]                       # a frame the X gate did not have
+    cfg["qubit/5/EF/x/vz"] = [-0.03, 0.04]
+    out = tmp_path / "config.yaml"
+    cfg.save_qcal(out)
+    with open(out) as f:
+        back = yaml.safe_load(f)
+
+    drive = [p for p in back["single_qubit"][2]["GE"]["X90"]["pulse"] if p["env"] != "virtualz"][0]
+    assert drive["kwargs"]["N"] == 3 and drive["kwargs"]["weights"] == [0.2, 0.05, 0.01]
+    assert drive["kwargs"]["alpha"] == cfg["qubit/2/x90/kwargs"]["alpha"]      # untuned kwargs kept
+
+    x = back["single_qubit"][2]["GE"]["X"]["pulse"]
+    assert [p["env"] for p in x] == ["virtualz", "FAST_DRAG", "virtualz"]      # the pair was inserted
+    assert [p["kwargs"]["phase"] for p in x if p["env"] == "virtualz"] == [0.11, 0.22]
+    assert all(p["channel"] == x[1]["channel"] and p["time"] == 0.0 for p in (x[0], x[2]))
+    efx = back["single_qubit"][5]["EF"]["X"]["pulse"]
+    assert [p["kwargs"]["phase"] for p in efx if p["env"] == "virtualz"] == [-0.03, 0.04]
+
+    # the inserted pairs re-load as the same knobs (and the untouched X gates stay bare)
+    again = Config.from_qcal(out)
+    assert again["qubit/2/x/vz"] == [0.11, 0.22] and again["qubit/5/EF/x/vz"] == [-0.03, 0.04]
+    assert "qubit/3/x/vz" not in again
+    assert again["qubit/2/x90/kwargs"]["weights"] == [0.2, 0.05, 0.01]
+
+
+def test_opaque_subtrees_round_trip_verbatim(tmp_path):
+    """(F0 gate) Everything out of scope (spec 14 §4) survives the adapter byte-identically: the whole
+    `reset` section (passive / active / unconditional pulse lists), `readout/esp`, each pair's
+    `dynamical_decoupling`, and a planted `bSWAP` subtree — none of it is understood, all of it is
+    carried."""
+    with open(X6Y3_YAML) as f:
+        tree = yaml.safe_load(f)
+    tree["two_qubit"]["(4, 5)"]["bSWAP"] = {           # the reference's exploratory subtree
+        "freq": 1.0746e10,
+        "pulse": [{"channel": "Q4.qdrv", "env": "cosine_square", "time": 3e-7,
+                   "kwargs": {"amp": 0.5, "phase": 0.0, "ramp_fraction": 0.25}}]}
+    src = tmp_path / "in.yaml"
+    with open(src, "w") as f:
+        yaml.safe_dump(tree, f, default_flow_style=False, sort_keys=False)
+
+    out = tmp_path / "out.yaml"
+    Config.from_qcal(src).save_qcal(out)
+    with open(out) as f:
+        back = yaml.safe_load(f)
+
+    assert back == tree                                       # nothing calibrated → verbatim
+    assert back["reset"] == tree["reset"]
+    assert back["readout"]["esp"] == tree["readout"]["esp"] == {"enable": False,
+                                                               "qubits": [0, 2, 3, 4, 5, 6, 7]}
+    assert back["two_qubit"]["(4, 5)"]["bSWAP"] == tree["two_qubit"]["(4, 5)"]["bSWAP"]
+    assert back["two_qubit"]["(0, 1)"]["CZ"]["dynamical_decoupling"]["enable"] is False
 
 
 def test_qcal_envelopes_build(qcal_cfg):

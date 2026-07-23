@@ -224,7 +224,8 @@ def test_counts_rabi(sub):
     npts = points
     prog = compile_kernel(kernels.k_rabi, m, tables=dict(gate=gate, ro=ro, demod=demod),
                           out=Array(npts), npts=npts, shots=shots, period=period, ddly=0,
-                          ngates=1, code=pack16(RO_CODE), mode=COUNTS, prep_gate=X90, vz0=0, vzsum=0,
+                          ngates=1, step=4, code=pack16(RO_CODE), mode=COUNTS, prep_gate=X90,
+                          vz0=0, vzsum=0,
                           a0q=int(a0q), daq=int(daq), prep=1)
     out = rq.run(drv, m, {0: prog},
                  timeout=_timeout(npts * shots * period))[0]["out"]
@@ -312,7 +313,8 @@ def test_computed_amp_matches_xs(sub):
     f_code, ph_code, dur = x90.freq_code(m), x90.phase_code(), len(lines)
     prog = compile_kernel(kernels.k_rabi, m, tables=dict(gate=gate, ro=ro, demod=demod),
                           out=Array(npts), npts=npts, shots=shots, period=period, ddly=0,
-                          ngates=1, code=pack16(RO_CODE), mode=COUNTS, prep_gate=X90, vz0=0, vzsum=0,
+                          ngates=1, step=4, code=pack16(RO_CODE), mode=COUNTS, prep_gate=X90,
+                          vz0=0, vzsum=0,
                           a0q=int(a0q), daq=int(daq), prep=1)
     ncap = 8000                                          # armed before reset release: covers boot + grid
     rq.setup(drv, m, {0: prog})
