@@ -1,9 +1,19 @@
-"""Host unit tests for the readout-completeness pieces of spec 14 F2: the confusion correction
-(`rcorr`, qcal's `rcorr_cmat`) and the 3-level `ReadoutFidelity`'s guards.
+"""The readout-completeness pieces of spec 14 F2: the confusion correction (`rcorr`, qcal's
+`rcorr_cmat`), the 3-level `ReadoutFidelity`'s guards, and — in co-sim — that the three real preps
+actually reach levels 0/1/2.
 
 `rcorr` is the one piece of readout analysis with an exact answer — push a known population vector
 through a known confusion matrix and the correction has to return it bit-for-bit (up to float error),
-so these are equalities, not tolerances.
+so these are equalities, not tolerances. That is the whole 3×3 confusion ARITHMETIC, host-pure, and
+it is why the co-sim half no longer measures a matrix (specs/software-test-refactor/02 §3.6): the
+old gate spent `relax = 8000` × 32 shots × 3 preps — the second-worst test in the suite — to
+rediscover, through shot noise, that a diagonal-dominant matrix inverts.
+
+What is left for the simulator is the one claim the host cannot make: that the three PRODUCTION
+prep programs — idle, the GE π, and `_ef_prep_prog`'s GE π + EF π — really drive the qutrit to
+levels 0, 1 and 2. That is an **L2 state probe** (01 §4): |2⟩ is invisible to the hardware `res`
+bit (one threshold, two outcomes), so it is read off `drv.sim.model_state()["populations"]`, one
+noiseless shot per prep against the analytic target.
 """
 
 import math
@@ -12,12 +22,20 @@ import numpy as np
 import pytest
 
 from riscq.cal import Config, ReadoutFidelity
-from riscq.cal.base import GATE_ENV, batch_timeout, acquire_shots, gate_sigma
-from riscq.cal.readout import ClassifierN, _rawiq_prog, rcorr
+from riscq.cal.base import GATE_ENV, gate_sigma
+from riscq.cal.readout import ClassifierN, _ef_prep_prog, _rawiq_prog, rcorr
 from riscq.pulses import Pulse, units
-from riscq import run as rq
+from tests.probe import Probe
 
-F_GE, F_EF = 50e6, 40e6          # the planted qutrit's two carriers
+# The planted qutrit's two carriers, an anharmonicity of exactly 4096 codes (100 MHz on this build)
+# apart. `ThreeLevelModel` picks which transition a batch drives by demodulating the gate DAC against
+# BOTH carriers over that batch's 16 samples and taking the larger — and 16 samples is a very short
+# window: at the old 50/40 MHz pair (Δ = 410 codes) the two demods came back within 1.6 % of each
+# other and the winner flipped batch to batch, so the "EF π" also drove GE and the |2> prep topped
+# out at 0.49. A separation of 4096 codes puts exactly one full turn of the difference frequency in
+# a batch, so each carrier's demod is EXACTLY zero against the other transition and both preps are
+# the textbook gates their planted rates say they are.
+F_GE, F_EF = 150e6, 50e6
 GE_AMP, EF_AMP = 0.5, 0.5
 
 
@@ -74,7 +92,7 @@ def test_three_level_fidelity_requires_a_pretrained_classifier():
     assert ReadoutFidelity(cfg, 0).classifiers == {}          # the 2-level path needs none
 
 
-# ── the 3-level confusion, on a planted qutrit (spec 14 F2) ──
+# ── L2: the three REAL preps reach levels 0 / 1 / 2 (spec 14 F2) ──
 
 def _s(batches, m):
     return float(batches) / m.params.dsp_freq_hz
@@ -82,7 +100,11 @@ def _s(batches, m):
 
 def _cfg3(m, q=0):
     """A qutrit Config: GE + EF gates and a 3-level readout tone. The EF X is a real π in {|1>, |2>},
-    which is what the |2> prep plays after the GE π."""
+    which is what the |2> prep plays after the GE π.
+
+    `reset/relax` is at its floor: an L2 probe re-issues `set_model`, which rebuilds the qutrit in
+    |0> in ZERO simulated cycles, so the 8000-batch idle head the old shot-statistics version needed
+    to reset between shots buys nothing here (01 §4.2)."""
     c = Config()
     c[f"qubit/{q}/freq"] = F_GE
     c[f"qubit/{q}/x90/amp"] = GE_AMP
@@ -94,64 +116,63 @@ def _cfg3(m, q=0):
     c[f"readout/{q}/amp"] = 0.5
     c[f"readout/{q}/dur"] = _s(56, m)
     c[f"readout/{q}/demod/dur"] = _s(40, m)
-    c["reset/relax"] = _s(8000, m)      # >= 5x the population T1 below, so each shot starts |0>
+    c["reset/relax"] = _s(8, m)
     return c
 
 
-def _plant(level):
-    """The model for a REFERENCE cloud: level `level` planted and held. No T1 — the planted level has
-    to survive the grid's relax head to be read out, which is exactly why the reference clouds are
-    captured on a decay-free model (the EF cals' `_train_3level` does the same)."""
-    return {"kind": "threelevel", "core": 0, "readout_code": 2048, "readout_amp": 18000.0,
-            "init_level": level, "collapse": True, "noise_scale": 400.0, "noise_seed": 7 + level}
-
-
-def _qutrit(m, **kw):
-    """The planted qutrit: a GE Rabi rate making the two-X90 prep a π, an EF rate making the EF X a π
-    in {|1>, |2>}, and a T1 that lets each shot's relax head reset the level between shots."""
+def _qutrit(m):
+    """The planted qutrit: a GE Rabi rate making the two-X90 prep an exact π and an EF rate making the
+    EF X an exact π in {|1>, |2>} — so each prep is a textbook gate and the expected populations are
+    the ideal ones. 01 §4.6: no decay, no noise, no collapse (the probe reads the state, not shots)."""
     ge = gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=GE_AMP), F_GE, units._amp_code(GE_AMP))
     ef = gate_sigma(m, Pulse(GATE_ENV, amp=EF_AMP), F_EF, units._amp_code(EF_AMP))
     return {"kind": "threelevel", "core": 0, "f_ge": F_GE, "f_ef": F_EF,
             "rabi_ge_rad_per_amp": math.pi / (2 * ge), "rabi_ef_rad_per_amp": math.pi / ef,
-            "readout_code": 2048, "readout_amp": 18000.0, "init_level": 0, "collapse": True,
-            # amplitude damping: the POPULATION time constant is t1/2 batches. The |2> prep is the
-            # longest sequence here (GE pi + LEAD + EF pi + SEP ~ 200 batches), so t1 has to leave it
-            # standing — at t1 = 600 it decayed to 0.375 and the row misclassified as |0>.
-            "t1": 3000, "noise_scale": 400.0, "noise_seed": 5, **kw}
+            "readout_code": 2048, "readout_amp": 18000.0, "init_level": 0}
+
+
+# One test per PROGRAM, because each program is its own image and an image load is ~7 k simulated
+# batches — the two together overrun the 20 k per-test cap (specs/software-test-refactor/02 §1).
+#
+# Both replace the halves of a 3 × 32-shot, `relax = 8000` confusion measurement whose |2> row only
+# ever reached 0.5. The preps are now pinned to 0.02 instead of to "dominates its row", and the 3×3
+# matrix ARITHMETIC — the row-stochastic shape and the `rcorr` inverse — is the host-pure half above.
+
+@pytest.mark.cosim
+def test_ge_preps_reach_levels_0_and_1(cosim):
+    """L2 (spec 14 F2) — the |0> and |1> rows of the 3-level confusion come from ONE `_rawiq_prog`
+    image whose `prep` runtime scalar picks idle or the GE π (two X90 plays). Both must land on the
+    level they name, and the |1> prep must not leak into |2>.
+
+    The target is analytic and exact: the GE rate is planted so the two-X90 prep is a π in
+    {|0>, |1>}, so the prep is a textbook gate and the populations are 1 at the intended level and 0
+    elsewhere. Nothing is fitted and nothing is sampled — |2> is invisible to the `res` bit, so the
+    populations come off `model_state()`."""
+    _, m = cosim
+    q = 0
+    prog, _ = _rawiq_prog(m, _cfg3(m, q), q, "X90", 1)
+    p, spec = Probe(cosim, {q: prog}), _qutrit(m)
+    for prep, want in ((0, [1.0, 0.0, 0.0]), (1, [0.0, 1.0, 0.0])):
+        pops = p.state(spec, {q: {"prep": prep}})["populations"]
+        print(f"\n[prep {prep}] populations={np.round(pops, 4).tolist()} want={want}")
+        assert pops == pytest.approx(want, abs=0.02), \
+            f"the prep={prep} program left the qutrit at {np.round(pops, 4).tolist()}, not {want}"
 
 
 @pytest.mark.cosim
-def test_three_level_fidelity_measures_a_real_confusion(cosim):
-    """(F2 gate) The 3×3 matrix from REAL preps: |0> (idle), |1> (GE π) and |2> (GE π + EF π, the new
-    `_ef_prep_prog`), each classified by a classifier trained on planted reference clouds — so the
-    matrix measures the readout, not the fit. Every prepared level must dominate its own row, and the
-    matrix must be a usable `rcorr` input (it inverts a planted population back)."""
-    drv, m = cosim
-    q = 0
-    cfg = _cfg3(m, q)
-    shots = 32
-    prog, period = _rawiq_prog(m, cfg, q, "X90", shots)
-    timeout = batch_timeout(shots * period)
-    clouds = []
-    for level in range(3):                       # reference clouds: PLANT each level, read it out
-        drv.sim.set_model(_plant(level))
-        rq.setup(drv, m, {q: prog})
-        clouds.append(acquire_shots(drv, m, {q: prog}, 0, shots, timeout)[q])
-    clf = ClassifierN(clouds)
-    assert clf.separation > 1.0, f"3-level clusters not separated ({clf.separation:.2f})"
+def test_ef_prep_reaches_level_2(cosim):
+    """L2 (spec 14 F2) — the |2> row's prep: `_ef_prep_prog`, a GE π followed by an EF π at the
+    config's EF X amplitude, on its own image with the carrier retuned mid-shot. It is the program
+    `ReadoutFidelity._run_3level` runs, unchanged.
 
-    drv.sim.set_model(_qutrit(m))                # now the real qutrit: the preps must DRIVE there
-    r = ReadoutFidelity(cfg, q, shots=shots, n_levels=3, classifier=clf).run(drv)
-    conf = r.data[q]["confusion"]
-    print(f"\n[cmat3] fidelity={r.data[q]['fidelity']:.3f}\n{np.round(conf, 3)}")
-    assert conf.shape == (3, 3) and np.allclose(conf.sum(1), 1.0)
-    # Each prepared level dominates its own row. The |2> row is the weak one (~0.5) and that is the
-    # co-sim's |2> prep, not this program: `test_ef_amplitude_recovers_the_ef_rabi` tops out at
-    # P(|2>) ≈ 0.56 on the same model. An imperfect matrix is exactly what `rcorr` exists to undo.
-    for level in range(3):
-        assert conf[level].argmax() == level, \
-            f"prepared |{level}> classified as |{conf[level].argmax()}>:\n{np.round(conf, 3)}"
-    assert conf[0, 0] > 0.9 and conf[1, 1] > 0.8 and conf[2, 2] > 0.4
-    assert r.proposal[f"readout/{q}/cmat"] == conf.tolist()     # YAML-safe, in the Config
-    p_true = np.array([0.2, 0.5, 0.3])
-    assert np.allclose(rcorr(p_true @ conf, conf), p_true)      # the measured matrix is invertible
+    Both rates are planted exact (GE: the two-X90 prep is a π in {|0>, |1>}; EF: the EF X is a π in
+    {|1>, |2>}), so the analytic target is a clean |2> — which also makes it the sharpest available
+    statement about the mid-shot GE→EF retune: any slip in WHEN the new carrier takes effect leaves
+    population behind in |1>."""
+    _, m = cosim
+    q = 0
+    prog, par, _ = _ef_prep_prog(m, _cfg3(m, q), q, 1)
+    pops = Probe(cosim, {q: prog}).state(_qutrit(m), {q: par})["populations"]
+    print(f"\n[prep |2>] populations={np.round(pops, 4).tolist()} want=[0.0, 0.0, 1.0]")
+    assert pops == pytest.approx([0.0, 0.0, 1.0], abs=0.02), \
+        f"the GE π + EF π prep left the qutrit at {np.round(pops, 4).tolist()}, not |2>"

@@ -12,10 +12,12 @@ calibrations build on it.
   across the sweep, the readout time is FIXED and the π pulse is placed `delay` batches before it
   (a longer delay = an earlier pulse), so the elapsed decay is exactly `delay`.
 
-Each sweep point re-prepares the qubit from |0> (set_model rebuilds the model per point — the model
-is one evolving Bloch vector, so it MUST be reset between points). The demod pipeline phase is
-calibrated once (a ReadoutCalibration in miniature, like M3) so the integrated real carries the
-signed <σz>. Every model is selected over Pyro5; the fixture is session-scoped.
+Both sweeps are L2 state probes (specs/software-test-refactor/01 §4): `tests.probe.Probe` loads the
+program ONCE and re-runs it per point. Each point re-prepares the qubit from |0> because set_model
+rebuilds the model — the model is one evolving Bloch vector, so it MUST be reset between points —
+and that rebuild costs zero simulated cycles. The demod pipeline phase is calibrated once (a
+ReadoutCalibration in miniature, like M3) so the integrated real carries the signed <σz>. Every
+model is selected over Pyro5; the fixture is session-scoped.
 """
 
 import math
@@ -28,7 +30,8 @@ from riscq.cal import fits
 from riscq.cal.base import SEP, demod_table
 from riscq.lang import Array, ParamTable, compile_kernel, kernel
 from riscq.map import LEAD, READOUT_LEAD, pack16
-from riscq.pulses import Pulse, envelopes, golden, units
+from riscq.pulses import Pulse, envelopes, units
+from tests.probe import Probe, rabi_for, sigma_z
 
 pytestmark = pytest.mark.cosim
 
@@ -96,31 +99,7 @@ def k_t1(gate: ParamTable, demod: ParamTable, out: Array, delay: int, maxd: int,
     out[1] = read_imag()  # noqa: F821
 
 
-# ── helpers ──
-
-def _rabi_for(m, pulse: Pulse, carrier_hz: float, target_rad: float) -> float:
-    """The model Rabi rate that makes `pulse` rotate by `target_rad`: rate = target / Σ amp_est,
-    where amp_est is the model's per-batch phase-blind RMS over the bit-exact DAC golden (the same
-    samples the model sees) — exactly M3's Rabi calibration, generalized to an arbitrary angle."""
-    lines = pulse.packed_lines(m, 0)
-    w = golden.pulse_window(lines, pulse.amp_code(), units._freq_code(carrier_hz, m.params),
-                            0, 0, len(lines))
-    sigma = sum(math.sqrt(2 * np.mean(row.astype(float) ** 2)) for row in w)
-    return target_rad / sigma
-
-
-def _sweep(cosim, prog, spec, name, points, extra=None):
-    """Run `prog` once per sweep value, re-preparing the model (fresh Bloch state) each point;
-    return the complex integrated readout z = real + i·imag."""
-    drv, m = cosim
-    z = []
-    for v in points:
-        drv.sim.set_model(spec)
-        params = {name: int(v), "code": pack16(RO_CODE), **(extra or {})}
-        out = rq.run(drv, m, {0: prog}, params={0: params}, timeout=3_000_000)[0]["out"]
-        z.append(complex(float(out[0]), float(out[1])))
-    return np.array(z)
-
+# ── fixtures ──
 
 @pytest.fixture(scope="module")
 def demod_cal(cosim):
@@ -130,11 +109,12 @@ def demod_cal(cosim):
     drv, m = cosim
     prog = compile_kernel(k_read, m, tables=dict(demod=demod_table(RO_DUR)),
                           out=Array(3), code=pack16(RO_CODE))
+    rq.setup(drv, m, {0: prog})       # the two probes differ only in the MODEL: load once (01 §4.5)
 
     def read(phase):
         drv.sim.set_model(dict(kind="twolevel", rabi_rad_per_amp=0.0, readout_code=RO_CODE,
                                readout_amp=RO_AMP, readout_phase=phase, init_excited=False))
-        out = rq.run(drv, m, {0: prog}, timeout=1_000_000)[0]["out"]
+        out = rq.rerun(drv, m, {0: prog}, timeout=1_000_000)[0]["out"]
         return int(out[1]), int(out[2])
 
     r0, i0 = read(0.0)
@@ -152,20 +132,29 @@ def _zero_model_after(cosim):
 
 # ── tests ──
 
+@pytest.mark.batch_cap(53_000)
 def test_ramsey_oscillates_at_planted_detuning(cosim, demod_cal):
+    """FLOOR: ~50 k = one image (~6.6 k) + 15 fringe points at ~2.9 k each (set_model 400 + rerun
+    ~2 k + the shot's own `maxw` wait). A damped-cosine fit needs ≥ 9 points and this one samples
+    ~3 fringe periods; 02 §1 already calls this class out as landing above the cap rather than
+    being forced under it. The per-point image reload is gone (Probe loads once) and the demod
+    calibration is now one `setup` + two `rerun`s instead of two `run`s."""
     _, m = cosim
     f_ge_hz = units.code_to_freq(units._freq_code(F_DRIVE_HZ, m.params) - DETUNE_CODE, m.params)
     x90 = Pulse(envelopes.square(16), freq_hz=F_DRIVE_HZ, amp=0.5)     # short => little intra-pulse smear
     gate = ParamTable(0, F_DRIVE_HZ, {"x90": x90})
-    rabi = _rabi_for(m, x90, F_DRIVE_HZ, math.pi / 2)
+    rabi = rabi_for(m, x90, F_DRIVE_HZ, math.pi / 2)
 
     prog = compile_kernel(k_ramsey, m, tables=dict(gate=gate, demod=demod_table(RO_DUR)),
                           out=Array(2))
     spec = dict(kind="twolevel", core=0, rabi_rad_per_amp=rabi, readout_code=RO_CODE,
                 readout_amp=RO_AMP, readout_phase=demod_cal, f_ge=f_ge_hz, t2=300)
     waits = list(range(0, 195, 13))                                   # 15 points, ~3 fringe periods
+    fixed = {"maxw": max(waits), "code": pack16(RO_CODE)}             # same for every point
     # fixed readout time => the demod phase is constant across the sweep; demod_cal lands the fringe on real
-    reals = _sweep(cosim, prog, spec, "wait", waits, extra={"maxw": max(waits)}).real
+    p = Probe(cosim, {0: prog})
+    # p.iq(...)[core 0][the window's single readout] — each point starts from a fresh |0>
+    reals = np.array([p.iq(spec, {0: {"wait": w, **fixed}})[0][0] for w in waits]).real
 
     fit = fits.fit_damped_cosine(waits, reals)
     f_expect = DETUNE_CODE / (1 << 12)                                # δ_code/4096 cycles per wait-batch
@@ -176,12 +165,17 @@ def test_ramsey_oscillates_at_planted_detuning(cosim, demod_cal):
         f"recovered Ramsey freq {fit.value:.5f} != planted {f_expect:.5f}"
 
 
+@pytest.mark.batch_cap(41_000)
 def test_t1_exponential_decay(cosim):
+    """FLOOR: ~38 k = one image (~6.6 k) + 10 points (9 delays + the |0⟩ reference) at ~3.2 k each —
+    each shot idles for its own `delay`, up to 3·T1 = 405 batches, which is the decay being measured.
+    An exp-decay fit needs ≥ 9 points; 02 §1 calls this class out as landing at 25–40 k. The
+    per-point image reload is already gone (Probe loads once)."""
     _, m = cosim
     t1 = 120                                                          # planted T1, in batches
     x180 = Pulse(envelopes.square(64), freq_hz=F_DRIVE_HZ, amp=0.9)
     gate = ParamTable(0, F_DRIVE_HZ, {"x180": x180})
-    rabi = _rabi_for(m, x180, F_DRIVE_HZ, math.pi)
+    rabi = rabi_for(m, x180, F_DRIVE_HZ, math.pi)
 
     prog = compile_kernel(k_t1, m, tables=dict(gate=gate, demod=demod_table(RO_DUR)), out=Array(2))
     spec = dict(kind="twolevel", core=0, rabi_rad_per_amp=rabi, readout_code=RO_CODE,
@@ -189,16 +183,18 @@ def test_t1_exponential_decay(cosim):
     # delays skip 0 (a pulse abutting the window smears the flip) and stay small enough that the
     # earliest π pulse (furthest in the future) is inside the fire-scheduling horizon.
     delays = list(range(45, 450, 45))                                # 9 points, ~3·T1
-    extra = {"maxd": delays[-1]}
-    z = _sweep(cosim, prog, spec, "delay", delays, extra=extra)
+    fixed = {"maxd": delays[-1], "code": pack16(RO_CODE)}            # same for every point
+    p = Probe(cosim, {0: prog})
+    # p.iq(...)[core 0][the window's single readout] — each point starts from a fresh |0>
+    z = np.array([p.iq(spec, {0: {"delay": d, **fixed}})[0][0] for d in delays])
     # the fixed readout time fixes the demod-LO phase across the sweep, but at an arbitrary absolute
     # angle; project onto a ground-state reference at the SAME readout structure (rabi=0 => the π
     # pulse is a no-op, qubit stays |0>) so the signal carries the signed <σz> cleanly.
-    zg = _sweep(cosim, prog, {**spec, "rabi_rad_per_amp": 0.0}, "delay", [delays[0]], extra=extra)[0]
-    reals = (z * zg.conjugate()).real / abs(zg)
+    zg = p.iq({**spec, "rabi_rad_per_amp": 0.0}, {0: {"delay": delays[0], **fixed}})[0][0]
+    reals = sigma_z(z, zg)
 
     fit = fits.fit_exp_decay(delays, reals)
-    print(f"\n[t1] fit ok={fit.ok} tau={fit.value:.1f} expect={t1} amp={fit.params.get('amp'):.0f}")
+    print(f"\n[t1] fit ok={fit.ok} tau={fit.value:.1f} expect={t1} amp={fit.params.get('amp'):.2f}")
     assert fit.ok, "exp-decay fit failed on the T1 recovery"
     assert fit.params["amp"] < 0, "|1> recovers toward ground (+real), so the exp amplitude is negative"
     assert 0.85 * t1 < fit.value < 1.15 * t1, \

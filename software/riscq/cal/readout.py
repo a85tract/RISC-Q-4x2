@@ -40,7 +40,7 @@ import numpy as np
 from riscq import run as rq
 from riscq.cal import kernels
 from riscq.cal.base import (GATE_CH, SEP, Result, acquire_shots, batch_timeout, batches, ef_table,
-                            grid_period, herald_offset, heralding, prep, qubits_list,
+                            ef_vz, grid_period, herald_offset, heralding, prep, qubits_list,
                             readout_tables, relax_batches, rerun_counts, res_sign, seconds, socmap,
                             sweep_q16, train_step, x90_vz)
 from riscq.cal.qubit import _classifiers
@@ -158,7 +158,7 @@ def _ef_prep_prog(m, cfg, q, shots):
     prog = compile_kernel(kernels.k_ef_rabi, m, tables=dict(gate=table, ro=ro, demod=demod),
                           out=Array(2 * shots), npts=1, shots=shots, period=period, ngates=1,
                           step=train_step(ef), code=code, ddly=ddly, ge_freq=ge_freq,
-                          ef_freq=ef_freq, **x90_vz(cfg, q))
+                          ef_freq=ef_freq, **x90_vz(cfg, q), **ef_vz(cfg, q, "x"))
     a = units._amp_code(float(cfg[f"qubit/{q}/EF/x/amp"]))
     return prog, {"a0q": a << 16, "daq": 0}, period
 
@@ -264,10 +264,13 @@ class ReadoutCalibration:
             proposal[f"readout/{q}/demod/phase"] = float(demod_phase)
             proposal[f"readout/{q}/res_sign"] = 1          # |0>→+real→res=0, |1>→res=1 (base.res_sign)
             fit[q] = clf
-            oks[q] = clf.separation > 1.0                  # qcal SNR 1 = means 4σ apart (see _snr)
+            # a 2σ split (qcal SNR 0.5) already trains a valid axis: the phase comes from the two
+            # cluster MEANS, whose error at these shot counts is far below the cluster width. The
+            # old 1.0 floor failed real data — qcal's own healthy X6Y3 sessions sit at 0.8–1.2.
+            oks[q] = bool(clf.separation > 0.5)
         self.data, self.fit = data, fit
         return Result(all(oks.values()), data, fit, proposal, cfg,
-                      f"ReadoutCalibration {self.qubits}")
+                      f"ReadoutCalibration {self.qubits}", oks=oks)
 
 
 class Separation:
@@ -281,8 +284,10 @@ class Separation:
     SEPARATION sits between the two — the whole point of a ±few-MHz sweep. (`data["mag0"]` keeps the
     |0> magnitude for the plot, and it is what the old cal would have argmax'd.)
 
-    Sizing: the RAW capture is 2·points·shots words per prep and lives in the core's RAM — asserted
-    against half of it, fail-loud (31 points × 32 shots = 1984 words ≈ 8 KB of 16 KB)."""
+    Sizing: one rerun's RAW capture is 2·points·shots words and lives in the core's RAM (capped at
+    half of it — 31 points × 33 shots at 16 KB); `shots` beyond that cap split into extra rerun
+    pairs of the SAME resident image (spec 08 §4), concatenated host-side, so qcal-class statistics
+    (hundreds of shots per point) cost only run time."""
 
     def __init__(self, cfg, qubits, span=2.5e6, points=31, shots=32, gate="X90"):
         self.cfg, self.qubits = cfg, qubits_list(qubits)
@@ -294,10 +299,10 @@ class Separation:
         m = socmap(drv)
         cfg = self.cfg
         npts, shots = self.points, self.shots
-        out_bytes = 4 * 2 * npts * shots
-        assert out_bytes <= m.mem_bytes // 2, \
-            (f"Separation's RAW capture is {out_bytes} B ({npts} points × {shots} shots × 2 words) — "
-             f"over half the core's {m.mem_bytes} B RAM; cut points or shots")
+        cap = (m.mem_bytes // 2) // (4 * 2 * npts)      # RAM-capped shots per rerun (see docstring)
+        assert cap >= 1, f"{npts} points cannot fit one RAW shot per point in half of {m.mem_bytes} B"
+        s_run = min(shots, cap)
+        reps = -(-shots // s_run)                       # rerun pairs; realized shots = reps · s_run
         progs, meta, timeout = {}, {}, 0
         for q in self.qubits:
             ro, demod, _, dur, ddly = readout_tables(cfg, q, m)
@@ -307,18 +312,21 @@ class Separation:
             c0q, dcq, xs = sweep_q16(c0 - span, c0 + span, npts)               # on-core sweep
             period = grid_period(relax_batches(cfg, m), SEP + plen, dur, ddly)
             progs[q] = compile_kernel(kernels.k_vna, m, tables=dict(gate=table, ro=ro, demod=demod),
-                                      out=Array(2 * npts * shots), npts=npts, shots=shots, period=period,
+                                      out=Array(2 * npts * s_run), npts=npts, shots=s_run, period=period,
                                       sh=0, ddly=ddly, mode=kernels.RAW, prep_gate=pg,
                                       c0q=int(c0q), dcq=int(dcq), **x90_vz(cfg, q))
             meta[q] = np.array(xs, float)
-            timeout = max(timeout, batch_timeout(npts * shots * period))
+            timeout = max(timeout, batch_timeout(npts * s_run * period))
         rq.setup(drv, m, progs)
-        iq0 = acquire_shots(drv, m, progs, 0, npts * shots, timeout)
-        iq1 = acquire_shots(drv, m, progs, 1, npts * shots, timeout)
+
+        def capture(p):
+            runs = [acquire_shots(drv, m, progs, p, npts * s_run, timeout) for _ in range(reps)]
+            return {q: np.concatenate([r[q].reshape(npts, s_run, 2) for r in runs], 1) for q in progs}
+        iq0, iq1 = capture(0), capture(1)
 
         data, fit, proposal, oks = {}, {}, {}, {}
         for q in self.qubits:
-            i0, i1 = iq0[q].reshape(npts, shots, 2), iq1[q].reshape(npts, shots, 2)
+            i0, i1 = iq0[q], iq1[q]
             seps = np.array([_snr(i0[i], i1[i]) for i in range(npts)])
             mag0 = np.hypot(i0[:, :, 0].mean(1), i0[:, :, 1].mean(1))   # what the OLD cal argmax'd
             best = int(np.argmax(seps))
@@ -333,9 +341,13 @@ class Separation:
             data[q] = {"x": freqs, "y": seps, "mag0": mag0}
             proposal[f"readout/{q}/freq"] = float(freqs[best])
             fit[q] = Classifier(i0[best], i1[best])
-            oks[q] = bool(seps[best] > 0.5)          # at least a 2σ split at the best frequency (see _snr)
+            # at least a 2σ split (see _snr), AND an INTERIOR argmax: a best point pinned to the
+            # sweep edge means the resonator drifted to or past the span (X6Y3's hybridised q4/q5
+            # pair hops MHz between sessions) — the value is a bound, not a peak; recentre or widen.
+            oks[q] = bool(seps[best] > 0.5) and 0 < best < npts - 1
         self.data, self.fit = data, fit
-        return Result(all(oks.values()), data, fit, proposal, cfg, f"Separation {self.qubits}")
+        return Result(all(oks.values()), data, fit, proposal, cfg, f"Separation {self.qubits}",
+                      oks=oks)
 
 
 class Punchout:
@@ -444,7 +456,8 @@ class Fidelity:
             fit[q] = None
             oks[q] = bool(fidq[best] > 0.75)
         self.data, self.fit = data, fit
-        return Result(all(oks.values()), data, fit, proposal, cfg, f"Fidelity {self.qubits}")
+        return Result(all(oks.values()), data, fit, proposal, cfg, f"Fidelity {self.qubits}",
+                      oks=oks)
 
 
 class ReadoutFidelity:
@@ -603,4 +616,4 @@ class Window:
             oks[q] = bool(fids[q][best] > 0.75)
         self.data, self.fit = data, fit
         return Result(all(oks.values()), data, fit, proposal, cfg,
-                      f"Window {self.qubits} {self.knob}")
+                      f"Window {self.qubits} {self.knob}", oks=oks)

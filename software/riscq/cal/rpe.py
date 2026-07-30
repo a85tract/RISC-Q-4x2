@@ -102,6 +102,14 @@ class Angles:
     #: Per-depth signal contrast, ideally 1 and decaying towards 0 as the state decoheres. Worth
     #: plotting: it is what tells you whether the ladder was too deep for the qubit.
     contrast: np.ndarray = None
+    #: The RAW per-experiment pyRPE ladders this angle set was inverted from, keyed by whatever
+    #: labels the experiments (for `cz_angles`, the state pair), each
+    #: {"ladder", "contrast", "last_good"}. Only the CZ estimator fills it, because only its
+    #: inversion mixes three independent experiments: a composite angle that disagrees with the
+    #: rest of the calibration says nothing about WHICH ladder moved, and the identities worth
+    #: checking (`A(2,3) == A(3,1)` on a converged tree — spec 14 §3 finding 9) live on the raw
+    #: ladders, not on the inverted angles.
+    ladders: dict = None
 
     @property
     def trusted(self):
@@ -265,21 +273,26 @@ def cz_angles(pair_counts, n_shots, depths=None):
 
     which inverts to ZZ = (A01 - A23)/2, IZ = (A01 + A23)/2, ZI = A31 + ZZ. Only the (0, 1)
     ladder is wrapped to [-π, π); the other two sit near π, where wrapping would straddle the cut.
+
+    The three raw ladders come back on `Angles.ladders` as well as the inverted angles: the
+    inversion is a 3->3 mix, so an angle that contradicts the rest of the calibration is only
+    diagnosable against the ladder it came from (spec 14 §3 finding 9).
     """
     missing = set(CZ_STATE_PAIRS) - set(pair_counts)
     if missing:
         raise ValueError(f"missing counts for CZ state pair(s) {sorted(missing)}")
 
-    ladders, last_goods, contrasts = {}, [], []
+    per_pair, last_goods, contrasts = {}, [], []
     for pair in CZ_STATE_PAIRS:
         cos_counts, sin_counts = pair_counts[pair]
         ladder, k, c = _ladder(cos_counts, sin_counts)
-        ladders[pair] = wrap(ladder) if pair == (0, 1) else ladder
+        per_pair[pair] = {"ladder": wrap(ladder) if pair == (0, 1) else ladder,
+                          "contrast": c, "last_good": k}
         last_goods.append(k)
         contrasts.append(c)
 
-    n = min(len(ladder) for ladder in ladders.values())
-    a01, a23, a31 = (ladders[p][:n] for p in CZ_STATE_PAIRS)
+    n = min(len(d["ladder"]) for d in per_pair.values())
+    a01, a23, a31 = (per_pair[p]["ladder"][:n] for p in CZ_STATE_PAIRS)
     contrast = np.min([c[:n] for c in contrasts], axis=0)
 
     zz = 0.5 * (a01 - a23)
@@ -293,6 +306,7 @@ def cz_angles(pair_counts, n_shots, depths=None):
         last_good=min(*last_goods, n - 1),
         n_shots=n_shots,
         contrast=contrast,
+        ladders=per_pair,
     )
 
 
@@ -771,8 +785,24 @@ class CZRPE:
     LinearResponse/optimizer stack, out of scope by spec 14 §4. Drive it from the notebook with
     `damped_update` and a hand-measured gain, or re-run `CZFrequency`/`CZAmplitude`.
 
-    Run the CZ chain first (`CZFrequency` → `CZAmplitude` → `RelativePhase` → `LocalPhases`): RPE
-    polishes a working CZ, it does not find one.
+    **The gap bias, and why this does not reproduce `LocalPhases`' write** (spec 14 §3 finding 9 —
+    the two-qubit twin of finding 4's `t_pulse/(d·t_idle)` bias). `k_cz_cond` brackets its CZ train
+    with the prep→train and train→close LEAD gaps and the prep X90; those enter a rung ONCE while
+    the tone enters it `d` times. So the accumulated phase is `d·θ + φ_gap` where the RPE model
+    wants `d·Θ`, and the per-CZ angle this reports is `θ + φ_gap/d` — with
+    `φ_gap = 2π·δ·(2·LEAD + xd)` for a residual carrier detuning δ on the Ramsey qubit. `LocalPhases`
+    measures at d = 1 and therefore ABSORBS `φ_gap` into the vz it writes; this class fits a slope
+    and excludes it. The two are pinned to the same number only as δ → 0 or d → ∞ — so **do not
+    compose them**: a tree that has just been through `LocalPhases` will read `IZ`/`ZI` here split by
+    `2π·δ·gap·(1 − 1/d_last)`, per qubit, with δ's sign. Measured on the real kernel
+    (`test_cz_rpe_ladder_drifts_with_the_lead_gap`): planting ±73.2 kHz on the two cores moved
+    `IZ`/`ZI` 5.5 rad apart at depths (1, 2, 4) with the true local phases at 0, and both offsets
+    vanished on resonance. The remedy is finding 4's: run `RPEFrequency` first and take the ladder
+    DEEP. The gap is ~1.05× the tone on X6Y3 (419 ns vs a 400 ns CZ) but ~10× on the co-sim twin,
+    which is why the twin exaggerates this by an order of magnitude.
+
+    Run the CZ chain first (`CZFrequency` → `RelativePhase` → `CZAmplitude` → `LocalPhases`, the
+    reference DAG's order): RPE polishes a working CZ, it does not find one.
     """
 
     #: The balanced closes per quadrature as (name, plus quad, minus quad) — `k_cz_cond` close
@@ -836,6 +866,9 @@ class CZRPE:
         else:
             self.angles[pair] = fit_out[pair] = angles
             data[pair]["contrast"] = angles.contrast
+            # the raw per-state-pair ladders the inversion mixed, so a composite angle that
+            # disagrees with LocalPhases can be traced to the rung it came from (finding 9)
+            data[pair]["ladders"] = angles.ladders
             err = angles.trusted_error
             data[pair]["zz_error"] = err["ZZ"]                    # reported, not written (docstring)
             prop = {f"two_qubit/{pk}/CZ/pulse": twoqubit._cz_local_set(

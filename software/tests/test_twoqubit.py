@@ -19,6 +19,7 @@ from riscq.cal.twoqubit import (_branch_correction, _cz_amp, _cz_cond_progs, _cz
                                 _cz_vz_entry, _fringe_peak, _local_phase_code, _mean_offset,
                                 _sandwich_binds, _signed_fft_freq)
 from riscq.map import LEAD, SocMap, SocParams, pack16
+from tests.responder import counts
 from riscq.pulses import envelopes, units
 
 _SIM2Q = Path(__file__).resolve().parents[1] / "configs" / "sim-2q.json"
@@ -525,51 +526,39 @@ def test_drive_form_pop_and_local_kernels_compile():
                            fef=0, sw=0, tail=0, p0=0, dp=0, sp=0, **x90_vz(cfg, q))
 
 
-def test_relative_phase_recovers_the_peak(monkeypatch):
+def test_relative_phase_recovers_the_peak(responder):
     """(X2 gate) `RelativePhase` end-to-end host-pure on synthetic branch data: the driver layer is
-    stubbed (setup / write_slot / rerun), the four tomography branches generated per rerun from the
-    CURRENTLY WRITTEN target cz-slot phase with a conditional phase θ(φ) peaking (θ=π) at a planted
-    φ* — so R = |sin(θ/2)| maximises there. The class's slot-write pacing, the four `_cond_R` reruns,
-    the parabola/argmax refine and the target `kwargs/phase` write-back all run for real; a coupler
-    pair asserts out."""
-    from riscq import run as rqrun
+    replaced by the shared `Responder` (specs/software-test-refactor/01 §2.2), the four tomography
+    branches generated per rerun from the CURRENTLY WRITTEN target cz-slot phase with a conditional
+    phase θ(φ) peaking (θ=π) at a planted φ* — so R = |sin(θ/2)| maximises there. The class's
+    slot-write pacing, the four `_cond_R` reruns, the parabola/argmax refine and the target
+    `kwargs/phase` write-back all run for real; a coupler pair asserts out."""
     cfg = _drive_cfg()
     phi_star, shots = 0.7, 400
-    state = {"phi": 0.0}
+    r = responder(_SIM2Q)
 
-    monkeypatch.setattr(rqrun, "setup", lambda *a, **k: None)
-
-    def fake_write_slot(drv, m_, core, prog, table, slot, field, value):
+    @r.answer
+    def _(progs, params):
+        core, table, slot, field, value = r.slot_writes[-1]
         assert (core, table, slot, field) == (1, "gate", 1, "phase")   # the TARGET core's cz slot
-        state["phi"] = value * math.pi / (1 << 15)                     # plain phase code → rad
-
-    def fake_rerun(drv, m_, progs, params=None, results=None, timeout=0):
+        phi = value * math.pi / (1 << 15)                              # plain phase code → rad
         prep = params.get(0, {}).get("prep", 0)
         quad = params.get(1, {}).get("quad", 0)
-        theta = math.pi * math.cos((state["phi"] - phi_star) / 2) if prep else 0.0
+        theta = math.pi * math.cos((phi - phi_star) / 2) if prep else 0.0
         p0 = (1 + (math.cos(theta) if quad == 0 else math.sin(theta))) / 2    # target P(0)
         return {0: {"out": np.array([0])},
-                1: {"out": np.array([round((1 - p0) * shots)])}}              # the kernel counts |1>s
-
-    monkeypatch.setattr(rqrun, "write_slot", fake_write_slot)
-    monkeypatch.setattr(rqrun, "rerun", fake_rerun)
-
-    class _Drv:                                       # socmap(drv) reads drv.sim.get_params()
-        class sim:
-            @staticmethod
-            def get_params():
-                return _SIM2Q.read_text()
+                1: {"out": counts([1 - p0], shots)}}                   # the kernel counts |1>s
 
     cal = RelativePhase(cfg, (0, 1), points=21, shots=shots)
-    r = cal.run(_Drv())
-    R = r.data[(0, 1)]["R"]
-    assert r.ok and R.max() > 0.9
-    written = r.proposal["two_qubit/(0, 1)/CZ/pulse"][1]["kwargs"]["phase"]
+    res = cal.run(r.drv)
+    R = res.data[(0, 1)]["R"]
+    assert res.ok and R.max() > 0.9
+    written = res.proposal["two_qubit/(0, 1)/CZ/pulse"][1]["kwargs"]["phase"]
     assert written == pytest.approx(phi_star, abs=0.2)             # within the argmax half-step
     assert cfg["two_qubit/(0, 1)/CZ/pulse"][1]["kwargs"]["phase"] == 0.267   # original untouched
 
     with pytest.raises(AssertionError, match="two-qubit-drive"):
-        RelativePhase(_cz_config(), (0, 1)).run(_Drv())
+        RelativePhase(_cz_config(), (0, 1)).run(r.drv)
 
 
 def _spect_cfg():
@@ -588,46 +577,37 @@ def _spect_cfg():
     return cfg
 
 
-def test_spectator_phase_recovers_planted_phase(monkeypatch):
+def test_spectator_phase_recovers_planted_phase(responder):
     """(X3 gate) `SpectatorPhase` end-to-end host-pure on synthetic fringes: the driver layer is
-    stubbed (setup / rerun) and each conditional-branch rerun returns the spectator Ramsey fringe
-    P(1) = (1 + cos(ψ_c + φ))/2 for a planted spectator kick ψ_c = ψ + c·δ (a small spectator
+    replaced by the shared `Responder` and each conditional-branch rerun returns the spectator Ramsey
+    fringe P(1) = (1 + cos(ψ_c + φ))/2 for a planted spectator kick ψ_c = ψ + c·δ (a small spectator
     conditionality δ — NO conditional π, the spectator is outside the gate). The class's REAL 3-core
     compile (spectator = the COUPLER_FORM ACTIVE Ramsey at czd+LEAD, the pair = DRIVE_FORM SPECTATOR
     roles, `sp` live only on the conditional core), the two `sp` reruns, the wrap-aware branch mean
     and the channel-matched write-back all run for real; the recovered −ψ − δ/2 lands in the
     SPECTATOR's entry of the pair's pulse list."""
-    from riscq import run as rqrun
     from riscq.cal import SpectatorPhase
     from riscq.cal.twoqubit import _phi_sweep
     cfg = _spect_cfg()
     psi, delta, points, shots = 0.9, 0.1, 24, 200
-
-    compiled = {}
-    monkeypatch.setattr(rqrun, "setup", lambda drv, m_, progs: compiled.update(progs))
+    r = responder(_SIM2Q1C)
 
     _, _, phi_ax = _phi_sweep(points)                            # the class's own φ axis
 
-    def fake_rerun(drv, m_, progs, params=None, results=None, timeout=0):
+    @r.answer
+    def _(progs, params):
         sp = params[0]["sp"]                                     # conditional defaults to pair[0]
         P1 = (1 + np.cos(psi + sp * delta + phi_ax)) / 2         # fringe peaks at φ = −ψ_c
         out = {q: {"out": np.zeros(points)} for q in progs}
         out[2] = {"out": np.rint(P1 * shots)}
         return out
 
-    monkeypatch.setattr(rqrun, "rerun", fake_rerun)
-
-    class _Drv:                                       # socmap(drv) reads drv.sim.get_params()
-        class sim:
-            @staticmethod
-            def get_params():
-                return _SIM2Q1C.read_text()
-
     cal = SpectatorPhase(cfg, (0, 1), spectator=2, points=points, shots=shots)
-    r = cal.run(_Drv())
-    assert r.ok
+    res = cal.run(r.drv)
+    assert res.ok
+    compiled = {q for setup in r.setups for q in setup}
     assert sorted(compiled) == [0, 1, 2], "expected a real 3-core compile through setup"
-    pulses = r.proposal["two_qubit/(0, 1)/CZ/pulse"]
+    pulses = res.proposal["two_qubit/(0, 1)/CZ/pulse"]
     got = _cz_vz_entry(pulses, 2)["kwargs"]["phase"]
     want = -(psi + delta / 2)                                    # the two branch peaks' midpoint
     assert got == pytest.approx(want, abs=0.03)
@@ -716,15 +696,14 @@ def _cz_branch_p0(u, v, quad):
     return abs(1 - (1j * u if quad else u)) ** 2 / 4 + abs(v) ** 2 / 4
 
 
-def test_cz_amp_freq_sweep_seeds_the_argmax(monkeypatch):
+def test_cz_amp_freq_sweep_seeds_the_argmax(responder):
     """(F4 gate) `CZAmpFreqSweep` end-to-end host-pure on the exact drive-form CZ physics: the
-    driver layer is stubbed (setup / write_slot / rerun) and the four tomography branches are
+    driver layer is replaced by the shared `Responder` and the four tomography branches are
     generated per rerun from the {|11>, |02>} pseudo-qubit amplitude at the CURRENTLY WRITTEN
     lockstep amp and each swept carrier (`_cz_uv` + `_cz_branch_p0`, the per-batch ramping-axis
     product the model runs, read through our 1-bit discriminator). The class's ONE compile, the
     both-lines `write_slot('amp')` pacing, the four `_cond_R` reruns per amp row, the 2D argmax and
     the CZ/freq + CZ/pulse write-back all run for real."""
-    from riscq import run as rqrun
     from riscq.cal.base import sweep_q16
     cfg = _drive_cfg()
     points, shots = 9, 400
@@ -735,49 +714,42 @@ def test_cz_amp_freq_sweep_seeds_the_argmax(monkeypatch):
     _, _, xs = sweep_q16(lo, hi, points)
     fax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
     f_star = float(fax[points // 2])                             # plant on a grid point
-    state = {"amp": {}, "setups": 0, "writes": []}
+    r = responder(_SIM2Q)
 
-    def fake_setup(drv, m_, progs):
-        state["setups"] += 1
-
-    def fake_write_slot(drv, m_, core, prog, table, slot, field, value):
-        assert (table, slot, field) == ("gate", 1, "amp")         # each core's OWN cz slot
-        state["amp"][core] = int(value) / units.AMP_SCALE
-        state["writes"].append((core, int(value)))
-
-    def fake_rerun(drv, m_, progs, params=None, results=None, timeout=0):
+    @r.answer
+    def _(progs, params):
         prep = params.get(0, {}).get("prep", 0)
         quad = params.get(1, {}).get("quad", 0)
-        assert state["amp"][0] == state["amp"][1], "the two CZ lines must be written LOCKSTEP"
-        p0 = np.array([_cz_branch_p0(*(_cz_uv(state["amp"][1], f, f_star) if prep else (1.0, 0.0)),
+        amps = [r.slot(core, "gate", 1, "amp") for core in (0, 1)]   # each core's OWN cz slot
+        assert amps[0] == amps[1], "the two CZ lines must be written LOCKSTEP"
+        amp = int(amps[1]) / units.AMP_SCALE
+        p0 = np.array([_cz_branch_p0(*(_cz_uv(amp, f, f_star) if prep else (1.0, 0.0)),
                                      quad) for f in fax])
         return {0: {"out": np.zeros(points, int)},
                 1: {"out": np.rint((1 - p0) * shots).astype(int)}}   # the kernel counts |1>s
 
-    monkeypatch.setattr(rqrun, "setup", fake_setup)
-    monkeypatch.setattr(rqrun, "write_slot", fake_write_slot)
-    monkeypatch.setattr(rqrun, "rerun", fake_rerun)
-
     cal = CZAmpFreqSweep(cfg, (0, 1), span=span, points=points, shots=shots)
-    r = cal.run(_StubDrv())
-    d = r.data[(0, 1)]
-    assert state["setups"] == 1                                  # ONE compile: the amp is host-side
+    res = cal.run(r.drv)
+    d = res.data[(0, 1)]
+    assert len(r.setups) == 1                                    # ONE compile: the amp is host-side
     assert d["R"].shape == (7, points)                           # the default 7-amp x freq grid
     assert d["amps"] == pytest.approx(np.linspace(0.5 * _AF_AMP, 1.5 * _AF_AMP, 7))
     assert d["freqs"] == pytest.approx(fax)
-    assert len(state["writes"]) == 2 * 7                         # both lines, once per amp row
+    assert len(r.slot_writes) == 2 * 7                           # both lines, once per amp row
+    assert all((t, s, f) == ("gate", 1, "amp")                   # each core's OWN cz slot
+               for (_, t, s, f, _) in r.slot_writes)
     ka, kf = np.unravel_index(int(np.argmax(d["R"])), d["R"].shape)
     assert (ka, kf) == (3, points // 2)                          # the planted (amp*, f_CZ*)
-    assert d["R"][ka, kf] > 0.95 and r.ok
-    assert r.proposal["two_qubit/(0, 1)/CZ/freq"] == pytest.approx(f_star)
-    written = r.proposal["two_qubit/(0, 1)/CZ/pulse"]
+    assert d["R"][ka, kf] > 0.95 and res.ok
+    assert res.proposal["two_qubit/(0, 1)/CZ/freq"] == pytest.approx(f_star)
+    written = res.proposal["two_qubit/(0, 1)/CZ/pulse"]
     assert [p["kwargs"]["amp"] for p in written[:2]] == pytest.approx([_AF_AMP, _AF_AMP])
     assert written[1]["kwargs"]["phase"] == 0.267                # the relative phase is untouched
     assert cfg["two_qubit/(0, 1)/CZ/freq"] == 25e6               # original config untouched
 
     # a landscape with no conditional response anywhere: refuse, write nothing (CZFrequency's gate)
     dead = CZAmpFreqSweep(cfg, (0, 1), amps=[0.02, 0.03], span=span, points=points,
-                          shots=shots).run(_StubDrv())
+                          shots=shots).run(r.drv)
     assert dead.data[(0, 1)]["R"].max() < 0.5
     assert not dead.ok and dead.proposal == {}
 
@@ -898,58 +870,49 @@ def _levels_iq(P, shots):
     return iq.reshape(-1)
 
 
-class _StubDrv:                                       # socmap(drv) reads drv.sim.get_params()
-    class sim:
-        @staticmethod
-        def get_params():
-            return _SIM2Q.read_text()
-
-
-def test_ef_phase_recovers_planted_vz(monkeypatch):
+def test_ef_phase_recovers_planted_vz(responder):
     """(X4 gate) `EFPhase` end-to-end host-pure on planted lines (the GE Phase golden probe, on the
-    3-level decode): the driver layer is stubbed at rq.run and each sequence's P(|2>) is linear in
-    the swept phi with opposite slopes crossing at a planted phi* — the class's REAL two-seq
-    k_ef_phase compile, the ClassifierN decode, the `_line_crossing` analysis and the
+    3-level decode): the driver layer is replaced by the shared `Responder` and each sequence's
+    P(|2>) is linear in the swept phi with opposite slopes crossing at a planted phi* — the class's
+    REAL two-seq k_ef_phase compile, the ClassifierN decode, the `_line_crossing` analysis and the
     `qubit/{q}/EF/x90/vz` = [phi*, phi*] write-back all run for real. The relative_phase pass
     re-centres the sweep on the STORED vz[0] (qcal's `phases + config[param]`)."""
-    from riscq import run as rqrun
     from riscq.cal.qubit import _phase_sweep
     cfg = _drive_cfg()
     cfg["qubit/0/EF/freq"] = 40e6
     cfg["qubit/0/EF/x90/amp"] = 0.4
     points, shots, span = 15, 100, 0.25    # RAW out = 2·npts·shots words: sized for the 16KB core RAM
     state = {"x": None, "phi_star": 0.1, "runs": 0}
+    r = responder(_SIM2Q)
 
-    def fake_run(drv, m_, progs, params=None, results=None, timeout=0):
+    @r.answer
+    def _(progs, params):
         slope = 1.0 if state["runs"] == 0 else -1.0              # Y180_X90 first, then X180_Y90
         state["runs"] += 1
         P = 0.5 + slope * (state["x"] - state["phi_star"])
         return {0: {"out": _levels_iq(P, shots)}}
 
-    monkeypatch.setattr(rqrun, "run", fake_run)
-
     state["x"] = _phase_sweep(-span, span, points)[2]            # the class's own axis
     cal = EFPhase(cfg, 0, _ef_clf(), points=points, span=span, shots=shots)
-    r = cal.run(_StubDrv())
-    assert r.ok and state["runs"] == 2 and not cal.fallback[0]
+    res = cal.run(r.drv)
+    assert res.ok and state["runs"] == 2 and not cal.fallback[0]
     assert cal.recovered_vz[0] == pytest.approx(0.1, abs=0.01)
-    assert r.proposal["qubit/0/EF/x90/vz"] == pytest.approx([0.1, 0.1], abs=0.01)
+    assert res.proposal["qubit/0/EF/x90/vz"] == pytest.approx([0.1, 0.1], abs=0.01)
 
     cfg["qubit/0/EF/x90/vz"] = [0.3, 0.25]                       # stored pair (X6Y3: asymmetric)
     state.update(x=_phase_sweep(0.3 - span, 0.3 + span, points)[2], phi_star=0.38, runs=0)
-    r2 = EFPhase(cfg, 0, _ef_clf(), points=points, span=span, shots=shots,
-                 relative_phase=True).run(_StubDrv())
-    assert r2.ok
-    assert r2.proposal["qubit/0/EF/x90/vz"] == pytest.approx([0.38, 0.38], abs=0.01)
+    res2 = EFPhase(cfg, 0, _ef_clf(), points=points, span=span, shots=shots,
+                   relative_phase=True).run(r.drv)
+    assert res2.ok
+    assert res2.proposal["qubit/0/EF/x90/vz"] == pytest.approx([0.38, 0.38], abs=0.01)
 
 
-def test_ef_amplitude_gate_x_knob(monkeypatch):
+def test_ef_amplitude_gate_x_knob(responder):
     """(X4 gate) EFAmplitude's `gate` knob — qcal `Amplitude(subspace='EF', gate='X')` (spec 04
     §2): the repetition guard flips to qcal's multiple-of-2 (pairs of EF π's return to |1>), the
     write path moves to `qubit/{q}/EF/x/amp`, and the n_gates=1 cosine fit recovers a planted π
-    amplitude — P(|2>) generated from a planted EF Rabi rate over the ACTUAL swept codes (driver
-    stubbed at rq.run), maximal at the π amp."""
-    from riscq import run as rqrun
+    amplitude — P(|2>) generated from a planted EF Rabi rate over the ACTUAL swept codes (the driver
+    layer is replaced by the shared `Responder`), maximal at the π amp."""
     from riscq.cal.base import gate_sigma
     clf = _ef_clf(5)
     cfg = _drive_cfg()
@@ -969,18 +932,130 @@ def test_ef_amplitude_gate_x_knob(monkeypatch):
     a_star = 0.5
     rabi = math.pi / gate_sigma(m, efp, 40e6, units._amp_code(a_star))   # π EXACTLY at a* = 0.5
     points, shots = 15, 100
+    r = responder(_SIM2Q)
 
-    def fake_run(drv, m_, progs, params=None, results=None, timeout=0):
+    @r.answer
+    def _(progs, params):
         a0q, daq = params[0]["a0q"], params[0]["daq"]            # the kernel's own Q16 walk
         P = [(1 - math.cos(rabi * gate_sigma(m, efp, 40e6, (a0q + i * daq) >> 16))) / 2
              for i in range(points)]
         return {0: {"out": _levels_iq(np.array(P), shots)}}
 
-    monkeypatch.setattr(rqrun, "run", fake_run)
     cal = EFAmplitude(cfg, 0, clf, gate="X", n_gates=1, amp_span=(0.05, 0.95), points=points,
                       shots=shots)
-    r = cal.run(_StubDrv())
-    assert r.ok
-    assert r.proposal["qubit/0/EF/x/amp"] == pytest.approx(a_star, abs=0.02)
-    assert r.proposal["qubit/0/EF/rabi"] == pytest.approx(rabi, rel=0.05)
-    assert "qubit/0/EF/x90/amp" not in r.proposal                # the X90 path is untouched
+    res = cal.run(r.drv)
+    assert res.ok
+    assert res.proposal["qubit/0/EF/x/amp"] == pytest.approx(a_star, abs=0.02)
+    assert res.proposal["qubit/0/EF/rabi"] == pytest.approx(rabi, rel=0.05)
+    assert "qubit/0/EF/x90/amp" not in res.proposal              # the X90 path is untouched
+
+
+# ── spec 14 findings 6 + 7: the EF bracket, and the frame the 3-level classifier reads in ──
+
+
+def _ef_bracket_cfg():
+    """`_drive_cfg` plus everything an EF cal compiles against — including the X6Y3 q2 EF pair and a
+    NON-ZERO stored demod phase (X6Y3's are −109.9°…+39.0°), so both findings are observable."""
+    cfg = _drive_cfg()
+    cfg["qubit/0/EF/freq"] = 40e6
+    cfg["qubit/0/EF/x90/amp"] = 0.4
+    cfg["qubit/0/EF/x/amp"] = 0.5
+    cfg["qubit/0/EF/x90/vz"] = [-0.16289759, -0.16289759]
+    cfg["readout/0/demod/phase"] = -1.918                       # the config frame the res bit uses
+    return cfg
+
+
+def _ef_srcs(r, cal, points, shots, p=None):
+    """Run `cal` against the shared `Responder` and return the generated C of every program it
+    compiled in THIS run (one entry per program the class sets up)."""
+    P = np.full(points, 0.5) if p is None else p
+    r.answer(lambda progs, params: {0: {"out": _levels_iq(P, shots)}})
+    seen = len(r.sources)
+    cal.run(r.drv)
+    return r.sources[seen:]
+
+
+def test_ef_kernels_play_the_calibrated_ef_vz_bracket(responder):
+    """(spec 14 finding 6) qcal's EF X90 is virtualz(vz0) · FAST_DRAG · virtualz(vz1), so every EF
+    gate in its EF Amplitude/Frequency/Phase circuits plays the calibrated pair — the pair EFPhase
+    writes to `qubit/{q}/EF/x90/vz`. The EF kernels used to play the train in a fresh 0 frame and
+    never consume it. Assert on the C the classes actually compile: the seated bracket words
+    (`ef_vz`) are emitted where the gate carries the pair, and NOT where qcal has none to play —
+    the bare EF X, and the two crossing sequences whose sweep REPLACES the pair."""
+    from riscq.cal import EFFrequency
+    from riscq.cal.base import ef_vz
+    cfg = _ef_bracket_cfg()
+    b = ef_vz(cfg, 0)
+    points, shots = 7, 16
+    r = responder(_SIM2Q)
+
+    # EF Rabi (EFAmplitude, gate='X90'): every gate of the train fires at frame + evz0 and steps the
+    # frame by evzsum, exactly as the GE k_rabi train does
+    src, = _ef_srcs(r, EFAmplitude(cfg, 0, _ef_clf(), n_gates=4, points=points,
+                                   shots=shots), points, shots)
+    assert str(b["evz0"]) in src and str(b["evzsum"]) in src
+
+    # ... and gate='X' binds the pair of the gate ACTUALLY played — the bare EF X has none
+    src, = _ef_srcs(r, EFAmplitude(cfg, 0, _ef_clf(), gate="X", n_gates=2, points=points,
+                                   shots=shots), points, shots)
+    assert str(b["evz0"]) not in src and str(b["evzsum"]) not in src
+
+    # EF Ramsey (EFFrequency): the swept detuning is the Rz BETWEEN the two EF X90s, so it COMPOSES
+    # with each gate's bracket — the 2nd fires at evzsum + phi + evz0
+    fringe = 0.5 + 0.4 * np.cos(np.arange(points) * 0.7)
+    srcs = _ef_srcs(r, EFFrequency(cfg, 0, _ef_clf(), points=points, shots=shots),
+                    points, shots, p=fringe)
+    assert all(str(b["evz0"]) in s and str(b["evzsum"]) in s for s in srcs)
+
+    # EFPhase's two crossing sequences are EXEMPT: there the swept phi IS the pair (qcal writes one
+    # crossing to both slots), so the stored bracket must not be composed on top of it
+    for s in _ef_srcs(r, EFPhase(cfg, 0, _ef_clf(), points=points, shots=shots),
+                      points, shots):
+        assert str(b["evz0"]) not in s and str(b["evzsum"]) not in s
+
+    # EFPhase(gate='X') is the opposite case: the two EF X90s keep their bracket and only the EF X's
+    # own axis is swept
+    src, = _ef_srcs(r, EFPhase(cfg, 0, _ef_clf(), gate="X", points=points, shots=shots),
+                    points, shots)
+    assert str(b["evz0"]) in src and str(b["evzsum"]) in src
+
+
+def test_ef_cals_capture_in_the_classifiers_zero_demod_frame(responder, monkeypatch):
+    """(spec 14 finding 7) `ClassifierN`'s training captures are deliberately zero-frame
+    (`_rawiq_prog`/`_ef_prep_prog` bake `phase=0.0`), so every consumer that classifies host-side
+    must capture in that same frame or its IQ clouds arrive rotated by the stored demod phase
+    relative to the classifier's means — 0 on the co-sim configs, −109.9°…+39.0° on X6Y3.
+
+    The res-bit cals are the deliberate opposite: there the stored phase IS the hardware
+    discrimination knob, so they must keep passing the config frame (`phase=None`)."""
+    from riscq.cal import Amplitude, EFFrequency, Phase
+    from riscq.cal import base as cal_base
+    from riscq.cal import qubit as cal_qubit
+    cfg = _ef_bracket_cfg()
+    points, shots = 7, 16
+    seen = []
+    real = cal_base.readout_tables
+
+    def recorder(cfg_, q, m_, phase=None, win=None):
+        seen.append(phase)
+        return real(cfg_, q, m_, phase=phase, win=win)
+
+    monkeypatch.setattr(cal_qubit, "readout_tables", recorder)
+    r = responder(_SIM2Q)
+
+    fringe = 0.5 + 0.4 * np.cos(np.arange(points) * 0.7)
+    for cal, p in ((EFAmplitude(cfg, 0, _ef_clf(), points=points, shots=shots), None),
+                   (EFFrequency(cfg, 0, _ef_clf(), points=points, shots=shots), fringe),
+                   (EFPhase(cfg, 0, _ef_clf(), points=points, shots=shots), None),
+                   (EFPhase(cfg, 0, _ef_clf(), gate="X", points=points, shots=shots), None)):
+        seen.clear()
+        _ef_srcs(r, cal, points, shots, p=p)
+        assert seen and set(seen) == {0.0}, f"{type(cal).__name__} captured at {set(seen)}"
+
+    # the res-bit consumers must NOT move
+    r.answer(lambda progs, params: {0: {"out": np.zeros(points, dtype=int)}})
+    for cal in (Amplitude(cfg, 0, points=points, shots=shots),
+                Phase(cfg, 0, points=points, shots=shots)):
+        seen.clear()
+        cal.run(r.drv)
+        assert seen and set(seen) == {None}, f"{type(cal).__name__} captured at {set(seen)}"

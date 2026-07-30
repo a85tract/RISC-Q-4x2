@@ -53,7 +53,7 @@ def k_vna_sweep(demod: ParamTable, iq: Array, base: int, step: int, npts: int, p
 
 
 @kernel
-def k_vna_one(demod: ParamTable, out: Array, code: int):
+def k_vna_one(demod: ParamTable, out: Array, code: int):   # `code` stays a RUNTIME param — see below
     """One host-loop VNA point (the pre-batch per-point shape): a single |0> read at demod `code`."""
     init_pulse_params(demod.pulses)  # noqa: F821
     set_freq(demod, code)  # noqa: F821
@@ -76,7 +76,13 @@ def _mags(iq):
     return np.array([math.hypot(int(iq[2 * k]), int(iq[2 * k + 1])) for k in range(len(iq) // 2)])
 
 
+@pytest.mark.batch_cap(33_000)
 def test_demod_retunes_on_core(cosim):
+    """FLOOR: ~30 k = TWO program images (~6.6 k each) + the 7-point on-core sweep + 7 host-loop
+    reruns (~2 k each). The claim is a point-for-point comparison of two routes over the same 7
+    demod codes, so neither route's image nor its 7 points can go: dropping the host loop deletes
+    the baseline the on-core sweep is being compared against. The per-point image reload is already
+    gone (`code` is a runtime param, `setup` + `rerun` per point)."""
     drv, m = cosim
     npts = 7
     codes = [(i + 1) * F for i in range(npts)]         # F,2F,…,7F — matched 4F at index 3
@@ -89,10 +95,13 @@ def test_demod_retunes_on_core(cosim):
                           npts=npts, period=400)
     on = _mags(rq.run(drv, m, {0: prog}, timeout=8_000_000)[0]["iq"])
 
-    # host loop: one run per code (the current Separation path), same tone
-    host = np.array([_mags(rq.run(drv, m, {0: compile_kernel(k_vna_one, m, tables=dict(demod=_demod()),
-                                                             out=Array(2), code=pack16(c))},
-                                  timeout=2_000_000)[0]["out"])[0] for c in codes])
+    # host loop: one run per code (the current Separation path), same tone. `code` is left unbound
+    # so it is a runtime param: the baseline is ONE loaded image + a `rerun` per point rather than
+    # a fresh `run` (image reload included) per point (01 §4.5) — same one-readout-per-run shape.
+    one = compile_kernel(k_vna_one, m, tables=dict(demod=_demod()), out=Array(2))
+    rq.setup(drv, m, {0: one})
+    host = np.array([_mags(rq.rerun(drv, m, {0: one}, params={0: {"code": pack16(c)}},
+                                    timeout=2_000_000)[0]["out"])[0] for c in codes])
 
     print(f"\n[vna-retune] codes/F={[c // F for c in codes]}\n"
           f"  on-core |z|={[int(x) for x in on]}\n  host    |z|={[int(x) for x in host]}")

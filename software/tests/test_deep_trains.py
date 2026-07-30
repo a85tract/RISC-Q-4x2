@@ -30,6 +30,14 @@ RO_DUR = 40
 X90_SAMPLES = 72            # 18 batches at gateInterp 4 — the X6Y3 X90 (35 ns) to scale
 RELAX = 200                 # a short co-sim relax head
 
+# Captures are SIZED, not generous (01 §3.3): `dac_capture_get` BLOCKS until the armed window is
+# full, so every armed batch past the last gate is simulated for nothing. A capture armed before the
+# reset release pays the core's boot + preamble first (measured ~800 batches on this build), and the
+# one shot these kernels play lives entirely inside the ONE grid period that follows — so
+# BOOT_NCAP + period covers it with the whole idle relax head to spare. Each test prints its
+# windows and asserts an exact gate count, so an undersized capture fails loudly, never silently.
+BOOT_NCAP = 1400
+
 
 @kernel
 def _k_unpaced(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, period: int,
@@ -63,8 +71,10 @@ def _tables(m, samples=X90_SAMPLES):
     return gate, ro, demod
 
 
-def _capture(drv, m, prog, period, ncap=40000):
-    """Run one program with the gate DAC captured from before the reset release."""
+def _capture(drv, m, prog, period):
+    """Run one program with the gate DAC captured from before the reset release, over a window
+    sized to boot + the shot's own grid period (BOOT_NCAP)."""
+    ncap = BOOT_NCAP + period
     rq.setup(drv, m, {0: prog})
     rq.check_magic(drv, m, 0, prog)
     rq.write_var(drv, m, 0, prog, "__rq_status", 0)
@@ -189,7 +199,7 @@ def test_ef_train_holds_at_the_reference_depth(cosim):
                           code=pack16(RO_CODE), ddly=0,
                           ge_freq=units.freq_to_code(F_GE, m.params),
                           ef_freq=units.freq_to_code(F_EF, m.params), vz0=0, vzsum=0,
-                          a0q=(16000 << 16), daq=0)
+                          evz0=0, evzsum=0, a0q=(16000 << 16), daq=0)
     t0, cap = _capture(drv, m, prog, period)
     wins = _windows(cap)
     prep, train = wins[0], wins[1:]                  # the two-X90 GE prep is one merged window

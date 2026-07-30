@@ -30,7 +30,7 @@ import numpy as np
 
 from riscq import run as rq
 from riscq.cal import fits, kernels
-from riscq.cal.base import (GATE_CH, SEP, Result, batch_timeout, batches, ef_pulse, ef_table,
+from riscq.cal.base import (GATE_CH, SEP, Result, batch_timeout, batches, ef_pulse, ef_table, ef_vz,
                             gate_pulse, gate_sigma, grid_period, herald_offset, heralding, population,
                             population_heralded, prep, qubit_freq, qubits_list, readout_tables,
                             relax_batches, rerun_levels, res_sign, seconds, socmap, sweep_counts,
@@ -623,7 +623,10 @@ class EFAmplitude:
             path = f"qubit/{q}/EF/{name}/amp"
             table, ge_freq, ef_freq = ef_table(cfg, q, m, name)
             efp, f_ef = ef_pulse(cfg, q, m, name), float(cfg[f"qubit/{q}/EF/freq"])
-            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            # classified host-side by ClassifierN — capture in the classifier's zero frame (spec 14
+            # finding 7): the training clusters are taken at phase=0, so a config-frame capture would
+            # arrive rotated by the stored demod phase relative to the classifier's means
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m, phase=0.0)
             span = self.amp_span
             if self.relative_amp:                     # qcal: the sweep is a MULTIPLE of the current amp
                 span = (span[0] * float(cfg[path]), span[1] * float(cfg[path]))
@@ -638,7 +641,10 @@ class EFAmplitude:
                                       out=Array(2 * self.points * self.shots), npts=self.points,
                                       shots=self.shots, period=period, ngates=self.n_gates,
                                       step=step, code=code,
-                                      ddly=ddly, ge_freq=ge_freq, ef_freq=ef_freq, **x90_vz(cfg, q))
+                                      ddly=ddly, ge_freq=ge_freq, ef_freq=ef_freq,
+                                      # the bracket of the gate actually being played: the EF X90's
+                                      # calibrated pair, or the EF X's absent (= [0, 0]) one
+                                      **x90_vz(cfg, q), **ef_vz(cfg, q, name))
             params[q] = {"a0q": int(a0q), "daq": int(daq)}
             sig = np.array([gate_sigma(m, efp, f_ef, int(a)) for a in xs]) * self.n_gates
             meta[q] = (np.array(xs, float), sig, path)
@@ -707,7 +713,9 @@ class EFFrequency:
         for q in self.qubits:
             carrier = float(cfg[f"qubit/{q}/EF/freq"])
             table, ge_freq, ef_freq = ef_table(cfg, q, m)
-            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            # classified host-side by ClassifierN — capture in the classifier's zero frame (spec 14
+            # finding 7)
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m, phase=0.0)
             ge = table.pulses["x90"].dur_batches(m, GATE_CH)
             ef = table.pulses["ef"].dur_batches(m, GATE_CH)
             seq = SEP + 2 * ef + waits[-1] + LEAD + 2 * ge          # earliest pulse → t_ro (longest wait)
@@ -718,7 +726,8 @@ class EFFrequency:
                                       tables=dict(gate=table, ro=ro, demod=demod),
                                       out=Array(2 * self.points * self.shots), npts=self.points,
                                       shots=self.shots, period=period, code=code, ddly=ddly,
-                                      ge_freq=ge_freq, ef_freq=ef_freq, w0=t0, dw=dt, **x90_vz(cfg, q))
+                                      ge_freq=ge_freq, ef_freq=ef_freq, w0=t0, dw=dt,
+                                      **x90_vz(cfg, q), **ef_vz(cfg, q))
             carriers[q] = carrier
             timeout = max(timeout, batch_timeout(self.points * self.shots * period))
         rq.setup(drv, m, progs)
@@ -773,12 +782,18 @@ class EFPhase:
     NOT the full-turn `_phi_sweep` of the Ramsey-peak cals: a line crossing needs a narrow linear
     window, and a full turn would wrap the lines. Writes `qubit/{q}/EF/x90/vz` = [phi, phi].
 
+    THE EF BRACKET (spec 14 §3 finding 6). The two crossing sequences are EXEMPT from playing the
+    stored `qubit/{q}/EF/x90/vz`: there the sweep IS the pair (qcal's sweep semantics — it REPLACES
+    it, and `relative_phase` is how the sweep is centred on the current value instead), so the kernel
+    binds evz0/evzsum = 0. The `gate='X'` circuit below is the opposite case and does play it.
+
     `gate='X'` is the EF twin of `Phase(gate='X')` (spec 14 §3.3): one circuit, EF-X90 · EF-X · EF-X90
     after the same GE π prep, over the EF X's own AXIS phase (`qubit/{q}/EF/x/phase` — not a
-    virtual-Z pair). The two EF X90s play in a fresh 0 frame, so the swept phi is measured against
-    THEIR axis; the composite is a 2π rotation inside {|1>, |2>} that returns to |1> only on
-    alignment, so P(|2>) is cosinusoidal in phi with its MINIMUM at the calibrated value (qcal fits
-    the same cosine to P(1) − P(2) and takes the maximum). The default sweep is a full turn."""
+    virtual-Z pair). Its two EF X90s carry their calibrated bracket (`ef_vz`), so the swept phi is
+    measured against the axis they actually sit on; the composite is a 2π rotation inside {|1>, |2>}
+    that returns to |1> only on alignment, so P(|2>) is cosinusoidal in phi with its MINIMUM at the
+    calibrated value (qcal fits the same cosine to P(1) − P(2) and takes the maximum). The default
+    sweep is a full turn."""
 
     CHI2_MAX = 10.0             # qcal's underfitting guard (single_qubit.py:1067)
 
@@ -816,7 +831,9 @@ class EFPhase:
             timeout = 0
             for q in self.qubits:
                 table, ge_freq, ef_freq = ef_table(cfg, q, m)
-                ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+                # classified host-side by ClassifierN — capture in the classifier's zero frame
+                # (spec 14 finding 7)
+                ro, demod, code, dur, ddly = readout_tables(cfg, q, m, phase=0.0)
                 ge = table.pulses["x90"].dur_batches(m, GATE_CH)
                 ef = table.pulses["ef"].dur_batches(m, GATE_CH)
                 seq_len = SEP + 3 * ef + LEAD + 2 * ge         # earliest pulse (GE prep) → t_ro
@@ -826,7 +843,10 @@ class EFPhase:
                                           out=Array(2 * self.points * self.shots), npts=self.points,
                                           shots=self.shots, period=period, code=code, ddly=ddly,
                                           ge_freq=ge_freq, ef_freq=ef_freq, seq=seq, hpi=hpi,
-                                          **x90_vz(cfg, q))
+                                          # the swept phi IS the EF pair here (qcal writes one
+                                          # crossing to both slots), so the stored bracket is
+                                          # REPLACED, not composed with — the GE Phase contract
+                                          evz0=0, evzsum=0, **x90_vz(cfg, q))
                 p0, dp, _ = axis[q]
                 par[q] = {"p0": pack16(p0), "dp": pack16(dp)}  # the swept EF pair, host-seated
                 timeout = max(timeout, batch_timeout(self.points * self.shots * period))
@@ -860,7 +880,9 @@ class EFPhase:
             # the swept phi REPLACES the EF X's stored axis (qcal writes the pulse's own phase kwarg),
             # so the slot is built at 0 and the on-core phase offset carries the whole axis
             table.pulses["efx"] = Pulse(efx.env, amp=efx.amp)
-            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            # classified host-side by ClassifierN — capture in the classifier's zero frame (spec 14
+            # finding 7)
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m, phase=0.0)
             ge = table.pulses["x90"].dur_batches(m, GATE_CH)
             ef = table.pulses["ef"].dur_batches(m, GATE_CH)
             xd = table.pulses["efx"].dur_batches(m, GATE_CH)
@@ -871,7 +893,10 @@ class EFPhase:
                                       out=Array(2 * self.points * self.shots), npts=self.points,
                                       shots=self.shots, period=period, code=code, ddly=ddly,
                                       ge_freq=ge_freq, ef_freq=ef_freq, seq=kernels.X90_X_X90,
-                                      hpi=pack16(units._phase_code(math.pi / 2)), **x90_vz(cfg, q))
+                                      hpi=pack16(units._phase_code(math.pi / 2)),
+                                      # the two EF X90s keep their calibrated bracket; only the EF
+                                      # X's axis is swept (its own pair is [0, 0])
+                                      **x90_vz(cfg, q), **ef_vz(cfg, q))
             p0, dp, _ = axis[q]
             par[q] = {"p0": pack16(p0), "dp": pack16(dp)}       # the swept EF X axis, host-seated
             timeout = max(timeout, batch_timeout(self.points * self.shots * period))

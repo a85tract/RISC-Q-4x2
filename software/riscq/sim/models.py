@@ -38,6 +38,19 @@ class QuantumModel(Protocol):
         Returns {adc_id: ADC_BATCH int16 samples} for the ADCs this model drives. Causal."""
         ...
 
+    def ground_truth(self) -> dict:
+        """The model's exact state, as plain JSON-serialisable data.
+
+        This is a TEST OBSERVATION, not part of the ADC seam: the bench exposes it over
+        `drv.sim.model_state()` so a co-sim test can assert what the played signal did to the
+        qubit without re-measuring it through shot statistics
+        (specs/software-test-refactor/01 §4.3). It has no hardware counterpart —
+        `RemoteDriver` has no `.sim` — so nothing under `riscq/` outside `riscq/sim/` may call it.
+
+        Models with no quantum state return `{}`.
+        """
+        return {}
+
 
 class ZeroModel:
     """ADC silence — the default (DAC-only tests). Drives nothing; the bench holds every ADC at 0."""
@@ -46,6 +59,9 @@ class ZeroModel:
         return []
 
     def adc_batch(self, t, dac):
+        return {}
+
+    def ground_truth(self) -> dict:
         return {}
 
 
@@ -206,6 +222,12 @@ class TwoLevelModel:
 
     def sigma_z(self) -> float:
         return float(self._b[2])
+
+    def ground_truth(self) -> dict:
+        """`bloch` = (⟨σx⟩, ⟨σy⟩, ⟨σz⟩). The readout can only ever see ⟨σz⟩ (the tone amplitude
+        tracks it); the xy components — what a virtual-Z calibration actually moves — are visible
+        here and nowhere else."""
+        return {"bloch": [float(v) for v in self._b]}
 
     def state(self):
         """The current density matrix as a qutip Qobj: ρ = (I + b·σ)/2."""
@@ -405,6 +427,11 @@ class ThreeLevelModel:
     def populations(self) -> np.ndarray:
         return np.abs(self._psi) ** 2
 
+    def ground_truth(self) -> dict:
+        """`populations` = (P0, P1, P2). |2⟩ is invisible to the hardware `res` bit (one
+        threshold, two outcomes), so leakage assertions have to come from here."""
+        return {"populations": [float(p) for p in self.populations()]}
+
     def _demod(self, t: int, samples: np.ndarray, code: int) -> complex:
         """The gate DAC demodulated against `code` over this batch (mirrors TwoLevelModel._drive_axis):
         magnitude tells which carrier is on, arg is the drive axis. Phase reduced mod 2^16 as ints."""
@@ -581,6 +608,13 @@ class TwoQubitModel:
         p = self.populations()
         return p.sum(axis=1), p.sum(axis=0)            # (control, target) single-qubit populations
 
+    def ground_truth(self) -> dict:
+        """`populations` = the full 3×3 joint grid, `marginals` = (control, target). The joint
+        state is what a CZ acts on and what per-core readout can only see marginals of."""
+        ctrl, tgt = self.marginals()
+        return {"populations": self.populations().tolist(),
+                "marginals": [ctrl.tolist(), tgt.tolist()]}
+
     def _demod(self, t: int, samples: np.ndarray, code: int) -> complex:
         """The DAC demodulated against `code` over this batch (as ThreeLevelModel._demod): magnitude
         tells whether the carrier is on, arg is the drive axis. Phase reduced mod 2^16 as ints."""
@@ -751,6 +785,11 @@ class MultiModel:
                 out[aid] = lanes if aid not in out \
                     else _clip16(out[aid].astype(float) + lanes.astype(float))
         return out
+
+    def ground_truth(self) -> dict:
+        """`models` = each sub-model's ground truth, in the order they were built — i.e. the order
+        of the `models` list in the spec passed to `set_model`."""
+        return {"models": [md.ground_truth() for md in self._models]}
 
 
 def build_model(spec: dict, m) -> QuantumModel:

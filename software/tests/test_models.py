@@ -170,10 +170,59 @@ def test_twolevel_projective_binomial_statistics():
     assert abs(ones / n - p1) < 4 * sigma, f"p̂={ones / n:.4f} vs planted p1={p1}"
 
 
+def test_twolevel_projective_reprepares_from_either_pole():
+    """The premise of an on-core shot loop that carries NO reset between shots (test_projective.py):
+    the collapse leaves a PURE pole, and one X90 maps EITHER pole onto the equator, so every shot
+    re-prepares p1 = 1/2 on its own and the counts stay binomial without a relax head."""
+    c = 1000.0
+    rabi = (math.pi / 2) / (math.sqrt(2) * c)          # one all-`c` batch = a π/2 rotation
+    tl = models.TwoLevelModel(M, collapse=True, rabi_rad_per_amp=rabi, readout_amp=5000.0)
+    dac = {M.gate_dac(0): np.full(16, c, dtype=np.int64), M.ro_dac(0): np.zeros(16, dtype=np.int64)}
+    for i, bz in enumerate((1.0, -1.0)):               # the two poles a collapse can leave
+        tl._b[:] = (0.0, 0.0, bz)
+        tl.adc_batch(i, dac)
+        assert abs(tl._b[2]) < 1e-12, f"an X90 from bz={bz} left the equator at {tl._b[2]}"
+
+
 def test_twolevel_projective_extremes_deterministic():
     tl = models.TwoLevelModel(M, collapse=True, readout_amp=5000.0)
     assert all(_read_window(tl, 1.0, i) == 0 for i in range(20))       # |0> always reads 0
     assert all(_read_window(tl, -1.0, i) == 1 for i in range(20))      # |1> always reads 1
+
+
+def _shot_iq(tl, bz, i, nbatches=40):
+    """One projective shot's demodulated IQ: plant Bloch-z = bz, open a readout window (the readout
+    drive's rising edge samples and collapses), then integrate the emitted tone against the readout
+    code over the window — the IQ point the decoder reports for that shot."""
+    gate = np.zeros(16, dtype=np.int64)
+    ro_off, ro_on = np.zeros(16, dtype=np.int64), np.full(16, 8000, dtype=np.int64)
+    tl._b[:] = (0.0, 0.0, bz)
+    t0 = i * (nbatches + 1)
+    tl.adc_batch(t0, {M.gate_dac(0): gate, M.ro_dac(0): ro_off})       # ro idle → arm the edge
+    z = 0j
+    for n in range(nbatches):
+        t = t0 + 1 + n
+        lanes = tl.adc_batch(t, {M.gate_dac(0): gate, M.ro_dac(0): ro_on})[M.adc_of(0)]
+        k = np.arange(models.ADC_BATCH) + models.ADC_BATCH * t
+        z += np.sum(lanes * np.exp(-1j * math.pi * tl.readout_code * k / (1 << 15)))
+    return z
+
+
+def test_twolevel_projective_clusters_separate():
+    """The cluster statistics `ReadoutCalibration` gates on (host-pure half of the retired
+    test_cal.py::test_acquire_shots_chunks): repeated projective reads of a |0> prep and of a |1>
+    prep land as two IQ blobs whose qcal SNR — ‖Δmeans‖/(2σ₀ + 2σ₁) — exceeds 1, i.e. the means are
+    at least 4σ apart. The two states' tones are π out of phase, so the blobs are antipodal and the
+    classifier assigns every shot correctly at this readout_amp/noise_scale."""
+    from riscq.cal import Classifier
+    tl = models.TwoLevelModel(M, collapse=True, readout_amp=20000.0, noise_scale=400.0,
+                              noise_seed=2)
+    iq = [np.array([[z.real, z.imag] for z in (_shot_iq(tl, bz, 32 * s + i) for i in range(16))])
+          for s, bz in enumerate((1.0, -1.0))]
+    clf = Classifier(*iq)
+    assert clf.separation > 1.0, f"clusters not 4σ apart: qcal SNR {clf.separation:.2f}"
+    assert float(clf.m0 @ clf.m1) < -0.9 * np.hypot(*clf.m0) * np.hypot(*clf.m1)   # antipodal
+    assert np.array_equal(clf.confusion(), np.eye(2))
 
 
 # ── dispersive readout (chi != 0, spec 13 Q2) ──
@@ -395,6 +444,49 @@ def test_threelevel_readout_three_distinct_clusters():
     for a, b in ((0, 1), (1, 2), (0, 2)):
         sep = abs((angs[a] - angs[b] + math.pi) % (2 * math.pi) - math.pi)
         assert sep > math.radians(90), f"levels {a},{b} phases too close: {math.degrees(sep):.0f}°"
+
+
+def _shot_iq3(tl, level, i, nbatches=40):
+    """One projective 3-level shot's demodulated IQ: plant the qutrit in `level`, open a readout
+    window (the readout drive's rising edge samples and collapses), then integrate the emitted tone
+    against the readout code over the window — the IQ point the decoder reports for that shot. The
+    `_shot_iq` of the two-level model, lifted to the qutrit."""
+    gate = np.zeros(BATCH_SIZE, dtype=np.int64)
+    ro_off, ro_on = np.zeros(BATCH_SIZE, dtype=np.int64), np.full(BATCH_SIZE, 8000, dtype=np.int64)
+    tl._psi[:] = 0.0
+    tl._psi[level] = 1.0
+    t0 = i * (nbatches + 1)
+    tl.adc_batch(t0, {M.gate_dac(0): gate, M.ro_dac(0): ro_off})        # ro idle → arm the edge
+    z = 0j
+    for n in range(nbatches):
+        t = t0 + 1 + n
+        lanes = tl.adc_batch(t, {M.gate_dac(0): gate, M.ro_dac(0): ro_on})[M.adc_of(0)]
+        k = np.arange(ADC_BATCH) + ADC_BATCH * t
+        z += np.sum(lanes * np.exp(-1j * math.pi * tl.readout_code * k / (1 << 15)))
+    return z
+
+
+def test_threelevel_projective_clusters_classify():
+    """The 3-level cluster STATISTICS the EF calibrations rest on (the host-pure half of the migrated
+    test_twoqubit_cosim.py::test_three_level_clusters_separate): repeated projective reads of |0>,
+    |1> and |2> land as three noisy IQ blobs whose minimum pairwise qcal SNR exceeds 1, so a
+    `ClassifierN` assigns each level to itself over 90 % of the time.
+
+    That the three frames survive the real demod/decoder is the RTL half and stays in co-sim, at one
+    noiseless shot per level. This half is a property of the model, so it is measured where shots are
+    free: 96 per level instead of 48, at the same readout_amp / noise_scale, with a fixed seed."""
+    from riscq.cal import ClassifierN
+    tl = models.ThreeLevelModel(M, core=0, collapse=True, readout_code=2048, readout_amp=18000.0,
+                                noise_scale=400.0, noise_seed=7)
+    shots = 96
+    clouds = [np.array([[z.real, z.imag]
+                        for z in (_shot_iq3(tl, L, 256 * L + i) for i in range(shots))])
+              for L in range(3)]
+    clf = ClassifierN(clouds)
+    conf = clf.confusion()
+    assert clf.separation > 1.0, f"3-level clusters not separated (min pairwise SNR {clf.separation:.2f})"
+    assert np.all(np.diag(conf) > 0.9), f"3-level confusion diagonal weak: {np.diag(conf)}"
+    assert np.allclose(conf.sum(1), 1.0)
 
 
 def test_threelevel_multimodel_and_dac_ids():

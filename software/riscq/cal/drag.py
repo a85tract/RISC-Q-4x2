@@ -120,7 +120,10 @@ class Leakage:
         for q in self.qubits:
             table, pg, _ = prep(cfg, q, m, "X90")
             pulse = gate_pulse(cfg, q, m)
-            ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+            # classified host-side by ClassifierN — capture in the classifier's zero frame (spec 14
+            # finding 7): the training clusters are taken at phase=0, so a config-frame capture would
+            # arrive rotated by the stored demod phase relative to the classifier's means
+            ro, demod, code, dur, ddly = readout_tables(cfg, q, m, phase=0.0)
             step = train_step(pulse.dur_batches(m, GATE_CH))
             seq = (self.n_gates - 1) * step + pulse.dur_batches(m, GATE_CH)
             period = grid_period(relax_batches(cfg, m), seq, dur, ddly)

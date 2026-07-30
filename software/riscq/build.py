@@ -46,17 +46,23 @@ class Program:
     - `tables`: live ParamTable symbol -> [(phase, amp, env, dur), ...] per-slot design-time
       codes riscq.run.load_tables fills the .data `struct rq_slot[]` with (spec 02 §3.2).
     - `c_source`: the generated C (kernels only; readable, spec principle 7).
+    - `bindings`: the compile-time bound int parameters (`npts`, `shots`, `period`, `mode`, the
+      sweep descriptors, ...) — the constants that were folded into the C. Carried so a reader
+      can recover what specialization this is without re-deriving it; the host-pure test
+      responder reads the sweep off here rather than closing over it
+      (specs/software-test-refactor/01 §2.2).
 
     Hand-written C uses `Program.from_image(img)` — everything empty, same runner."""
 
     def __init__(self, image: Image, params=None, arrays=None, envelopes=None, tables=None,
-                 c_source: str | None = None):
+                 c_source: str | None = None, bindings=None):
         self.image = image
         self.params: dict[str, int | None] = dict(params or {})
         self.arrays: dict[str, int] = dict(arrays or {})
         self.envelopes: dict = dict(envelopes or {})
         self.tables: dict = dict(tables or {})
         self.c_source = c_source
+        self.bindings: dict[str, int] = dict(bindings or {})
 
     @classmethod
     def from_image(cls, image: Image) -> "Program":

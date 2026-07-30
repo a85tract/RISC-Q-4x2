@@ -591,18 +591,22 @@ def k_phase(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npt
 # the GE pulse. Both are RAW-only: |1> vs |2> discrimination is host-side (the 3-level ClassifierN reads
 # P(|2>) off the clusters), the hardware res sign cannot separate them. `ge_freq`/`ef_freq` are SEATED
 # carrier words (units.freq_to_code); the GE prep is a two-X90 pi carrying its frame bracket (vz0/vzsum,
-# the module docstring), the EF drive plays in a fresh 0 frame (no EF virtual-Z cal in this scope).
+# the module docstring), and the EF gate carries its OWN bracket (evz0/evzsum, base.ef_vz) on the EF
+# frame the retune starts at 0 — qcal's EF X90 is the same virtualz . FAST_DRAG . virtualz triplet, and
+# EFPhase calibrates that pair into qubit/{q}/EF/x90/vz (spec 14 §3 finding 6). The EF X carries no pair.
 
 
 @kernel
 def k_ef_rabi(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts: int, shots: int,
               period: int, ngates: int, step: int, code: int, ddly: int, ge_freq: int, ef_freq: int,
-              vz0: int, vzsum: int, a0q: int, daq: int):
+              vz0: int, vzsum: int, evz0: int, evzsum: int, a0q: int, daq: int):
     """Batched EF Rabi: prep |1> (GE pi), retune to f_ef, then sweep the EF X90 amplitude on-core (Q16
     pair a0q/daq; realized code = aq >> 16 written raw, spec 12), `shots` shots/point on a fixed grid.
     RAW mode: per-shot IQ through a cursor (out sized 2·npts·shots) — the host reads P(|2>), which peaks
-    at an EF pi (|1>->|2>). The n-gate train walks the paced `step` grid (module docstring, spec 14 F1),
-    all in one 0 frame so the gates add coherently (qcal's repetition amplifies an EF-amplitude error)."""
+    at an EF pi (|1>->|2>). The n-gate train walks the paced `step` grid (module docstring, spec 14 F1)
+    on ONE EF frame started at 0, every gate carrying the EF bracket (evz0/evzsum, base.ef_vz) exactly
+    as the GE k_rabi train carries its own — that is the pair EFPhase calibrates, and qcal's EF gate
+    plays it at every repetition, so the ladder amplifies the same circuit it does (finding 6)."""
     init_pulse_params(demod.pulses)  # noqa: F821
     set_freq(demod, code)  # noqa: F821
     init_pulse_params(ro.pulses)  # noqa: F821
@@ -626,7 +630,8 @@ def k_ef_rabi(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, n
             fire(gate, gate["x90"])  # noqa: F821  B0: startTime auto-advances by dur
             set_start(gate, t_ef)  # noqa: F821     pin the EF retune to the EF-drive start
             set_freq(gate, ef_freq)  # noqa: F821
-            set_phase_offset(gate, 0)  # noqa: F821  fresh 0 frame for the EF train
+            f = evz0                 # the EF frame is rebuilt every shot: frame(0) + evz0
+            set_phase_offset(gate, f)  # noqa: F821
             fire(gate, gate["ef"])  # noqa: F821     EF X90 #1 at t_ef (startTime already set)
             t = t_ef
             tp = t_ef - TRAIN_AHEAD * step
@@ -634,6 +639,8 @@ def k_ef_rabi(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, n
                 tp = tp + step
                 wait_until(tp)  # noqa: F821  gate g−TRAIN_AHEAD has started (and popped)
                 t = t + step
+                f = f + evzsum       # frame += evz0 + evz1, then the next play's + evz0
+                set_phase_offset(gate, f)  # noqa: F821
                 play(gate, gate["ef"], t)  # noqa: F821  the paced EF train
             play(ro, ro["meas"], t_ro)  # noqa: F821     readout drive (window trigger)
             play(demod, demod["sq"], t_ro + ddly)  # noqa: F821  demod opens `ddly` after the drive
@@ -649,14 +656,18 @@ def k_ef_rabi(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, n
 @kernel
 def k_ef_ramsey(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts: int,
                 shots: int, period: int, code: int, ddly: int, ge_freq: int, ef_freq: int, vz0: int,
-                vzsum: int, w0: int, dw: int, p0: int, dp: int):
+                vzsum: int, evz0: int, evzsum: int, w0: int, dw: int, p0: int, dp: int):
     """Batched EF Ramsey (covers EF Frequency): prep |1> (GE pi), retune to f_ef, then EF X90 — wait w —
     virtual-Z(phi) — EF X90, `shots` shots/point on a fixed grid. Same wait/virtual-Z structure as
     k_ramsey: the wait (w0/dw, batches) is computed on-core; the detuning is the host-seated phase pair
     (p0/dp) accumulated in the seated domain (spec 12) — phi at wait w_i is 16·detune·w_i, so the fringe
     runs at |delta + applied| off the model's EF reference, exactly the GE V-fit. RAW mode: the host
-    reads P(|2>) off the 3-level clusters. The two EF X90s play in a fresh 0 frame, the swept phi as the
-    Rz between them (the EF X90's own frame bracket is out of scope here — no EF Phase cal)."""
+    reads P(|2>) off the 3-level clusters.
+
+    The EF frame starts at 0 and the swept phi is an Rz BETWEEN the two EF X90s, so — exactly as in the
+    GE k_ramsey — it COMPOSES with each gate's own EF bracket rather than replacing it: the 1st EF X90
+    fires at frame(0) + evz0, the frame then advances by evzsum (the gate's pair) and by phi (the
+    sweep), so the 2nd fires at evzsum + phi + evz0 (spec 14 §3 finding 6)."""
     init_pulse_params(demod.pulses)  # noqa: F821
     set_freq(demod, code)  # noqa: F821
     init_pulse_params(ro.pulses)  # noqa: F821
@@ -681,9 +692,10 @@ def k_ef_ramsey(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array,
             fire(gate, gate["x90"])  # noqa: F821
             set_start(gate, t_ef1)  # noqa: F821     pin the EF retune to the EF-drive start
             set_freq(gate, ef_freq)  # noqa: F821
-            set_phase_offset(gate, 0)  # noqa: F821  1st EF X90: fresh 0 frame
+            set_phase_offset(gate, evz0)  # noqa: F821  1st EF X90: frame(0) + evz0
             play(gate, gate["ef"], t_ef1)  # noqa: F821
-            set_phase_offset(gate, phi)  # noqa: F821  2nd EF X90: the swept virtual-Z detuning phi
+            set_phase_offset(gate, phi + evz0 + evzsum)  # noqa: F821  2nd EF X90: (frame evzsum + the
+            #                                        swept virtual-Z detuning phi) + evz0
             play(gate, gate["ef"], t_ef2)  # noqa: F821
             play(ro, ro["meas"], t_ro)  # noqa: F821
             play(demod, demod["sq"], t_ro + ddly)  # noqa: F821  demod opens `ddly` after the drive
@@ -700,7 +712,7 @@ def k_ef_ramsey(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array,
 @kernel
 def k_ef_phase(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts: int,
                shots: int, period: int, code: int, ddly: int, ge_freq: int, ef_freq: int, vz0: int,
-               vzsum: int, seq: int, hpi: int, p0: int, dp: int):
+               vzsum: int, evz0: int, evzsum: int, seq: int, hpi: int, p0: int, dp: int):
     """Batched EF gate PHASE calibration — qcal's `Phase(subspace='EF')` (spec 04 §2 / X4, spec 14
     §3.3): prep |1> (GE π, the k_ef_* retune mechanism), retune to f_ef, then one of qcal's circuits
     ON THE EF GATE (its EF variants only prepend that GE π) — the compile-time `seq` binding folds to
@@ -708,14 +720,17 @@ def k_ef_phase(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, 
       Y180_X90 / X180_Y90:  the three-EF-X90 sequences of the GE k_phase, `hpi` the seated π/2 Rz,
                             and the swept phi IS the EF X90's virtual-Z pair (vz0 = vz1 = phi —
                             exactly the GE k_phase contract: the sweep REPLACES the stored pair,
-                            which the class's relative_phase knob centres the sweep on instead);
+                            which the class's relative_phase knob centres the sweep on instead, so
+                            evz0/evzsum are NOT played here and the callers bind them 0);
       X90_X_X90:            qcal's gate='X' circuit, EF-X90 · EF-X · EF-X90 (slot "efx"), where the
-                            swept phi tilts only the EF X's own AXIS. The two EF X90s play in a
-                            fresh 0 frame, so they sit on their own stored axis and phi is measured
-                            RELATIVE to it; the composite is a 2π rotation inside {|1>, |2>} that
-                            returns to |1> only on alignment, so P(|2>) is MINIMAL there.
+                            swept phi tilts only the EF X's own AXIS. Here the two EF X90s DO carry
+                            their calibrated bracket (evz0/evzsum, base.ef_vz — spec 14 §3 finding 6), the
+                            EF X its own [0, 0] pair, and phi is measured relative to the X90s'
+                            axis; the composite is a 2π rotation inside {|1>, |2>} that returns to
+                            |1> only on alignment, so P(|2>) is MINIMAL there.
 
-    The EF segment starts from a fresh 0 frame; the GE prep carries the GE bracket (vz0/vzsum). RAW
+    The EF segment starts from a 0 frame that each branch then brackets as above; the GE prep carries
+    the GE bracket (vz0/vzsum). RAW
     mode: per-shot IQ through a cursor (out sized 2·npts·shots) — the host reads P(|2>) off the
     3-level clusters. The retune's deterministic frame slip offsets EVERY EF pulse's axis equally,
     which conjugates out of a z-basis population (Rz(δ)·U·Rz(−δ) on an Rz eigenstate), so it moves
@@ -749,12 +764,12 @@ def k_ef_phase(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, 
             set_start(gate, t_ef)  # noqa: F821     pin the EF retune to the train start
             set_freq(gate, ef_freq)  # noqa: F821
             if seq == X90_X_X90:                  # gate='X': the swept phi is the EF X's OWN axis
-                set_phase_offset(gate, 0)  # noqa: F821  fresh 0 frame: EF X90 #1 on its stored axis
+                set_phase_offset(gate, evz0)  # noqa: F821  EF X90 #1: frame(0) + evz0
                 fire(gate, gate["ef"])  # noqa: F821     at t_ef (startTime already set)
-                set_phase_offset(gate, phi)  # noqa: F821  the EF X, tilted by the swept axis
-                fire(gate, gate["efx"])  # noqa: F821    (B0 startTime auto-advance)
+                set_phase_offset(gate, evzsum + phi)  # noqa: F821  the EF X, tilted by the swept axis
+                fire(gate, gate["efx"])  # noqa: F821    (B0 startTime auto-advance; the X has no pair)
                 wait_until(t_ge + 2 * ge)  # noqa: F821  pace the depth-4 queues (below)
-                set_phase_offset(gate, 0)  # noqa: F821  EF X90 #2, back on the X90s' own axis
+                set_phase_offset(gate, evzsum + evz0)  # noqa: F821  EF X90 #2, back on the X90s' axis
                 fire(gate, gate["ef"])  # noqa: F821
             else:
                 if seq == Y180_X90:

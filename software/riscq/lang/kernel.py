@@ -138,7 +138,7 @@ def compile_kernel(k: Kernel, soc_map: SocMap, tables: dict[str, ParamTable] | N
     envelopes = {ch: alloc.image() for ch, alloc in fe.allocs.items() if alloc.image()}
     prog_tables = {t.name: list(t.slot_codes) for t in kir.tables}
     return build.Program(image, params=params, arrays=dict(kir.arrays), envelopes=envelopes,
-                         tables=prog_tables, c_source=c_source)
+                         tables=prog_tables, c_source=c_source, bindings=dict(fe.bound))
 
 
 def _wrap32(v: int) -> int:

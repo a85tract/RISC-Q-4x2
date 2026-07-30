@@ -85,9 +85,14 @@ def test_rerun_op_budget(cosim):
     assert cd.ops <= 12, f"rerun cost {cd.ops} seam ops (expected ~10)"
 
 
+@pytest.mark.batch_cap(22_000)
 def test_rerun_op_budget_size_independent(cosim):
     """THE invariant: a `rerun`'s op count does not scale with the batch size — block writes/reads
-    move O(n) bytes in O(1) seam ops. Same loaded image, a small then a large batch, equal counts."""
+    move O(n) bytes in O(1) seam ops. Same loaded image, a small then a large batch, equal counts.
+
+    FLOOR: ~20 k = one `setup` of the 64-word image plus two `rerun`s that each move a 64-word input
+    block in and a 64-word output block out (a co-sim AXI word is ~22 dspClk cycles, so the blocks
+    ARE the cost). Running two batch sizes is the whole claim, and the large one has to be large."""
     drv, m = cosim
     N = 64
     prog = compile_kernel(k_echo, m, xs=Array(N, input=True), out=Array(N))

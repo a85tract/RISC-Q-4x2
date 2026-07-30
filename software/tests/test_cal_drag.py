@@ -197,3 +197,29 @@ def test_leakage_picks_the_minimum_of_a_planted_p2(monkeypatch):
     rmax = Leakage(cfg, 0, _clf(), "qubit/{q}/x90/vz", [[p, p] for p in phases], n_gates=8, shots=8,
                    maximize=True).run(_StubDrv())
     assert rmax.proposal == {"qubit/0/x90/vz": [-0.2, -0.2]}
+
+
+def test_leakage_captures_in_the_classifiers_zero_demod_frame(monkeypatch):
+    """(spec 14 finding 7) `Leakage` reads P(|2>) through a pre-trained `ClassifierN`, whose training
+    captures are deliberately zero-frame (`_rawiq_prog`/`_ef_prep_prog` bake `phase=0.0`). A
+    config-frame capture would arrive rotated by the stored demod phase relative to the classifier's
+    means — 0 on the co-sim configs, −109.9°…+39.0° on X6Y3 — so the train must capture at phase 0
+    too. (The res-bit cals are the deliberate opposite: there the stored phase IS the discriminator.)"""
+    from riscq import run as rqrun
+    from riscq.cal import base as cal_base
+    from riscq.cal import drag as cal_drag
+    from riscq.cal.drag import Leakage
+    cfg = _leakage_cfg()
+    cfg["readout/0/demod/phase"] = -1.918                # the config frame the res bit would use
+    seen = []
+    real = cal_base.readout_tables
+
+    def recorder(cfg_, q, m_, phase=None, win=None):
+        seen.append(phase)
+        return real(cfg_, q, m_, phase=phase, win=win)
+
+    monkeypatch.setattr(cal_drag, "readout_tables", recorder)
+    monkeypatch.setattr(rqrun, "run", lambda *a, **k: {0: {"out": _levels_iq(0.1, 8)}})
+    Leakage(cfg, 0, _clf(), "qubit/{q}/x90/vz", [[0.0, 0.0], [0.1, 0.1]], n_gates=4, shots=8) \
+        .run(_StubDrv())
+    assert seen == [0.0, 0.0]                            # one compile per swept point

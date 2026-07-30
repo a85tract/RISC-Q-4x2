@@ -66,6 +66,18 @@ class _SimExtras:
         Needed because the co-sim fixture is session-scoped (one sim process for the whole run)."""
         self._proxy.set_model(dict(spec))
 
+    def model_state(self) -> dict:
+        """The active QuantumModel's exact state (specs/software-test-refactor/01 §4.3) — e.g.
+        `{"bloch": [x, y, z]}` for a two-level model, `{"populations": [...]}` for three-level,
+        `{"populations": ..., "marginals": ...}` for two-qubit, `{"models": [...]}` for a
+        MultiModel. `{}` for models that carry no quantum state.
+
+        A TEST OBSERVATION, deliberately confined to the co-sim seam: it lets a test assert what a
+        played signal did to the qubit without re-measuring it through shots, which is what makes
+        the physics gates cheap. There is no hardware counterpart, so nothing under `riscq/`
+        outside `riscq/sim/` may call it."""
+        return dict(self._proxy.model_state())
+
     def shutdown(self) -> None:
         self._proxy.shutdown()
 

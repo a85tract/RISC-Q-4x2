@@ -1,12 +1,22 @@
-"""M4b acceptance: the calibration suite against TwoLevelModel ground truth (spec 07 M4 / spec 08 B5).
+"""The calibration suite's RTL half: what the SoC EMITS and what that does to the qubit.
 
 Every calibration batches its whole sweep into ONE run (spec 08): the host preloads the swept knobs
 as point columns, the kernel walks them on a fixed grid whose idle head is the T1 relax reset, and
-the host fits the self-normalised counts population P = counts/shots (no |0> reference / projection —
-counts are self-normalised) against the PROJECTIVE TwoLevelModel (collapse=True), recovering the
-planted Rabi rate (<1%), detuning, and T1/T2. Readout cals keep host-side analysis on raw IQ clusters.
-The Calibration_X6Y3 sequence runs top-to-bottom and moves a deliberately-detuned Config toward the
-model's ground truth.
+the host fits the self-normalised counts population against the model. Only two of the steps in
+that loop need a simulator, and after the T4 migration
+(specs/software-test-refactor/02 §3.2) those two are all that is left here:
+
+- **L1** (01 §3) — the emitted stimulus, model OFF: the readout timing knobs and the heralded
+  two-window grid, asserted on the converters, plus the batched cal's O(1) seam-op cost.
+- **L2** (01 §4) — what that stimulus does to the qubit, read off `drv.sim.model_state()` through
+  `tests.probe.Probe`: one shot per point, an ANALYTIC target, no fit and no shot statistics.
+
+Everything else — the fits, the proposals, the (count, kept) decode, the readout cluster/confusion
+/window cals, the coarse→fine amplitude arithmetic, the demod-frame fixed point — is host-pure in
+`tests/test_cal_host.py` against the analytic responder. The two `--slow` anchors
+(`test_amplitude_recovers_rabi`, `test_x6y3_improves_detuned_config`) put the whole loop back
+together with real shots and real noise, and are what notice if an L0 responder or an L2 analytic
+target ever drifts from the hardware.
 """
 
 import math
@@ -15,16 +25,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from riscq.cal import (Amplitude, Classifier, Config, Fidelity, Frequency, Phase,
-                       Punchout, ReadoutCalibration, ReadoutFidelity, Separation, T1, T2, Window,
+from riscq.cal import (Amplitude, Classifier, Config, Frequency, ReadoutCalibration,
                        calibration_x6y3)
-from riscq.cal import fits
+from riscq.cal import fits, kernels
 from riscq.cal.base import batch_timeout
 from riscq.cal.readout import _ro_amp_prog
 from riscq import run as rq
-from riscq.cal.base import batches, gate_sigma, socmap, x90_vz, GATE_ENV
-from riscq.map import SocMap, SocParams, pack16
-from riscq.pulses import Pulse, units
+from riscq.cal.base import (GATE_CH, GATE_ENV, SEP, X90, batches, demod_table, ef_vz, gate_pulse,
+                            gate_sigma, grid_period, herald_offset, prep, readout_tables,
+                            relax_batches, socmap, train_step, x90_vz)
+from riscq.lang import Array, ParamTable, compile_kernel, kernel
+from riscq.map import LEAD, READOUT_LEAD, SocMap, SocParams, pack16
+from riscq.pulses import Pulse, envelopes, units
+from tests.probe import Probe, rabi_for
 
 F_GE = 50e6                              # planted qubit frequency (freq_code 2048)
 RELAX = 1600                             # co-sim relax head (batches) — the Config carries it in SECONDS
@@ -76,6 +89,19 @@ def test_x90_frame_bracket_words():
     cfg["qubit/0/x90/vz"] = [0.0429, 0.0080]                       # X6Y3 q6 (asymmetric)
     c0, c1 = units._phase_code(0.0429), units._phase_code(0.0080)
     assert x90_vz(cfg, 0) == {"vz0": pack16(c0), "vzsum": pack16(c0 + c1)}
+
+
+def test_ef_frame_bracket_words():
+    """spec 14 finding 6 — the EF twin of the bracket above, bound under NON-COLLIDING names so an EF
+    kernel carries both (the GE prep's vz0/vzsum and the EF gate's evz0/evzsum). The pair lives at
+    `qubit/{q}/EF/{name}/vz` and EFPhase calibrates it; the EF X is a bare FAST_DRAG with no pair, so
+    `name='x'` folds to a no-op — as does every co-sim config."""
+    cfg = Config()
+    assert ef_vz(cfg, 0) == {"evz0": 0, "evzsum": 0}
+    cfg["qubit/0/EF/x90/vz"] = [-0.16289759, -0.16289759]           # X6Y3 q2 (the config of record)
+    c = units._phase_code(-0.16289759)
+    assert ef_vz(cfg, 0) == {"evz0": pack16(c), "evzsum": pack16(2 * c)}
+    assert ef_vz(cfg, 0, "x") == {"evz0": 0, "evzsum": 0}           # the EF X carries no pair
 
 
 def test_amplitude_n1_rejects_a_fit_outside_the_swept_span():
@@ -187,27 +213,6 @@ def _model(rabi, f_ge=F_GE, t1=300, t2=450, noise=0.0, seed=0, collapse=False, *
                 collapse=bool(collapse), **{"readout_amp": 20000.0, **kw})
 
 
-def _dispersive(m, chi_code=60, kappa_code=170):
-    """A dispersive readout planted on the config's readout frequency (spec 13 Q2): the resonator sits
-    at f_r = readout/0/freq with linewidth κ, pulled to f_r ± χ by |0>/|1>. With 2χ/κ ≈ 0.7 the |0>
-    magnitude peaks at f_r + χ while the two-state SEPARATION peaks at f_r — two DIFFERENT frequencies,
-    which is what makes Separation's acceptance gate non-vacuous."""
-    return dict(f_r=_readout_freq(m), chi=units.code_to_freq(chi_code, m.params),
-                kappa=units.code_to_freq(kappa_code, m.params))
-
-
-def _calibrate(drv, m, cfg, spec, shots=16):
-    """Bake the demod discrimination phase into `cfg` (what every counts-mode readout needs), measured
-    by ReadoutCalibration on a LOW-NOISE copy of `spec` — the phase is a property of the readout chain,
-    not of its noise — then restore `spec`. Returns the (clean) trained classifier."""
-    drv.sim.set_model({**spec, "noise_scale": 200.0})
-    r = ReadoutCalibration(cfg, 0, shots=shots).run(drv)
-    assert r.ok, f"ReadoutCalibration could not separate clusters (sep={r.data[0]['separation']:.2f})"
-    cfg["readout/0/demod/phase"] = float(r.proposal["readout/0/demod/phase"])
-    drv.sim.set_model(spec)
-    return r.fit[0]
-
-
 def _rabi_pi(m):
     """The Rabi rate that makes a π rotation out of the default |1> prep — X90·X90 at x90_amp=0.495
     (spec 13 §4), i.e. the same drive integral as one GATE_ENV pulse at amp 0.99."""
@@ -247,6 +252,7 @@ def _zero_after(request):
 # ── Amplitude: recover the planted Rabi rate within 1% ──
 
 @pytest.mark.cosim
+@pytest.mark.slow
 def test_amplitude_recovers_rabi(cosim, demod_phase):
     drv, m = cosim
     rabi = float(4 * math.pi / _sig_max(m, F_GE))          # ~2 Rabi periods (counts sub-1% budget)
@@ -271,12 +277,23 @@ def test_amplitude_recovers_rabi(cosim, demod_phase):
 
 
 @pytest.mark.cosim
+@pytest.mark.slow
 def test_amplitude_fine_pass_improves_the_coarse(cosim, demod_phase):
     """spec 13 Q4 — the notebook's two-step amplitude cal, on qcal's knobs: a coarse n_gates=1 cosine
     sweep, then a FINE pass that repeats the gate 4× (qcal's multiple-of-4 guard: 4 · X90 = 2π, back
     to |0>) over `relative_amp` 0.7–1.3× whatever the coarse step just wrote. Four gates amplify an
     amplitude error 4×, so the parabola's minimum pins it far more sharply than the cosine did — the
-    fine pass must beat the coarse one against the model's true π/2 amplitude."""
+    fine pass must beat the coarse one against the model's true π/2 amplitude.
+
+    An ANCHOR (specs/software-test-refactor/02 §4.1), and the clearest case for why the tier exists:
+    `err_fine < err_coarse` is a VARIANCE claim — four gates buy a 4× finer amplitude resolution
+    *for the same population error*, which means nothing without a population error to reduce. T4a
+    measured the two fits against the noiseless L0 responder at these knobs and got 0.018 % and
+    0.017 %: float residue, not a property. Its deterministic half did move to L0
+    (test_cal_host::test_amplitude_fine_pass_refines_the_coarse — the relative_amp span, the upward
+    parabola, the vertex on the true π/2 amp); the amplification itself has no owner in the fast
+    tiers, so it comes back here with the real shot noise that makes it a statement. Original knobs
+    and tolerances, deliberately: an anchor that has been made cheap is no longer an anchor."""
     drv, m = cosim
     rabi = float(4 * math.pi / _sig_max(m, F_GE))
     drv.sim.set_model(_model(rabi, t1=200, t2=2000, noise=300.0, seed=17, collapse=True))
@@ -300,474 +317,370 @@ def test_amplitude_fine_pass_improves_the_coarse(cosim, demod_phase):
     assert err_fine < err_coarse, f"the fine pass did not improve: {err_coarse:.5f} → {err_fine:.5f}"
 
 
-# ── Frequency: qcal's V-fit recovers a planted detuning of EITHER sign (the sign lock-step) ──
+# ── L2 state probes: what the emitted circuit does to the QUBIT (01 §4) ──
+#
+# The RTL plays the real circuit; the answer is then READ off the model (`Probe.state()` →
+# `drv.sim.model_state()`) instead of being re-measured with shot statistics. The rate that makes a
+# pulse an exact rotation is PLANTED with `probe.rabi_for`, so every gate below is correct by
+# construction and its expected state is the textbook one — never another run of the same model
+# (01 §4.4). One shot per point, one `rq.setup` per test, and `set_model` re-prepares |0> for free.
+#
+# None of these kernels carries a readout: the state comes off the model, so all a kernel has to
+# guarantee is that its pulses have LEFT THE DAC before it reports done.
 
-@pytest.mark.cosim
-@pytest.mark.parametrize("d0_code", [60, -60])
-def test_frequency_recovers_detuning(cosim, demod_phase, d0_code):
-    """spec 13 Q4 — the update sign, PINNED. The fringe frequency is |δ + applied|, so its magnitude
-    alone cannot tell a carrier that is too high from one that is too low: only the position of the
-    V's vertex can (b = −δ), and only if the whole chain — the on-core virtual-Z ramp's sign, the
-    model's axis ramp, and the proposal's arithmetic — agrees. Get any of them backwards and the
-    "correction" DOUBLES the error for one of the two signs while looking perfect for the other. So
-    plant the detuning BOTH ways and require the config to move toward f_ge each time.
-
-    (The V-fit itself is the other half of Q4: the old signed line needed |applied| > |δ| at every
-    detuning to keep sign(δ + applied) = sign(applied). qcal's a·|x − b| + c does not.)
-
-    Sized for the co-sim clock: 12 waits × 96 shots × 4 detunings, on a 4·T1 relax head (t1 = 200, so
-    ~2 % of the shots start with a residual excitation — an offset the cosine fit absorbs) instead of
-    the 8·T1 the other cals use, which is what buys the second sign its runtime."""
-    drv, m = cosim
-    rabi = float((math.pi / 2) / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5),
-                                            F_GE, units._amp_code(0.5)))
-    drive = units.code_to_freq(units._freq_code(F_GE, m.params) + d0_code, m.params)   # f_ge + δ0
-    drv.sim.set_model(_model(rabi, t1=200, t2=3000, noise=300.0, seed=3, collapse=True))
-    cfg = _cfg(m, drive, x90_amp=0.5, relax=800)
-    cfg["readout/0/demod/phase"] = demod_phase
-    freq = Frequency(cfg, 0, detune=units.code_to_freq(200, m.params), n_detune=4,
-                     t0=_s(8, m), dt=_s(4, m), points=12, shots=96)
-    r = freq.run(drv)
-    print(f"\n[frequency δ={d0_code:+d}] applied={r.data[0]['applied']} "
-          f"|fringe|={np.round(r.data[0]['obs'])}\n"
-          f"  V-fit a={r.fit[0].params['a']:.3f} b={r.fit[0].value:+.1f} (want {-d0_code:+d}) → "
-          f"recovered δ={freq.recovered_detuning_code[0]:+.1f} (planted {d0_code:+d})")
-    assert r.ok
-    assert r.fit[0].params["a"] > 0, "the V must open upward (qcal's negative-curvature guard)"
-    assert abs(freq.recovered_detuning_code[0] - d0_code) < 25, "detuning code not recovered"
-    r.apply()
-    err_before = abs(drive - F_GE)
-    err_after = abs(cfg["qubit/0/freq"] - F_GE)
-    print(f"[frequency δ={d0_code:+d}] |freq−f_ge| before={err_before:.3g} after={err_after:.3g}")
-    assert err_after < 0.3 * err_before, "config frequency did not move toward f_ge"
+# 01 §4.6: no noise, no collapse, no t1/t2 — decay is not the subject of any probe here. The
+# readout knobs are left at their defaults: nothing below fires the demod.
+L2_MODEL = dict(kind="twolevel", core=0, f_ge=F_GE, noise_scale=0.0, collapse=False)
 
 
-# ── T1 / T2: recover planted decay constants ──
-
-@pytest.mark.cosim
-def test_t1_recovers_decay(cosim, demod_phase):
-    drv, m = cosim
-    t1 = 120                                                      # batches (the model's own unit)
-    drv.sim.set_model(_model(_rabi_pi(m), t1=t1, t2=2000, noise=300.0, seed=4, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.495)                            # X90·X90 prep = π (spec 13 §4)
-    cfg["readout/0/demod/phase"] = demod_phase
-    r = T1(cfg, 0, points=9).run(drv)
-    print(f"\n[t1] fit ok={r.fit[0].ok} tau={r.fit[0].value} amp={r.fit[0].params.get('amp')} "
-          f"delays={r.data[0]['x'].tolist()} P={np.round(r.data[0]['y'],3).tolist()}")
-    assert r.ok
-    t1_s = _s(t1, m)                                              # the proposal is in SECONDS
-    assert 0.8 * t1_s < r.proposal["qubit/0/T1"] < 1.2 * t1_s
+@kernel
+def k_probe_x90(gate: ParamTable, out: Array):
+    """One X90 from |0>."""
+    init_pulse_params(gate.pulses)  # noqa: F821
+    set_freq(gate, gate.freq)  # noqa: F821
+    t = now() + LEAD  # noqa: F821
+    play(gate, gate["x90"], t)  # noqa: F821
+    wait_until(t + gate["x90"].dur + SEP)  # noqa: F821   the pulse has left the DAC
+    out[0] = 0
 
 
-@pytest.mark.cosim
-def test_t2_recovers_decay(cosim, demod_phase):
-    drv, m = cosim
-    t2 = 200
-    rabi = float((math.pi / 2) / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5),
-                                            F_GE, units._amp_code(0.5)))
-    drv.sim.set_model(_model(rabi, t1=400, t2=t2, noise=300.0, seed=5, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.5)
-    cfg["readout/0/demod/phase"] = demod_phase
-    r = T2(cfg, 0, detune=units.code_to_freq(70, m.params), points=15,
-           t0=_s(8, m), dt=_s(16, m)).run(drv)                    # dt=16 batches → covers > t2
-    print(f"\n[t2] fit ok={r.fit[0].ok} freq={r.fit[0].value} tau={r.fit[0].params.get('tau')} "
-          f"waits={r.data[0]['x'].tolist()} P={np.round(r.data[0]['y'],3).tolist()}")
-    assert r.ok
-    t2_s = _s(t2, m)                                              # the proposal is in SECONDS
-    assert 0.8 * t2_s < r.proposal["qubit/0/T2"] < 1.25 * t2_s
+@kernel
+def k_probe_x90_x_x90(gate: ParamTable, out: Array):
+    """qcal's Phase(gate='X') circuit — X90 · X · X90, contiguous (k_phase's X90_X_X90 branch,
+    without the swept frame: the axes here are the pulses' own, from the Config)."""
+    init_pulse_params(gate.pulses)  # noqa: F821
+    set_freq(gate, gate.freq)  # noqa: F821
+    d = gate["x90"].dur  # noqa: F821
+    xd = gate["x"].dur  # noqa: F821
+    t = now() + LEAD  # noqa: F821
+    play(gate, gate["x90"], t)  # noqa: F821
+    play(gate, gate["x"], t + d)  # noqa: F821
+    play(gate, gate["x90"], t + d + xd)  # noqa: F821
+    wait_until(t + 2 * d + xd + SEP)  # noqa: F821
+    out[0] = 0
 
 
-# ── Phase: qcal's line crossing recovers a PLANTED ac-Stark phase (spec 13 Q3) ──
+@kernel
+def k_probe_prep(gate: ParamTable, out: Array, pg: int):
+    """qcal's two |1> preps (base.prep): X90 · X90 — one play + one bare fire, B0's startTime
+    auto-advance making the train contiguous — or the Config's OWN X pulse.
 
-def _stark_vz(eps):
-    """The virtual-Z the calibration must recover for a planted per-X90 Stark rotation `eps`.
+    `pg` is a RUNTIME scalar here so one resident image serves both preps; the production kernels
+    fold it at compile time, which is a compiler property and is gated host-pure."""
+    init_pulse_params(gate.pulses)  # noqa: F821
+    set_freq(gate, gate.freq)  # noqa: F821
+    t = now() + LEAD  # noqa: F821
+    if pg == X90:
+        play(gate, gate["x90"], t)  # noqa: F821
+        fire(gate, gate["x90"])  # noqa: F821
+    else:
+        play(gate, gate["x"], t)  # noqa: F821
+    wait_until(t + 2 * gate["x90"].dur + gate["x"].dur + SEP)  # noqa: F821  covers either branch
+    out[0] = 0
 
-    The X90 is exp(−i[θ·(n̂·σ) + ε·Z]/2) with θ = π/2 (the drive and the Stark accrue TOGETHER — the
-    model interleaves them batch by batch, as a real detuning-during-drive does). Its symmetric
-    decomposition is Rz(β)·R_n(θ')·Rz(β) with β = atan((ε/Ω)·tan(Ω/2)), Ω = √(θ² + ε²) — so the pulse
-    leaves β of Z on EACH side, and the virtual-Z pair that cancels it is φ = β on each side (the frame
-    chases the phase the qubit accrued). β → (2/π)·ε ≈ 0.64·ε for small ε, NOT ε/2: a Z error accrued
-    DURING a π/2 rotation does not split as ε/2 per side (spec 13 §6 says ε/2; that is the lumped-error
-    approximation, and its sign is the opposite of what our frame convention gives)."""
-    omega = math.hypot(math.pi / 2, eps)
-    return math.atan2(eps * math.tan(omega / 2), omega)
+
+@kernel
+def k_probe_ramsey(gate: ParamTable, out: Array, wait: int, maxw: int):
+    """Two X90s `wait` batches apart, start to start — the Ramsey pair, no readout."""
+    init_pulse_params(gate.pulses)  # noqa: F821
+    set_freq(gate, gate.freq)  # noqa: F821
+    t = now() + LEAD  # noqa: F821
+    play(gate, gate["x90"], t)  # noqa: F821
+    play(gate, gate["x90"], t + wait)  # noqa: F821
+    wait_until(t + maxw + gate["x90"].dur + SEP)  # noqa: F821
+    out[0] = 0
 
 
 @pytest.mark.cosim
-def test_phase_recovers_the_stark_shift(cosim, demod_phase):
-    """spec 13 Q3 — THE gate the old Phase could not pose. Plant an ac-Stark drive phase in the model
-    (`stark_rad_per_sigma`: every driven batch also rotates the qubit about z, so an X90 leaves ε of Z
-    behind) and qcal's two sequences must find it: their |1> populations are lines of opposite slope in
-    the swept virtual-Z, and the crossing is the phase that cancels the error. With no Stark planted
-    the answer is 0 and ANY sequence 'passes' — which is why the old cosine-Ramsey Phase could only
-    concede that it 'recovers ≈0'."""
-    drv, m = cosim
-    x90 = Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5)
-    sigma = gate_sigma(m, x90, F_GE, units._amp_code(0.5))   # the X90's drive integral
-    rabi = float((math.pi / 2) / sigma)                      # calibrated X90 (θ = π/2)
-    eps = 0.3                                                # the planted Z rotation per X90 (rad)
-    # t1/relax are the SNR levers here: the |1> population decays over the pulse→readout SEP, which
-    # flattens both lines (and the crossing's error goes as 1/slope), while the relax head has to stay
-    # ≫ T1 to reset. t1 = 300 / relax = 1000 is the cheapest pair that keeps the slopes at ±0.4.
-    drv.sim.set_model(_model(rabi, t1=300, t2=3000, noise=300.0, seed=6, collapse=True,
-                             stark_rad_per_sigma=eps / sigma))
-    cfg = _cfg(m, F_GE, x90_amp=0.5, relax=1000)
-    cfg["readout/0/demod/phase"] = demod_phase
-    cal = Phase(cfg, 0, points=7, span=0.3, shots=96)
-    r = cal.run(drv)
-    want = _stark_vz(eps)
-    vz = r.proposal["qubit/0/x90/vz"]
-    print(f"\n[phase] planted eps={eps:.3f} → vz should be {want:+.4f} (ε/2 = {eps/2:+.4f})\n"
-          f"  recovered vz={vz}  slopes={r.fit[0][0].value:+.2f}/{r.fit[0][1].value:+.2f} "
-          f"fallback={cal.fallback[0]}\n"
-          f"  P(Y180_X90)={np.round(r.data[0]['p0'], 3).tolist()}\n"
-          f"  P(X180_Y90)={np.round(r.data[0]['p1'], 3).tolist()}")
-    assert r.ok and not cal.fallback[0]
-    assert vz[0] == vz[1], "qcal writes ONE crossing to BOTH virtual-Z slots"
-    # Tolerance = 2σ of the crossing under binomial noise: with slopes of ±0.42 and 7×96 shots per
-    # sequence, σ ≈ 2.1·0.5/(√N·|m0 − m1|) ≈ 0.05 rad (and σ ∝ √runtime, so buying it down costs
-    # minutes). It still excludes 0 (what the old cosine Phase "recovered"), a flipped sign, and a
-    # frame contract that advanced by φ per gate instead of 2φ (which would land at 2·want).
-    assert abs(vz[0] - want) < 0.10, f"recovered {vz[0]:+.4f} rad, planted Stark wants {want:+.4f}"
-    assert "qubit/0/x90/phase" not in r.proposal, "the FAST_DRAG's own axis phase is not the knob"
+def test_phase_recovers_the_stark_shift(cosim):
+    """L2 — spec 13 Q3's physics, asserted where it actually lives: on the BLOCH PHASE.
+
+    Plant an ac-Stark drive phase (`stark_rad_per_sigma`: every driven batch also rotates the qubit
+    about +z, so an X90 of drive integral σ leaves ε = stark·σ of Z behind) and read what ONE X90
+    does. What it leaves is a phase in the equatorial plane — invisible to a z-basis readout, which
+    is why the counts version this replaces had to infer it from where two 7×96-shot lines cross.
+
+    The analytic target is the one the old test's `_stark_vz` named. The pulse is
+    exp(−i[θ(n̂·σ) + εZ]/2) with θ = π/2 (drive and Stark accrue TOGETHER, batch by batch), i.e. a
+    rotation by Ω = √(θ² + ε²) about n = (θ, 0, ε)/Ω. Rodrigues on |0> gives, exactly,
+
+        bx = (θε/Ω²)(1 − cos Ω)     by = −(θ/Ω)·sin Ω     bz = cos Ω + (ε/Ω)²(1 − cos Ω)
+
+    and since bx / (−by) = (ε/Ω)·(1 − cos Ω)/sin Ω = (ε/Ω)·tan(Ω/2), the equatorial azimuth is
+    exactly −π/2 + β with tan β = (ε/Ω)·tan(Ω/2). β is the per-side virtual-Z the calibration
+    exists to write, so this pins the same number the old proposal did — from one shot instead of
+    1344, and to 0.02 rad instead of 0.10.
+
+    The gate is 32 batches long (not GATE_ENV's 4) because the model interleaves the xy and z
+    rotations batch by batch: the closed form above is their n → ∞ limit and the first-order Trotter
+    error is θε/(2n) — 0.06 rad at n = 4, 0.007 at n = 32. A real gate is a continuous drive; the
+    per-batch step is the model's discretization, so the continuum answer is the honest target."""
+    _, m = cosim
+    x90 = Pulse(envelopes.square(128), freq_hz=F_GE, amp=0.5)     # 32 batches — see the docstring
+    sigma = gate_sigma(m, x90, F_GE, x90.amp_code())
+    gate = ParamTable(GATE_CH, F_GE, {"x90": x90})
+    prog = compile_kernel(k_probe_x90, m, tables=dict(gate=gate), out=Array(1))
+    spec = {**L2_MODEL, "rabi_rad_per_amp": rabi_for(m, x90, F_GE, math.pi / 2)}   # an EXACT X90
+    p = Probe(cosim, {0: prog})
+
+    for eps in (0.0, 0.3):                        # 0.0 is the control: no Stark ⇒ no residual phase
+        b = p.state({**spec, "stark_rad_per_sigma": eps / sigma})["bloch"]
+        omega = math.hypot(math.pi / 2, eps)
+        s, c = (math.pi / 2) / omega, eps / omega
+        want = [s * c * (1 - math.cos(omega)), -s * math.sin(omega),
+                math.cos(omega) + c * c * (1 - math.cos(omega))]
+        beta = math.atan2(eps * math.tan(omega / 2), omega)
+        print(f"\n[stark eps={eps:.2f}] bloch={np.round(b, 4).tolist()} want={np.round(want, 4).tolist()}"
+              f"  azimuth={math.atan2(b[1], b[0]):+.4f} want={-math.pi / 2 + beta:+.4f} (β={beta:+.4f})")
+        assert b == pytest.approx(want, abs=0.02), \
+            f"eps={eps}: the X90 landed at {b}, the Stark-tilted rotation wants {want}"
+        assert math.atan2(b[1], b[0]) == pytest.approx(-math.pi / 2 + beta, abs=0.02), \
+            "the residual Bloch phase is not the per-side virtual-Z the calibration writes"
 
 
 @pytest.mark.cosim
 @pytest.mark.parametrize("planted", [0.0, 0.5])
-def test_phase_x_gate_recovers_the_planted_axis(cosim, demod_phase, planted):
-    """spec 14 F1 — `Phase(gate='X')`, qcal's second Phase mode. Its circuit is X90 · X · X90, a 2π
-    rotation that returns to |0> only when the X's own AXIS matches the X90s'. Plant that axis by
-    giving the X90s a phase of `planted`: the X's calibrated axis must follow them, and the proposal
-    lands on `qubit/0/x/phase` (an axis phase — NOT the virtual-Z pair the X90 mode writes). The X is
-    the X6Y3 shape (double LENGTH, same amplitude, spec 13 §4).
+def test_phase_x_gate_recovers_the_planted_axis(cosim, planted):
+    """L2 — spec 14 F1's circuit, on the state. X90 · X · X90 is a 2π rotation that returns to |0>
+    only when the X sits on the X90s' AXIS. Plant that axis on the X90s (`qubit/0/x90/phase`) and
+    leave the X at 0 — exactly the config the counts version used — so the mismatch is
+    δ = φ_X − φ_X90 = −planted.
 
-    The fringe runs at 2φ, so it has period π and the recovered axis is only defined mod π (the two
-    solutions are the same gate) — which is what is checked. Like every counts-mode cal here it needs
-    the measured `demod_phase`: without it the discriminator's polarity is whatever the grid period
-    leaves the demod LO at, and the recovered axis lands half a fringe out."""
-    drv, m = cosim
-    x90 = Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5)
-    sigma = gate_sigma(m, x90, F_GE, units._amp_code(0.5))
-    drv.sim.set_model(_model(float((math.pi / 2) / sigma), t1=400, t2=3000, noise=300.0, seed=3,
-                             collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.5, relax=1000)
-    cfg["readout/0/demod/phase"] = demod_phase    # the measured discrimination phase (counts mode)
+    Analytic, and exact here: the drive is resonant so each pulse has ONE fixed xy-plane axis, and
+    the X is the X6Y3 shape (double LENGTH, same amplitude) so its drive integral is exactly 2σ,
+    i.e. exactly π. Rodrigues through the three rotations from |0> gives
+
+        b = (−sin 2δ · cos φ_X90,  −sin 2δ · sin φ_X90,  cos 2δ)
+
+    so ⟨σz⟩ = cos 2δ — the period-π fringe the old test could only locate to ±0.25 rad through a
+    13 × 96-shot cosine, now pinned to 0.02 in one shot. (`planted = 0` is the aligned case: a clean
+    2π back to |0>.)"""
+    _, m = cosim
+    cfg = _cfg(m, F_GE, x90_amp=0.5)
     cfg["qubit/0/x90/phase"] = planted            # the reference axis both X90s sit on
     cfg["qubit/0/x/env"] = "square"               # the X: double LENGTH, same amp → π (spec 13 §4)
     cfg["qubit/0/x/dur"] = _s(8, m)
     cfg["qubit/0/x/amp"] = 0.5
     cfg["qubit/0/x/phase"] = 0.0                  # deliberately off the X90s when planted != 0
-    cal = Phase(cfg, 0, gate="X", points=13, shots=96)
-    r = cal.run(drv)
-    got = r.proposal.get("qubit/0/x/phase")
-    print(f"\n[phase-X] planted axis={planted:+.3f} recovered={got} "
-          f"fallback={cal.fallback.get(0)}\n  P(1)={np.round(r.data[0]['y'], 3).tolist()}")
-    assert r.ok and "qubit/0/x90/vz" not in r.proposal   # the X mode writes the axis, not the pair
-    assert abs(math.remainder(got - planted, math.pi)) < 0.25, \
-        f"recovered {got:+.4f} rad, the X90s sit at {planted:+.4f} (mod π)"
+    x90 = gate_pulse(cfg, 0, m)
+    gate = ParamTable(GATE_CH, F_GE, {"x90": x90, "x": gate_pulse(cfg, 0, m, "x")})
+    prog = compile_kernel(k_probe_x90_x_x90, m, tables=dict(gate=gate), out=Array(1))
+    p = Probe(cosim, {0: prog})
+    b = p.state({**L2_MODEL, "rabi_rad_per_amp": rabi_for(m, x90, F_GE, math.pi / 2)})["bloch"]
 
+    d = 0.0 - planted                             # the X's axis minus the X90s'
+    want = [-math.sin(2 * d) * math.cos(planted), -math.sin(2 * d) * math.sin(planted),
+            math.cos(2 * d)]
+    print(f"\n[phase-X planted={planted:+.2f}] bloch={np.round(b, 4).tolist()} "
+          f"want={np.round(want, 4).tolist()}")
+    assert b == pytest.approx(want, abs=0.02), \
+        f"X90·X·X90 with the X {d:+.3f} rad off the X90s landed at {b}, not {want}"
 
-# ── acquire_shots: ReadoutCalibration captures bimodal |0>/|1> clusters (raw mode) ──
-
-@pytest.mark.cosim
-def test_acquire_shots_chunks(cosim):
-    drv, m = cosim
-    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=400.0, seed=2, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=RO_RELAX)
-    r = ReadoutCalibration(cfg, 0, shots=16).run(drv)   # per-prep RAW reruns: |0>, |1>
-    assert r.data[0]["iq0"].shape == (16, 2) and r.data[0]["iq1"].shape == (16, 2)
-    assert r.ok and r.data[0]["separation"] > 1.0       # qcal SNR: means ≥ 4σ apart (spec 13 §2)
-    assert isinstance(r.fit[0], Classifier)             # the trained classifier rides on the Result
-
-
-@pytest.mark.cosim
-def test_readout_calibration_phase_proposal_is_a_fixed_point(cosim):
-    """The demod-phase proposal is ABSOLUTE (rotate the |0>→|1> cluster axis onto +real, spec 13 §5),
-    so the RAW capture must run in the ZERO demod frame: baking the config's CURRENT phase into the
-    capture carrier rotates the measured axis by exactly that stale value and the 'absolute' proposal
-    comes out relative — invisible on co-sim configs (stored phase 0), wrong on X6Y3 (−109.9°…+39.0°).
-    Plant a stale nonzero phase, calibrate, apply, re-calibrate: the second run must propose the SAME
-    phase (a fixed point). The old capture-at-stored-phase left each proposal ~1 rad off the last."""
-    drv, m = cosim
-    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=300.0, seed=7, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=RO_RELAX)
-    cfg["readout/0/demod/phase"] = 1.0                  # any stale nonzero phase (rad)
-    r1 = ReadoutCalibration(cfg, 0, shots=24).run(drv)
-    assert r1.ok
-    r1.apply()
-    r2 = ReadoutCalibration(cfg, 0, shots=24).run(drv)
-    assert r2.ok
-    p1, p2 = r1.proposal["readout/0/demod/phase"], r2.proposal["readout/0/demod/phase"]
-    print(f"\n[rc-phase] stale=1.0 first={p1:+.3f} second={p2:+.3f}")
-    assert abs(math.remainder(p2 - p1, 2 * math.pi)) < 0.2, \
-        "the demod-phase proposal must be a fixed point (absolute, not relative to the stored phase)"
-
-
-# ── the |1> prep: qcal's two gates reach the same population (spec 13 Q1) ──
 
 @pytest.mark.cosim
 def test_prep_gate_x90_and_x_agree(cosim):
-    """spec 13 Q1: `gate='X90'` plays the config's X90 TWICE (one play + one bare fire — B0's
-    startTime auto-advance makes the train contiguous); `gate='X'` plays the config's OWN X pulse
-    once, here (as on X6Y3) a double-LENGTH, same-amplitude pulse — NOT the deleted "π = 2× the X90
-    amp" synthesis. Both integrate to the same drive, so both prep |1>: their clusters classify the
-    same under ONE fixed classifier (the X90 run's), to within shot noise."""
-    drv, m = cosim
-    drv.sim.set_model(_model(_rabi_pi(m), t1=800, t2=3000, noise=300.0, seed=13, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=3200)   # X90 = π/2 (4 batches @ 0.495); relax = 4·T1
-    cfg["qubit/0/x/env"] = "square"                  # the X: double LENGTH, same amp → the same π
+    """L2 — spec 13 Q1: qcal's two |1> preps must BOTH reach |1>.
+
+    `gate='X90'` plays the Config's X90 twice (one play + one bare fire, contiguous through B0's
+    startTime auto-advance); `gate='X'` plays the Config's OWN X pulse once — here, as on X6Y3, a
+    double-LENGTH same-amplitude pulse, NOT the deleted "π = 2× the X90 amp" synthesis. Both
+    integrate to the same drive, so with the X90 planted as an exact π/2 both must land ⟨σz⟩ = −1.
+
+    The counts version compared the two preps' clusters under one fixed classifier and could only
+    say they agreed to 0.15 with each above 0.75; this says each is |1> to 0.02, off one shot."""
+    _, m = cosim
+    cfg = _cfg(m, F_GE, x90_amp=0.495)
+    cfg["qubit/0/x/env"] = "square"               # the X: double LENGTH, same amp → the same π
     cfg["qubit/0/x/dur"] = _s(8, m)
     cfg["qubit/0/x/amp"] = 0.495
-    r90 = ReadoutCalibration(cfg, 0, shots=24, gate="X90").run(drv)
-    rx = ReadoutCalibration(cfg, 0, shots=24, gate="X").run(drv)
-    assert r90.ok and rx.ok
-    clf = r90.fit[0]                                  # the FIXED classifier (trained on the X90 preps)
-    p90 = float(clf.classify(r90.data[0]["iq1"]).mean())
-    px = float(clf.classify(rx.data[0]["iq1"]).mean())
-    print(f"\n[prep-gate] P(|1>): X90·X90={p90:.3f} X={px:.3f}  "
-          f"sep={r90.data[0]['separation']:.1f}/{rx.data[0]['separation']:.1f}")
-    assert p90 > 0.75 and px > 0.75, f"a prep did not reach |1>: X90·X90={p90:.3f} X={px:.3f}"
-    assert abs(p90 - px) < 0.15, f"the two preps disagree: X90·X90={p90:.3f} vs X={px:.3f}"
+    table, pg90, _ = prep(cfg, 0, m, "X90")       # the production prep: table + the kernels' fold
+    _, pgx, _ = prep(cfg, 0, m, "X")
+    prog = compile_kernel(k_probe_prep, m, tables=dict(gate=table), out=Array(1))
+    spec = {**L2_MODEL, "rabi_rad_per_amp": rabi_for(m, table.pulses["x90"], F_GE, math.pi / 2)}
+    p = Probe(cosim, {0: prog})
 
-
-# ── the readout cals, on qcal's statistics (spec 13 Q2) ──
-
-@pytest.mark.cosim
-def test_separation_picks_max_separation_not_the_magnitude_peak(cosim):
-    """spec 13 Q2 — THE regression that catches the old Separation. On a dispersive readout the |0>
-    response peaks at f_r + χ while the two-state separation peaks at f_r, so the |0>-magnitude argmax
-    (what the old |0>-only VNA took) and the cluster-SNR argmax (qcal's statistic, what we take now)
-    are DIFFERENT grid points. Separation runs the matched-pair sweep at both prep states (k_vna RAW,
-    two reruns of one resident program) and must pick the latter.
-
-    Soft readout (collapse=False): the clusters are then the readout noise around each state's
-    response — Gaussian, as a real experiment's are. (Projective collapse would make the |1> cluster a
-    MIXTURE of both tones through the co-sim's small T1/relax budget, and that spread is ∝ ‖Δmeans‖, so
-    it divides straight back out of the SNR — an artifact of the 1600-batch reset, not physics.)"""
-    drv, m = cosim
-    disp = _dispersive(m, chi_code=60, kappa_code=170)
-    drv.sim.set_model(_model(_rabi_pi(m), t1=300, t2=3000, noise=300.0, seed=14,
-                             readout_amp=4000.0, **disp))
-    cfg = _cfg(m, F_GE, x90_amp=0.495)                     # X90·X90 = π; readout/0/freq = f_r
-    r = Separation(cfg, 0, span=units.code_to_freq(120, m.params), points=5, shots=64).run(drv)
-    sep, mag0 = r.data[0]["y"], r.data[0]["mag0"]
-    c_r = units._freq_code(_readout_freq(m), m.params)
-    # data["x"] is physical Hz around the stored freq (codes stay inside run(), spec 13 §2) — map it
-    # back to the swept codes for the grid-point assertions below.
-    xs = np.round((r.data[0]["x"] - _readout_freq(m))
-                  / units.code_to_freq(1, m.params)).astype(int) + c_r
-    best, peak = int(np.argmax(sep)), int(np.argmax(mag0))
-    print(f"\n[separation] ok={r.ok} codes={xs.tolist()} (f_r={c_r}, |0> peak={c_r + 60})\n"
-          f"  cluster SNR   ={np.round(sep, 3).tolist()} -> argmax {best} (code {xs[best]})\n"
-          f"  |0> magnitude ={np.round(mag0).astype(int).tolist()} -> argmax {peak} (code {xs[peak]})")
-    assert r.ok
-    assert xs[peak] == c_r + 60, "the |0> magnitude does not peak at the |0> dressed resonance"
-    assert best != peak, "max separation and the |0>-magnitude peak coincide — the gate is vacuous"
-    assert xs[best] == c_r, "Separation did not pick the max-separation frequency"
+    for name, pg in (("X90·X90", pg90), ("X", pgx)):
+        b = p.state(spec, {0: {"pg": pg}})["bloch"]
+        print(f"\n[prep-gate {name}] bloch={np.round(b, 4).tolist()}")
+        assert b == pytest.approx([0.0, 0.0, -1.0], abs=0.02), f"the {name} prep landed at {b}, not |1>"
 
 
 @pytest.mark.cosim
-def test_separation_proposes_physical_hz_not_the_alias(cosim):
-    """The 16-bit sweep codes alias (Nyquist fold): on X6Y3 the 6.55 GHz readout, synthesized in the
-    DAC's 2nd Nyquist zone, folds to a code whose code_to_freq is ≈ −1.44 GHz — which is what the old
-    proposal wrote back into the tree of record. The proposal must be DELTA-based physical Hz
-    (f0 + code_to_freq(best − c0)): store the readout freq as the out-of-band alias f − fs — the
-    IDENTICAL hardware code bit-for-bit, so the run itself is unchanged — and the proposal must come
-    back in that same band, within the swept span of the stored value."""
-    drv, m = cosim
-    disp = _dispersive(m, chi_code=60, kappa_code=170)
-    drv.sim.set_model(_model(_rabi_pi(m), t1=300, t2=3000, noise=300.0, seed=14,
-                             readout_amp=4000.0, **disp))
-    cfg = _cfg(m, F_GE, x90_amp=0.495)
-    f_alias = _readout_freq(m) - units.sample_rate(m.params)     # same code, the other Nyquist band
-    assert units._freq_code(f_alias, m.params) == units._freq_code(_readout_freq(m), m.params)
-    cfg["readout/0/freq"] = float(f_alias)
-    span = units.code_to_freq(120, m.params)
-    r = Separation(cfg, 0, span=span, points=5, shots=64).run(drv)
-    prop = r.proposal["readout/0/freq"]
-    print(f"\n[separation-alias] stored={f_alias:.6g} proposed={prop:.6g} span={span:.4g}")
-    assert r.ok
-    assert abs(prop - f_alias) <= span, \
-        "the proposal must stay delta-based in the stored band, not jump to the baseband alias"
-    assert np.all(np.abs(r.data[0]["x"] - f_alias) <= span)      # the x-axis is in-band Hz too
+def test_multiqubit_both_cores_recover(cosim):
+    """L2 — spec 13 Q5's load-bearing deliverable: ONE run drives TWO cores and each core's own
+    qubit responds to its own gate DAC.
+
+    One compiled image, loaded on both cores, plays the same X90-shaped pulse on each. The two
+    models are planted with DIFFERENT rates (`rabi_for` π/2 on core 0, π on core 1) so the same
+    stimulus must produce two DIFFERENT textbook states in the same run: core 0 on the equator at
+    −y, core 1 at |1>. A crossed gate DAC, a core that never released, or a shared-time slip all
+    break that; recovering a fit is not needed to see it."""
+    _, m = cosim
+    x90 = Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5)
+    gate = ParamTable(GATE_CH, F_GE, {"x90": x90})
+    prog = compile_kernel(k_probe_x90, m, tables=dict(gate=gate), out=Array(1))
+    turn = {0: math.pi / 2, 1: math.pi}                  # core 0 an X90, core 1 a π
+    sub = [{**L2_MODEL, "core": q, "rabi_rad_per_amp": rabi_for(m, x90, F_GE, turn[q])}
+           for q in (0, 1)]
+
+    p = Probe(cosim, {0: prog, 1: prog})
+    models = p.state({"kind": "multi", "models": sub})["models"]
+    b0, b1 = (mo["bloch"] for mo in models)
+    print(f"\n[multi-q] core0={np.round(b0, 4).tolist()} core1={np.round(b1, 4).tolist()}")
+    assert b0 == pytest.approx([0.0, -1.0, 0.0], abs=0.02), f"core 0's X90 landed at {b0}, not −y"
+    assert b1 == pytest.approx([0.0, 0.0, -1.0], abs=0.02), f"core 1's π landed at {b1}, not |1>"
 
 
 @pytest.mark.cosim
-def test_fidelity_picks_readout_amp(cosim):
-    """spec 13 Q2 — Fidelity sweeps qcal's knob (the readout DRIVE amplitude, on-core via k_ro_amp) and
-    scores the confusion diagonal ½[P(0|0) + P(1|1)] under the FIXED hardware discriminator (the demod
-    phase ReadoutCalibration measured; never retrained per point). The dispersive resonator's answer is
-    proportional to the drive, so the diagonal responds to the amplitude and the argmax lands in the
-    sweep — with the old flat tone (amplitude a model constant) this knob was a no-op."""
-    drv, m = cosim
-    spec = _model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=5600.0, seed=15, collapse=True,
-                  readout_amp=4000.0, **_dispersive(m))
-    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=RO_RELAX)      # readout/0/amp = 0.5 (the sweep centre)
-    _calibrate(drv, m, cfg, spec)                           # bake the discrimination phase
-    r = Fidelity(cfg, 0, amp_span=0.45, points=5, shots=24).run(drv)
-    amps, fid = r.data[0]["x"], r.data[0]["y"]
-    print(f"\n[fidelity] ok={r.ok} amps={np.round(amps, 3).tolist()}\n"
-          f"  diagonal={np.round(fid, 3).tolist()} P(1|0)={np.round(r.data[0]['p0'], 3).tolist()} "
-          f"P(1|1)={np.round(r.data[0]['p1'], 3).tolist()} -> picked={r.proposal['readout/0/amp']:.3f}")
-    assert r.ok
-    assert fid[-1] - fid[0] > 0.1, "the confusion diagonal does not respond to the readout amplitude"
-    assert amps[0] <= r.proposal["readout/0/amp"] <= amps[-1]
+@pytest.mark.parametrize("d0_code", [60, -60])
+def test_frequency_recovers_detuning(cosim, d0_code):
+    """L2 — the RTL half of spec 13 Q4: a carrier detuned by δ really does RAMP THE DRIVE AXIS, so
+    a Ramsey pair separated by a wait accumulates exactly the phase δ says it should.
+
+    The model takes the drive axis by demodulating the gate DAC against `f_ge`, so a carrier δ codes
+    away ramps that axis by 2π·δ/2^12 rad per batch (16 DAC samples of δ/2^16 turns each). Two X90s
+    whose axes differ by φ therefore leave, exactly (Rodrigues, both axes in the xy-plane, in the
+    frame of the FIRST pulse's axis),
+
+        b = (−sin φ · cos φ,  −sin² φ,  −cos φ)      ⇒   ⟨σz⟩ = −cos φ,  |b_xy| = |sin φ|
+
+    with φ = 2π·δ·Δt/2^12 and Δt the pulses' start-to-start separation. Both of those are invariant
+    under z-rotation, so they are what is asserted: the first pulse's ABSOLUTE axis is
+    2π·δ·t₁/2^12, and t₁ is wherever in free-running batch time the rerun happened to land, so the
+    lab-frame azimuth carries an arbitrary offset and nothing else does. Three waits pin the RATE —
+    no fit, no fringe envelope, no 12×96×4 sweep (the counts version cost 599 s per sign).
+
+    The X90 is ONE batch long on purpose. The model applies one rotation per batch about that
+    batch's axis, so a single-batch pulse is exactly a fixed-axis rotation and the two-axis formula
+    above is exact; a 4-batch GATE_ENV would ramp its own axis by 0.37 rad mid-pulse (the detuned
+    Rabi tilt), which no fixed-axis target can describe.
+
+    What ⟨σz⟩ CANNOT see is the ramp's sign: reflecting through the xz-plane maps φ → −φ and leaves
+    every z-basis observable of a sequence starting at the pole invariant. So ±60 pins the rate for
+    a carrier above AND below f_ge, but the sign lock-step (V-vertex → proposal) is arithmetic and
+    lives host-pure in test_cal_host::test_frequency_proposal_moves_the_carrier_toward_f_ge.
+
+    Tolerance 0.05: `_drive_axis` demodulates 16 samples per batch, so the counter-rotating term at
+    f_drive + f_ge leaves ~0.015 rad of axis residual per pulse (~0.03 rad differential), which is
+    deterministic, not statistical."""
+    _, m = cosim
+    drive = units.code_to_freq(units._freq_code(F_GE, m.params) + d0_code, m.params)   # f_ge + δ
+    x90 = Pulse(envelopes.square(4), freq_hz=drive, amp=0.5)      # ONE batch — see the docstring
+    gate = ParamTable(GATE_CH, drive, {"x90": x90})
+    waits = (8, 20, 32)                                           # start-to-start, batches
+    prog = compile_kernel(k_probe_ramsey, m, tables=dict(gate=gate), out=Array(1),
+                          maxw=max(waits))
+    spec = {**L2_MODEL, "rabi_rad_per_amp": rabi_for(m, x90, drive, math.pi / 2)}
+    p = Probe(cosim, {0: prog})
+
+    for w in waits:
+        b = p.state(spec, {0: {"wait": w}})["bloch"]
+        phi = 2 * math.pi * d0_code * w / (1 << 12)
+        print(f"\n[frequency δ={d0_code:+d} Δt={w}] φ={phi:+.4f} bloch={np.round(b, 4).tolist()}"
+              f"  ⟨σz⟩={b[2]:+.4f} want={-math.cos(phi):+.4f}  |b_xy|={math.hypot(b[0], b[1]):.4f} "
+              f"want={abs(math.sin(phi)):.4f}")
+        assert b[2] == pytest.approx(-math.cos(phi), abs=0.05), \
+            f"δ={d0_code:+d}, Δt={w}: ⟨σz⟩ = {b[2]:+.4f}, a δ-ramped axis wants {-math.cos(phi):+.4f}"
+        assert math.hypot(b[0], b[1]) == pytest.approx(abs(math.sin(phi)), abs=0.05), \
+            "the pair did not leave the equatorial radius |sin φ| the same φ implies"
+
+
+# ── L1: the readout TIMING knobs and the heralded grid, on the converters (01 §3) ──
+
+@kernel
+def k_ro_delay(ro: ParamTable, demod: ParamTable, out: Array, code: int, pre: int, ddly: int):
+    """One readout drive, started `pre` batches early, and one demod window opening `ddly` after the
+    reference time — the `demod/delay` knob's own arithmetic. Every counts kernel does exactly this
+    (`play(demod, ..., t_ro + ddly)`); the delay is not a table field, which is why sweeping it needs
+    a per-run param instead of a write_slot."""
+    init_pulse_params(demod.pulses)  # noqa: F821
+    set_freq(demod, code)  # noqa: F821
+    init_pulse_params(ro.pulses)  # noqa: F821
+    set_freq(ro, ro.freq)  # noqa: F821
+    t = now() + LEAD + pre  # noqa: F821
+    play(ro, ro["meas"], t - pre)  # noqa: F821
+    play(demod, demod["sq"], t + ddly)  # noqa: F821
+    wait_until(t + ddly + READOUT_LEAD)  # noqa: F821
+    read_res()  # noqa: F821                                 (HALTS until the window has settled)
+    out[0] = read_real()  # noqa: F821
+    out[1] = read_imag()  # noqa: F821
 
 
 @pytest.mark.cosim
-def test_fidelity_sweeps_the_full_span_at_tiny_amp(cosim):
-    """qcal's Fidelity sweeps exactly ±amp_span around the config amp; the old AMP_MIN = 0.01 floor
-    silently truncated the lower half-span for X6Y3-class readout amps (q5: 0.0115 lost 54 % of it).
-    At amp 0.012, span 0.005, the first swept point must be 0.007 — not the clamped 0.01. (Only the
-    realized sweep axis is asserted; the populations at these near-noise amps are not the point.)"""
+def test_readout_timing_knob_moves_the_readout(cosim):
+    """L1 (spec 14 F2) — `demod/delay` MOVES THE INTEGRATION WINDOW IN TIME, measured on the readout
+    datapath to the batch.
+
+    The demod carrier is not a converter channel (it feeds the decoder), so the window's position is
+    not a DAC capture — but it is just as observable. Loop the readout DRIVE back into the ADC
+    (`LoopbackModel`: deterministic, no quantum state, permitted at L1 by 01 §3.3) and the decoder
+    integrates the echo only where the window and the drive OVERLAP. Park the window deep inside the
+    drive and it collects the whole 64 batches; slide it off the trailing edge and it loses exactly
+    one batch of signal per batch of delay:
+
+        |z|(ddly) = A·(drive_end − ddly),   A = |z|(deep inside) / window
+
+    so the 16-batch step between the two ramp points must remove exactly a QUARTER of the plateau.
+    Stating it as a slope is what makes it independent of the converter round trip and the decoder
+    pipeline — a fixed offset on `drive_end` that a single absolute edge could not separate.
+
+    The model this replaces was the projective TwoLevelModel scored through `Window`'s confusion
+    diagonal at 48 shots/point, where the only assertable effect was the total collapse of the
+    starved point; the decode half of that claim is host-pure in test_cal_host."""
     drv, m = cosim
-    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=300.0, seed=20, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=RO_RELAX)
-    cfg["readout/0/amp"] = 0.012
-    r = Fidelity(cfg, 0, amp_span=0.005, points=3, shots=16).run(drv)
-    xs = r.data[0]["x"]
-    print(f"\n[fid-span] amps={np.round(xs, 5).tolist()}")
-    assert xs[0] == pytest.approx(0.007, abs=1e-4), "the lower half-span was clamped away"
+    q, pre, drive, win = 0, 64, 192, 64            # batches: drive [t−64, t+128), window 64 long
+    # demod code 8192 = one quarter turn per ADC sample, so the demod product's 2ω term closes
+    # exactly every batch and each overlapping batch contributes the SAME amount. At the model's
+    # usual code 2048 it does not, and the leftover ripple is ±3 % of a 20-batch integral — which
+    # would put a systematic error in the slope this test is about.
+    ro_freq = units.demod_code_to_freq(8192, m.params)
+    ro = ParamTable(1, ro_freq, {"meas": Pulse(envelopes.square(drive), freq_hz=ro_freq, amp=0.5)})
+    prog = compile_kernel(k_ro_delay, m, tables=dict(ro=ro, demod=demod_table(win)), out=Array(2),
+                          code=units.demod_freq_to_code(ro_freq, m.params), pre=pre)
+    drv.sim.set_model({"kind": "loopback", "src": m.ro_dac(q), "dst": m.adc_of(q), "gain": 1.0})
+    rq.setup(drv, m, {q: prog})
 
+    def mag(ddly):
+        out = rq.rerun(drv, m, {q: prog}, params={q: {"ddly": ddly}}, results=["out"],
+                       timeout=batch_timeout(4 * (pre + drive)))[q]["out"]
+        return math.hypot(float(out[0]), float(out[1]))
 
-@pytest.mark.cosim
-def test_readout_fidelity_matches_the_host_classifier(cosim):
-    """spec 13 Q2 — ReadoutFidelity's confusion comes from the `res` bit under the FIXED discriminator
-    (two COUNTS reruns; no raw IQ, no retraining). It must agree, within shot noise, with the confusion
-    of a host classifier trained on the same readout's clusters — i.e. the on-chip discriminator really
-    is the classifier we think it is. The old version could not show this: it retrained on the very
-    points it then confused."""
-    drv, m = cosim
-    spec = _model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=5600.0, seed=16, collapse=True,
-                  readout_amp=4000.0, **_dispersive(m))
-    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=RO_RELAX)
-    _calibrate(drv, m, cfg, spec)                              # bake the discrimination phase
-    host = ReadoutCalibration(cfg, 0, shots=48).run(drv).fit[0]  # the host classifier, same readout
-    r = ReadoutFidelity(cfg, 0, shots=48).run(drv)             # the res bit under that discriminator
-    conf, hconf = r.data[0]["confusion"], host.confusion()
-    print(f"\n[readout-fidelity] fidelity={r.data[0]['fidelity']:.3f} "
-          f"(host {np.mean(np.diag(hconf)):.3f})\n  res bit:\n{np.round(conf, 3)}\n"
-          f"  host classifier:\n{np.round(hconf, 3)}")
-    assert r.ok
-    assert 0.7 < r.data[0]["fidelity"] < 1.0, "a saturated confusion would test nothing"
-    assert np.allclose(np.diag(conf), np.diag(hconf), atol=0.15)   # ~2σ of two 48-shot estimates
-
-
-@pytest.mark.cosim
-def test_window_picks_the_longer_integration(cosim, demod_phase):
-    """The demod-window sweep — OURS, not qcal's (spec 13 §5), so it is out of the X6Y3 chain — retunes
-    the window via write_slot + rerun (no recompile, spec 08 §4) and is scored exactly like Fidelity:
-    the confusion diagonal under the fixed discriminator (not a classifier retrained per window, as the
-    old Fidelity did). A longer integration collects more SNR, so it must win."""
-    drv, m = cosim
-    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=7000.0, seed=10, collapse=True,
-                             readout_amp=1000.0))                   # the plain (flat-tone) readout
-    cfg = _cfg(m, F_GE, x90_amp=0.495, dur=64, drive=80, relax=RO_RELAX)   # drive covers the window
-    cfg["readout/0/demod/phase"] = demod_phase
-    durs = (16, 64)                                                 # candidate windows (batches)
-    r = Window(cfg, 0, durs=[_s(d, m) for d in durs], shots=24).run(drv)
-    fid = r.data[0]["y"]
-    print(f"\n[window] ok={r.ok} durs={r.data[0]['x'].astype(int).tolist()} "
-          f"diagonal={np.round(fid, 3).tolist()} picked={r.proposal['readout/0/demod/dur']:.3e} s")
-    assert r.ok
-    assert fid[1] > fid[0] + 0.05, "the longer integration window did not read out better"
-    assert r.proposal["readout/0/demod/dur"] == pytest.approx(_s(durs[1], m))
-
-
-# ── multi-qubit simultaneous: both cores calibrated in ONE run (spec 13 Q5 / §8) ──
-
-# ── the readout TIMING knobs (spec 14 F2) ──
-
-@pytest.mark.cosim
-@pytest.mark.parametrize("knob", ["demod/delay"])
-def test_readout_timing_knob_moves_the_readout(cosim, demod_phase, knob):
-    """(F2 gate) The demod DELAY — when the integration window opens after the drive starts, qcal's
-    `demod/delay` — swept through `Window`'s machinery: compile once at the longest candidate, then
-    retune per point. Unlike the two durations it is NOT a table field (the kernel adds it to the
-    demod's play time), so it is compiled as a per-run param instead, which is what this exercises.
-
-    Gated on the large, unambiguous effect: the projective model emits its readout tone only while the
-    DRIVE is on, so a delay that opens the window past the END of the drive integrates silence and
-    discrimination collapses. Differences between the two prompt points are within binomial noise at
-    these shot counts (~0.07 per point), so only the collapse is asserted.
-
-    The readout DRIVE length (`readout/{q}/dur`) shares this machinery but gets no scored gate: this
-    model latches the shot's level at the drive's RISING EDGE and then emits the tone for the whole
-    window, so the drive's LENGTH is unobservable here (a sweep over it returns the same three numbers
-    it returns for any other candidates). `test_readout_drive_length_reaches_the_dac` gates that knob
-    where it IS observable — on the converter."""
-    drv, m = cosim
-    q = 0
-    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=300.0, seed=11, collapse=True))
-    cfg = _cfg(m, F_GE, relax=RO_RELAX)
-    cfg[f"readout/{q}/demod/phase"] = demod_phase
-    cfg[f"readout/{q}/demod/dur"] = _s(40, m)
-    cfg[f"readout/{q}/dur"] = _s(56, m)
-    durs = [_s(n, m) for n in (0, 24, 96)]         # 96 opens the window past the 56-batch drive
-    bad = 2
-    r = Window(cfg, q, durs=durs, shots=48, knob=knob).run(drv)
-    y = r.data[q]["y"]
-    good = [k for k in range(len(durs)) if k != bad]
-    print(f"\n[{knob}] fidelity={np.round(y, 3).tolist()} -> {r.proposal[f'readout/{q}/{knob}']:.2e}")
-    assert y[bad] < min(y[k] for k in good) - 0.2, \
-        f"{knob}: the starved point did not collapse the readout: {y}"
-    assert int(np.argmax(y)) in good, f"{knob} picked the starved point: {y}"
-    assert r.proposal[f"readout/{q}/{knob}"] == pytest.approx(durs[int(np.argmax(y))], rel=0.05)
-
-
-@pytest.mark.cosim
-def test_punchout_maps_frequency_against_drive_power(cosim):
-    """(F2 gate) The punchout map — walkthrough stage 1.2, the one readout stage we had no tool for.
-    One k_vna program per qubit, then a `write_slot("ro", 0, "amp")` + a |0> rerun per amplitude, so
-    the map is (amps × points) of |S21| at the |0> resonator.
-
-    On this model the resonator is LINEAR: its response scales with the drive and its dressed peak
-    does NOT walk with power (real punchout needs a nonlinear cavity, which the model does not have).
-    So what is gated is what this model can actually show, and it is exactly what would be broken by a
-    mis-wired amp loop: every row peaks at the same dressed frequency (f_r + χ), and the rows scale
-    with the drive amplitude in the right order."""
-    drv, m = cosim
-    q = 0
-    disp = _dispersive(m, chi_code=60, kappa_code=170)
-    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=60.0, seed=4, collapse=False,
-                             **disp))
-    cfg = _cfg(m, F_GE, relax=RO_RELAX)
-    amps = [0.1, 0.3, 0.6]
-    r = Punchout(cfg, q, amps=amps, span=2.5e6, points=21, shots=16).run(drv)
-    mag, freqs = r.data[q]["mag"], r.data[q]["x"]
-    peaks = [int(np.argmax(row)) for row in mag]
-    c_r = units._freq_code(_readout_freq(m), m.params)
-    print(f"\n[punchout] amps={amps}\n  peak idx per row={peaks} (f_r code={c_r}, |0> peak={c_r + 60})"
-          f"\n  row max={np.round([row.max() for row in mag], 1).tolist()}")
-    assert mag.shape == (len(amps), 21)
-    assert len(set(peaks)) == 1, f"the dressed peak moved with power on a LINEAR resonator: {peaks}"
-    rowmax = np.array([row.max() for row in mag])
-    assert np.all(np.diff(rowmax) > 0), f"the response did not grow with drive amplitude: {rowmax}"
-    # ... and it grows about linearly, which is the amp knob actually reaching the drive
-    assert rowmax[2] / rowmax[0] == pytest.approx(amps[2] / amps[0], rel=0.25)
+    flat, hi, lo = (mag(d) for d in (0, 96, 112))   # 0 = deep inside; 96/112 straddle the tail
+    per_batch = flat / win                          # A: the integral one overlapping batch is worth
+    edge = 96 + hi / per_batch                      # the drive's trailing edge, in window time
+    print(f"\n[demod/delay] |z| plateau={flat:.0f} ddly=96 -> {hi:.0f} ddly=112 -> {lo:.0f}  "
+          f"step={hi - lo:.0f} want={16 * per_batch:.0f}  overlap={hi / per_batch:.2f}/"
+          f"{lo / per_batch:.2f} batches, edge={edge:.2f} (the drive ends at {drive - pre})")
+    assert flat > 0 and hi < flat, "the window never left the middle of the drive"
+    assert hi - lo == pytest.approx(16 * per_batch, rel=0.01), \
+        f"16 batches of demod/delay removed {(hi - lo) / per_batch:.2f} batches of the integral, not 16"
+    assert 0 <= edge - (drive - pre) <= 16, \
+        f"the window sits {edge - (drive - pre):.2f} batches off the drive's end — not a round trip"
 
 
 @pytest.mark.cosim
 def test_readout_drive_length_reaches_the_dac(cosim):
-    """(F2 gate) The readout DRIVE length knob, gated where it is observable: the converter. `Window`
-    compiles the drive at the longest candidate and retunes the slot per point, so the readout DAC's
-    active window must be exactly the batches written — the proof the knob is applied even though the
-    projective model (which latches on the drive's rising edge) cannot see it."""
+    """L1 (spec 14 F2) — the readout DRIVE length knob, gated where it is observable: the converter.
+    `Window` compiles the drive at the longest candidate and retunes the slot per point, so the
+    readout DAC's active window must be exactly the batches written — the proof the knob is applied
+    even though the projective model (which latches on the drive's rising edge) cannot see it.
+
+    One `rq.setup`: the whole point of a slot retune is that the image stays put (spec 08 §4)."""
     drv, m = cosim
     q = 0
     drv.sim.set_model({"kind": "zero"})               # the readout DAC carries only the core's drive
-    cfg = _cfg(m, F_GE, relax=400)
+    cfg = _cfg(m, F_GE, relax=8)                  # L1: the relax head is not the subject
     cfg[f"readout/{q}/dur"] = _s(56, m)
     cfg[f"readout/{q}/demod/dur"] = _s(40, m)
     a = units._amp_code(float(cfg[f"readout/{q}/amp"]))
     prog, period = _ro_amp_prog(m, cfg, q, "X90", 1, 1, a << 16, 0)
+    rq.setup(drv, m, {q: prog})
     for want in (56, 24, 8):
-        rq.setup(drv, m, {q: prog})
         rq.write_slot(drv, m, q, prog, "ro", 0, "dur", want)
         rq.check_magic(drv, m, q, prog)
         rq.write_var(drv, m, q, prog, "__rq_status", 0)
         rq.write_params(drv, m, q, prog, {"prep": 0})
-        h = drv.sim.dac_capture_arm(m.ro_dac(q), 20000)
+        h = drv.sim.dac_capture_arm(m.ro_dac(q), 1400)   # boot + one grid period (296) + the drive
         rq.reset(drv, m, on=False)
         rq.poll_done(drv, m, q, prog, timeout=batch_timeout(period))
         rq.reset(drv, m, on=True)
@@ -779,162 +692,165 @@ def test_readout_drive_length_reaches_the_dac(cosim):
         assert got == want, f"wrote dur={want}, the readout DAC played {got} batches"
 
 
-@pytest.mark.cosim
-def test_multiqubit_both_cores_recover(cosim):
-    """spec 13 Q5 — the load-bearing deliverable: a calibration takes `qubits=[0, 1]`, compiles one
-    program per core and issues ONE run, and the host fits each core. Simultaneous readout is a
-    DIFFERENT measurement from serial (spec §8): on this build cores 0 and 1 share the readout DAC/ADC
-    (ro_dac=14 / adc_of=0), so the two readouts are frequency multiplexed — the models emit at demod
-    codes 2048 / 1024 and their tones SUM on ADC 0 (MultiModel), each core's demod integrating out its
-    own. We plant a DIFFERENT Rabi rate on each core and require BOTH to recover in the one run (the
-    Rabi-rate cosine is robust to the residual crosstalk / halved per-tone amplitude of the summed
-    readout, where an exp-decay T1 fit is not)."""
-    drv, m = cosim
-    ro = {0: _readout_freq(m), 1: units.demod_code_to_freq(1024, m.params)}   # codes 2048 / 1024
-    code = {0: 2048, 1: 1024}
-    sig_max = _sig_max(m, F_GE)
-    planted = {0: float(4 * math.pi / sig_max), 1: float(6 * math.pi / sig_max)}   # ~2 / 3 periods
-    cfg = Config()
-    for q in (0, 1):
-        cfg[f"qubit/{q}/freq"] = F_GE
-        cfg[f"qubit/{q}/x90/amp"] = 0.5
-        cfg[f"qubit/{q}/T1"] = _s(120, m)
-        cfg[f"readout/{q}/freq"] = float(ro[q])
-        cfg[f"readout/{q}/amp"] = 0.5
-        cfg[f"readout/{q}/dur"] = _s(56, m)               # drive covers the demod window + SEP
-        cfg[f"readout/{q}/demod/dur"] = _s(40, m)
-    cfg["reset/relax"] = _s(RO_RELAX, m)                  # relax ≫ T1 resets both cores each grid slot
-
-    def model(rabis, seeds):
-        """A summed two-qubit model: core q's tone at demod code `code[q]`, readout_amp halved so the
-        two frequency-multiplexed tones sum inside the converter range."""
-        sub = [{**_model(rabis[q], t1=RO_T1, t2=3000, noise=300.0, seed=seeds[q], collapse=True,
-                          readout_amp=14000.0), "core": q, "readout_code": code[q]} for q in (0, 1)]
-        return {"kind": "multi", "models": sub}
-
-    # 1) fix each core's demod discrimination phase on a PREP-CALIBRATED model (X90·X90 = π gives clean
-    #    |1> clusters); the phase is rabi-independent (readout_phase pinned 0) so it serves step 2. ONE run
-    drv.sim.set_model(model({0: _rabi_pi(m), 1: _rabi_pi(m)}, {0: 21, 1: 22}))
-    rc = ReadoutCalibration(cfg, [0, 1], shots=24).run(drv)
-    assert rc.ok, f"clusters did not separate: {[rc.data[q]['separation'] for q in (0, 1)]}"
-    rc.apply()                                            # writes BOTH cores' demod phase + res-sign
-
-    # 2) recover BOTH cores' (different) Rabi rates in ONE run
-    drv.sim.set_model(model(planted, {0: 31, 1: 32}))
-    r = Amplitude(cfg, [0, 1], n_gates=1, points=13, shots=48).run(drv)
-    got = {q: r.proposal[f"qubit/{q}/rabi"] for q in (0, 1)}
-    print(f"\n[multi-q] planted Rabi {planted} recovered {got} "
-          f"ratios={ {q: got[q] / planted[q] for q in (0, 1)} }")
-    assert r.ok
-    assert set(r.data) == {0, 1}, "one run must return BOTH cores' data"
-    for q in (0, 1):
-        assert abs(got[q] / planted[q] - 1) < 0.08, \
-            f"core {q}: recovered Rabi {got[q]:.4e} vs planted {planted[q]:.4e}"
+def _dac_windows(t0, cap):
+    """The (start, end) absolute batch stamps of each contiguous run of nonzero DAC output."""
+    on = np.flatnonzero(cap.any(axis=1))
+    if not on.size:
+        return []
+    cuts = np.flatnonzero(np.diff(on) > 1)
+    return [(int(t0 + r[0]), int(t0 + r[-1] + 1)) for r in np.split(on, cuts + 1)]
 
 
-# ── §8 heralding: a pre-sequence herald read post-selects |0> (spec 13 Q5 Part C) ──
+# ── §8 heralding: the two-window grid geometry, on the converters ──
+#
+# A `readout/herald` run inserts a readout BEFORE the sequence and post-selects on it finding the
+# qubit in |0>. The read HALTS the core, so the drive scheduled right after it needs the same
+# scheduling lead a normal shot has, or it posts too late and DROPS — the qubit never rotates and
+# every point reads |0>. `herald_offset` is derived to give exactly that:
+#
+#     hoff = seq + delay + READOUT_LEAD + 2·SEP
+#         ⇒ (t_ro − SEP − seq) − (t_h + delay + READOUT_LEAD) == SEP
+#
+# which is a statement about WHEN pulses leave the converters, so that is where it is asserted.
+# The other half of the old three tests — the (count, kept) decode and its denominator — is
+# host-pure in test_cal_host, one test per kernel.
+#
+# ONE test PER KERNEL. k_rabi, k_ro_amp and k_phase each carry their own copy of the same four-line
+# herald block, differing only in the sequence they bracket, and three copies of four lines is
+# exactly how a copy-paste divergence survives — which is the failure this geometry catches.
 
-@pytest.mark.cosim
-def test_heralding_matches_unheralded_on_clean_qubit(cosim, demod_phase):
-    """A `readout/herald` counts run inserts a readout BEFORE the sequence and only counts shots that
-    found the qubit in |0> (`P = count/kept`, spec 13 §8). On a clean qubit (relax ≫ T1 resets to |0>)
-    the herald passes every shot, so the heralded Rabi curve and its recovered rate MATCH the
-    unheralded ones — proving the two-window grid timing, the runtime `if h==0` gate, and the
-    (count, kept) denominator all agree with count/shots. (The herald=off path is byte-identical C —
-    every other cosim test runs it — so this only has to check the herald=on path lands on the same
-    answer.)"""
-    drv, m = cosim
-    rabi = float(3 * math.pi / _sig_max(m, F_GE))
-    drv.sim.set_model(_model(rabi, t1=RO_T1, t2=3000, noise=300.0, seed=11, collapse=True))
-    cfg = _cfg(m, F_GE, relax=RO_RELAX)
-    cfg["readout/0/demod/phase"] = demod_phase
+# The capture is armed before the reset release, so it pays for the core's boot as well as the
+# shot. Measured: ~2 000 batches of boot + preamble before k_rabi reads `now()`, then one heralded
+# grid period (<= 350) and the 56-batch measurement drive. At 2 000 the capture ended between the
+# two windows, which reads as a dropped drive — a confusing way to fail, so leave the margin.
+HERALD_NCAP = 3200
 
-    cfg["readout/herald"] = False
-    off = Amplitude(cfg, 0, n_gates=1, points=9, shots=64).run(drv)
+
+def _herald_cfg(m):
+    """The heralded L1 config: model off, relax head at its floor (it is not the subject here)."""
+    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=8)
     cfg["readout/herald"] = True
-    on = Amplitude(cfg, 0, n_gates=1, points=9, shots=64).run(drv)
+    return cfg
 
-    assert off.ok and on.ok, "both the heralded and unheralded Rabi must FIT (a corrupt curve wouldn't)"
-    print(f"\n[herald] off P={np.round(off.data[0]['y'], 3).tolist()}"
-          f"\n  on  P={np.round(on.data[0]['y'], 3).tolist()}")
-    # THE spec gate (§8): heralded and unheralded POPULATIONS agree — on a clean qubit the herald
-    # passes every shot, so P = count/kept equals count/shots (which also proves kept == shots: a wrong
-    # denominator would scale P away). off and on are independent noise realisations (heralding also
-    # consumes RNG draws), so compare at ~3σ of the 64-shot noise — loose enough to never flake, tight
-    # enough to catch the drive dropping (that bug, a too-short herald offset, read a flat P≈0, ~0.8 off).
-    # We compare the curves, NOT the fitted Rabi rate: a 9-point cosine can mis-seed to a harmonic.
-    assert np.allclose(off.data[0]["y"], on.data[0]["y"], atol=0.2), \
-        "heralded and unheralded populations must agree (herald passes every clean-|0> shot)"
+
+def _assert_herald_geometry(cosim, prog, params, period, seqlen, ddly, drive, hoff, label):
+    """Play ONE heralded shot with the model off and pin the two-window grid on both converters:
+    two readout-drive windows exactly `hoff` apart, the `seqlen`-batch gate train between them, a
+    full SEP of scheduling lead after the herald window closes, and a clean SEP before the
+    measurement opens."""
+    drv, m = cosim
+    q = 0
+    drv.sim.set_model({"kind": "zero"})            # the DACs carry only this core's own drive
+    rq.setup(drv, m, {q: prog})
+    caps = {d: drv.sim.dac_capture_arm(d, HERALD_NCAP) for d in (m.gate_dac(q), m.ro_dac(q))}
+    rq.rerun(drv, m, {q: prog}, params={q: params}, results=["out"],
+             timeout=batch_timeout(period))
+    ro_win = _dac_windows(*drv.sim.dac_capture_get(caps[m.ro_dac(q)]))
+    gate_win = _dac_windows(*drv.sim.dac_capture_get(caps[m.gate_dac(q)]))
+    print(f"\n[herald {label}] hoff={hoff} seq={seqlen} drive={drive} ddly={ddly} "
+          f"ro={ro_win} gate={gate_win}")
+
+    assert len(ro_win) == 2, f"{label}: a heralded shot plays TWO readout windows, the DAC shows {ro_win}"
+    (h_start, h_end), (m_start, _) = ro_win
+    assert h_end - h_start == drive and m_start - h_start == hoff, \
+        f"{label}: the herald read is not one full drive `hoff` before the measurement: {ro_win}"
+    assert len(gate_win) == 1 and gate_win[0][1] - gate_win[0][0] == seqlen, \
+        f"{label}: the sequence did not reach the gate DAC as one {seqlen}-batch train: {gate_win}"
+    g_start, g_end = gate_win[0]
+    assert g_start - (h_start + ddly + READOUT_LEAD) == SEP, \
+        f"{label}: the drive gets no full scheduling lead after the herald read (the drive-drop trap)"
+    assert m_start - g_end == SEP, \
+        f"{label}: the sequence does not end a clean SEP before the measurement"
 
 
 @pytest.mark.cosim
-def test_heralded_readout_fidelity_matches_unheralded(cosim, demod_phase):
-    """The same herald fold in k_ro_amp (spec 13 §8): qcal's transpiler post-selects EVERY circuit,
-    the Fidelity/ReadoutFidelity confusion circuits included. On a clean |0> qubit (relax ≫ T1) the
-    pre-prep herald passes every shot, so the heralded confusion diagonal must MATCH the unheralded
-    one — which also proves the (count, kept) denominator (kept == shots: a wrong denominator scales
-    the populations away) and the two-window grid timing (a dropped prep drive would read P(1|1)≈0,
-    diagonal ≈ 0.5)."""
-    drv, m = cosim
-    drv.sim.set_model(_model(_rabi_pi(m), t1=RO_T1, t2=3000, noise=300.0, seed=18, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.495, relax=RO_RELAX)
-    cfg["readout/0/demod/phase"] = demod_phase
-    cfg["readout/herald"] = False
-    off = ReadoutFidelity(cfg, 0, shots=32).run(drv)
-    cfg["readout/herald"] = True
-    on = ReadoutFidelity(cfg, 0, shots=32).run(drv)
-    d_off, d_on = np.diag(off.data[0]["confusion"]), np.diag(on.data[0]["confusion"])
-    print(f"\n[herald-rof] off diag={np.round(d_off, 3).tolist()} "
-          f"on diag={np.round(d_on, 3).tolist()}")
-    assert on.data[0]["fidelity"] > 0.75 and off.data[0]["fidelity"] > 0.75
-    assert np.allclose(d_on, d_off, atol=0.15), \
-        "heralded and unheralded confusion diagonals must agree on a clean |0> qubit"
+def test_herald_grid_geometry_k_rabi(cosim):
+    """L1 (spec 13 §8) — the herald geometry of **k_rabi**, the gate-amplitude sweep's kernel
+    (Amplitude / the heralded Rabi curve). At `ngates = 1` the swept train is a single X90, so the
+    bracketed sequence — and `herald_offset`'s argument — is one gate long."""
+    _, m = cosim
+    q = 0
+    cfg = _herald_cfg(m)
+    table, pg, _ = prep(cfg, q, m, "X90")
+    ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+    d = table.pulses["x90"].dur_batches(m, table.channel)
+    seqlen = d                                     # ngates = 1: the paced train IS one gate
+    period = grid_period(relax_batches(cfg, m), seqlen, dur, ddly, herald=True)
+    hoff = herald_offset(seqlen, ddly)
+    prog = compile_kernel(kernels.k_rabi, m, tables=dict(gate=table, ro=ro, demod=demod),
+                          out=Array(2), npts=1, shots=1, period=period, ngates=1,
+                          step=train_step(d), code=code, mode=kernels.COUNTS, ddly=ddly,
+                          prep_gate=pg, herald=1, hoff=hoff, **x90_vz(cfg, q))
+    params = {"a0q": units._amp_code(0.495) << 16, "daq": 0, "prep": 1}
+    _assert_herald_geometry(cosim, prog, params, period, seqlen, ddly,
+                            batches(cfg[f"readout/{q}/dur"], m), hoff, "k_rabi")
 
 
 @pytest.mark.cosim
-def test_heralded_phase_matches_unheralded(cosim, demod_phase):
-    """The same herald fold in k_phase (spec 13 §8): qcal post-selects both Phase sequences. On a
-    clean |0> qubit the heralded and unheralded line crossings agree within the fit error (no Stark
-    planted, so both recover ≈ 0). A broken herald shape (the drive-drop trap, a wrong (count, kept)
-    decode) flattens or scrambles the two lines — the crossing leaves the swept range (ok=False) or
-    lands far from the unheralded one."""
-    drv, m = cosim
-    rabi = float((math.pi / 2) / gate_sigma(m, Pulse(GATE_ENV, freq_hz=F_GE, amp=0.5),
-                                            F_GE, units._amp_code(0.5)))
-    drv.sim.set_model(_model(rabi, t1=RO_T1, t2=3000, noise=300.0, seed=19, collapse=True))
-    cfg = _cfg(m, F_GE, x90_amp=0.5, relax=RO_RELAX)
-    cfg["readout/0/demod/phase"] = demod_phase
-    cfg["readout/herald"] = False
-    off = Phase(cfg, 0, points=7, span=0.3, shots=32).run(drv)
-    cfg["readout/herald"] = True
-    on = Phase(cfg, 0, points=7, span=0.3, shots=32).run(drv)
-    assert off.ok and on.ok
-    v_off, v_on = off.proposal["qubit/0/x90/vz"][0], on.proposal["qubit/0/x90/vz"][0]
-    print(f"\n[herald-phase] off={v_off:+.4f} on={v_on:+.4f}"
-          f"\n  off P(Y180_X90)={np.round(off.data[0]['p0'], 3).tolist()}"
-          f"\n  on  P(Y180_X90)={np.round(on.data[0]['p0'], 3).tolist()}")
-    # 3σ of the crossing difference under binomial noise at 7×32 shots/sequence with ~±0.45 slopes
-    # (σ ≈ 0.075/run, √2 for two independent runs) — loose enough not to flake, tight enough that a
-    # dropped drive or a scaled denominator (both send the crossing wild or out of range) fails.
-    assert abs(v_on - v_off) < 0.3, \
-        "heralded and unheralded Phase crossings must agree on a clean |0> qubit"
+def test_herald_grid_geometry_k_ro_amp(cosim):
+    """L1 (spec 13 §8) — the herald geometry of **k_ro_amp**, the readout-drive sweep's kernel
+    (Fidelity / ReadoutFidelity / Window). qcal's transpiler post-selects EVERY circuit, the
+    confusion circuits included, and here the bracketed sequence is the |1> prep itself: X90 · X90,
+    contiguous through B0's startTime auto-advance. Built by the production `_ro_amp_prog`."""
+    _, m = cosim
+    q = 0
+    cfg = _herald_cfg(m)
+    a = units._amp_code(float(cfg[f"readout/{q}/amp"]))
+    prog, period = _ro_amp_prog(m, cfg, q, "X90", 1, 1, a << 16, 0)
+    _, _, _, _, ddly = readout_tables(cfg, q, m)
+    _, _, seqlen = prep(cfg, q, m, "X90")          # the |1> prep's length: hoff's own argument
+    _assert_herald_geometry(cosim, prog, {"prep": 1}, period, seqlen, ddly,
+                            batches(cfg[f"readout/{q}/dur"], m),
+                            herald_offset(seqlen, ddly), "k_ro_amp")
+
+
+@pytest.mark.cosim
+def test_herald_grid_geometry_k_phase(cosim):
+    """L1 (spec 13 §8) — the herald geometry of **k_phase**, the virtual-Z calibration's kernel.
+    Its bracketed sequence is the longest of the three: qcal's three back-to-back X90s (here the
+    Y180_X90 fold), so `hoff` has to grow with it — which is the whole reason `seq` is an argument
+    of `herald_offset` and not a constant."""
+    _, m = cosim
+    q = 0
+    cfg = _herald_cfg(m)
+    gate = ParamTable(GATE_CH, F_GE, {"x90": gate_pulse(cfg, q, m)})
+    ro, demod, code, dur, ddly = readout_tables(cfg, q, m)
+    seqlen = 3 * gate.pulses["x90"].dur_batches(m, gate.channel)      # three back-to-back X90s
+    period = grid_period(relax_batches(cfg, m), seqlen, dur, ddly, herald=True)
+    hoff = herald_offset(seqlen, ddly)
+    prog = compile_kernel(kernels.k_phase, m, tables=dict(gate=gate, ro=ro, demod=demod),
+                          out=Array(2), npts=1, shots=1, period=period, code=code, ddly=ddly,
+                          seq=kernels.Y180_X90, hpi=pack16(units._phase_code(math.pi / 2)),
+                          vz0=0, vzsum=0, herald=1, hoff=hoff)
+    _assert_herald_geometry(cosim, prog, {"p0": pack16(0), "dp": pack16(0)}, period, seqlen, ddly,
+                            batches(cfg[f"readout/{q}/dur"], m), hoff, "k_phase")
 
 
 # ── §7 cost accounting: a batched cal is O(1) client seam ops in one run ──
 
 @pytest.mark.cosim
 def test_cost_accounting_amplitude(cosim):
-    """spec 08 §7: a batched Amplitude cal costs O(1) client seam ops in ONE run (a few block writes
-    in, one poll, one block read out) — not the ~50k of the old one-run-per-point host loop. The op
-    count is independent of npts×shots (block writes/reads move O(n) bytes in O(1) ops), so this tiny
-    5×8 sweep counts the same as a full 21×160 one. CountingDriver wraps the 4 seam ops (spec 08 B3)."""
+    """L1 (spec 08 §7) — a batched Amplitude cal costs O(1) client seam ops in ONE run (a few block
+    writes in, one poll, one block read out), not the ~50k of the old one-run-per-point host loop.
+    The op count is independent of npts×shots (block writes/reads move O(n) bytes in O(1) ops), so
+    this tiny 5×4 sweep counts the same as a full 21×160 one. CountingDriver wraps the 4 seam ops
+    (spec 08 B3).
+
+    Model OFF and the grid sized for COST, not physics: an op count does not care what the counts
+    are, so the 1600-batch relax head and the 40-batch window the physics tests need are pure
+    overhead here. `shots` is 4 rather than the original 8 because the floor is not the sweep — the
+    k_rabi image load alone is ~11.5 k simulated batches and the rerun another ~2.7 k, so 40 shots
+    on the shortest legal grid (period 168) cannot fit under the 20 k cap
+    (specs/software-test-refactor/02 §1). Nothing in the claim depends on the count: 20 shots is
+    still a batched sweep, and the size-INDEPENDENCE itself is owned by
+    test_rerun.py::test_rerun_op_budget_size_independent, which compares two sizes on purpose."""
     from test_rerun import CountingDriver
     drv, m = cosim
-    drv.sim.set_model(_model(_rabi_pi(m), t1=200, t2=2000, noise=300.0, seed=12, collapse=True))
-    cfg = _cfg(m, F_GE)
+    drv.sim.set_model({"kind": "zero"})
+    cfg = _cfg(m, F_GE, dur=8, drive=24, relax=8)
     cfg["readout/0/demod/phase"] = math.pi / 2          # any phase; the op count is physics-independent
     cd = CountingDriver(drv)
-    Amplitude(cfg, 0, n_gates=1, points=5, shots=8).run(cd)
+    Amplitude(cfg, 0, n_gates=1, points=5, shots=4).run(cd)
     print(f"\n[cost] one batched Amplitude cal = {cd.ops} client seam ops in 1 run "
           f"(setup+rerun; the rerun batch alone is 10 seam ops — test_rerun.py, B3)")
     assert cd.ops < 60, f"batched Amplitude cost {cd.ops} ops (expected O(1), a few dozen), not ~50k"
@@ -943,6 +859,7 @@ def test_cost_accounting_amplitude(cosim):
 # ── the Calibration_X6Y3 sequence improves a deliberately-detuned Config ──
 
 @pytest.mark.cosim
+@pytest.mark.slow
 def test_x6y3_improves_detuned_config(cosim):
     """spec 13 Q6 — the payoff: calibration_x6y3 IS the notebook, driven through the qcal adapter. The
     config is loaded from a co-sim-scaled qcal tree by Config.from_qcal (the parity path — not a

@@ -235,7 +235,8 @@ class Result:
     dicts keyed by the qubit label (`data[q]["x"]`, `fit[q]`) — a cal runs every requested qubit
     simultaneously in one run; a single-qubit cal is just the one-key case. `proposal` is a single
     merged `{config path → value}` dict (the paths already carry `q`, so there is no collision).
-    `.apply()` writes EVERY proposal into the Config; `.plot()` draws one qubit's sweep (or all)."""
+    `oks` is the per-qubit verdict (`ok` = all of them); `.apply()` writes the passing qubits'
+    proposals; `.plot()` draws one qubit's sweep (or all)."""
 
     ok: bool
     data: dict
@@ -243,12 +244,18 @@ class Result:
     proposal: dict = field(default_factory=dict)
     cfg: object = None
     label: str = ""
+    oks: dict = field(default_factory=dict)   # per-qubit ok; empty = one all-qubit verdict (legacy)
 
     def apply(self):
-        if not self.ok:
+        """Write the proposal into the Config. With per-qubit `oks`, a failed qubit's paths are
+        skipped and the rest still apply (qcal writes per qubit too — one drifted resonator must not
+        veto the other seven); it refuses outright only when NO qubit passed."""
+        good = {str(q) for q, v in self.oks.items() if v}
+        if not self.ok and not good:
             raise RuntimeError(f"{self.label}: fit failed, refusing to update config")
         for path, value in self.proposal.items():
-            self.cfg[path] = value
+            if self.ok or path.split("/")[1] in good:
+                self.cfg[path] = value
         return self.cfg
 
     def plot(self, ax=None, q=None):
@@ -320,6 +327,21 @@ def x90_vz(cfg, q: int) -> dict:
     v0, v1 = cfg.get(f"qubit/{q}/x90/vz", [0.0, 0.0])
     c0, c1 = units._phase_code(float(v0)), units._phase_code(float(v1))
     return {"vz0": pack16(c0), "vzsum": pack16(c0 + c1)}
+
+
+def ef_vz(cfg, q: int, name: str = "x90") -> dict:
+    """The EF gate's own virtual-Z frame bracket — `x90_vz`'s EF twin (spec 14 §3 finding 6), bound as
+    `evz0`/`evzsum` so an EF kernel can carry BOTH brackets at once (the GE prep's vz0/vzsum and this
+    one) without the names colliding: `compile_kernel(..., **x90_vz(cfg, q), **ef_vz(cfg, q))`.
+
+    qcal's EF X90 is the same virtualz(vz0) · FAST_DRAG · virtualz(vz1) triplet as the GE one — the
+    pair `qubit/{q}/EF/{name}/vz` that `EFPhase` calibrates — so every EF gate in its EF
+    Amplitude/Frequency/Phase circuits plays it, and the config of record carries a non-trivial pair
+    on all 8 qubits (q2 −0.163 rad, q6 −0.133). The EF X is a bare FAST_DRAG with no pair, so
+    `name='x'` finds no key and folds to a no-op — as does every co-sim config."""
+    v0, v1 = cfg.get(f"qubit/{q}/EF/{name}/vz", [0.0, 0.0])
+    c0, c1 = units._phase_code(float(v0)), units._phase_code(float(v1))
+    return {"evz0": pack16(c0), "evzsum": pack16(c0 + c1)}
 
 
 # ── EF-subspace gate table (spec two-qubit/01 §4.1) ──

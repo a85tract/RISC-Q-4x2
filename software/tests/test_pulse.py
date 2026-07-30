@@ -45,7 +45,12 @@ int main(void) {
 }
 """
 
-N_CAPTURE = 3200   # batches from arm (pre-release): covers boot (~1k) + LEAD + dur + slack
+# Captures are SIZED, not generous (01 §3.3): `dac_capture_get` BLOCKS until the armed window is
+# full, so every armed batch past the pulse is simulated for nothing. From arm (pre-release) the
+# window has to cover boot + preamble + the scheduled lead — MEASURED at index 482 for the default
+# LEAD — plus the longest `dur` in this file (64 batches, the VNA tone). 1000 leaves ~450 batches
+# of margin and still checks ~900 batches of DAC silence around the one window.
+N_CAPTURE = 1000
 
 # Same fire as PULSE_SRC, but through the new pulse-table op: init_pulse_params programs slot 0
 # from a host-filled `struct rq_slot[]` (spec 02 §3.2) instead of individual set_* calls. tbl is
@@ -67,26 +72,60 @@ int main(void) {
 """
 
 
+_PROGS: dict[str, Program] = {}     # each source compiled once
+_RESIDENT: dict[int, str] = {}      # driver -> the C source currently loaded on core 0
+_ENV: dict[tuple[int, int], bytes] = {}   # (driver, channel) -> the lines currently at env line 0
+
+
+def _upload_env(drv, m, channel, lines):
+    """Put `lines` at envelope line 0 of core 0's `channel` — skipping the write when they are
+    already there. A 64-line gate envelope is a 256-word block write ≈ 5.6k simulated batches, so
+    re-uploading an identical envelope per trial is this file's second cost after the image load.
+    """
+    key = (id(drv), channel)
+    blob = np.ascontiguousarray(lines, dtype="<u4").tobytes()
+    if _ENV.get(key) != blob:
+        rq.write_envelope(drv, m, 0, channel, 0, lines)
+        _ENV[key] = blob
+
+
+def _load(drv, m, src):
+    """Compile `src` (once) and make sure it is the image resident on core 0, leaving reset held.
+
+    An image is not altered by a run and every RQ_PARAM global is rewritten before each trial, so
+    re-loading it per trial buys nothing and costs ~7k simulated batches — which was this file's
+    dominant cost (01 §3.3). `check_magic` still runs on every call, so a stale cache (some other
+    file having loaded over core 0) fails loudly rather than running the wrong image.
+    """
+    prog = _PROGS.get(src)
+    if prog is None:
+        prog = _PROGS[src] = Program.from_image(compile_c(src, m))
+    rq.reset(drv, m, on=True)
+    if _RESIDENT.get(id(drv)) != src:
+        rq.load_program(drv, m, 0, prog.image)
+        for core in range(1, m.params.qubit_num):
+            rq.park_core(drv, m, core)
+        _RESIDENT[id(drv)] = src
+    rq.check_magic(drv, m, 0, prog)
+    return prog
+
+
 def _play(cosim, channel, lines, freq_code, amp_code, phase_code, lead=None,
           n_capture=N_CAPTURE):
-    """Load PULSE_SRC on core 0, upload `lines` at envelope line 0, arm a full-boot DAC
+    """Make PULSE_SRC resident on core 0, upload `lines` at envelope line 0, arm a full-boot DAC
     capture, run, and return (t_fire, t0, samples) for the channel's DAC. `channel` is the
     logical RF channel index (0 gate / 1 ro)."""
     drv, m = cosim
-    prog = Program.from_image(compile_c(PULSE_SRC, m))
+    prog = _load(drv, m, PULSE_SRC)
     dur = len(lines)
-    rq.reset(drv, m, on=True)
-    rq.load_program(drv, m, 0, prog.image)
-    rq.check_magic(drv, m, 0, prog)
-    for core in range(1, m.params.qubit_num):
-        rq.park_core(drv, m, core)
-    rq.write_envelope(drv, m, 0, channel, 0, lines)
-    # packed fields arrive pre-seated in data[31:16] (spec 12); ch_sel/lead are plain
+    _upload_env(drv, m, channel, lines)
+    # packed fields arrive pre-seated in data[31:16] (spec 12); ch_sel/lead are plain.
+    # `lead` is written on EVERY trial: the image is resident across trials, so an omitted param
+    # would inherit the previous trial's value rather than the source's RQ_LEAD initialiser.
     params = {"ch_sel": channel, "freq_code": pack16(freq_code),
               "amp_code": pack16(amp_code), "phase_code": pack16(phase_code),
-              "env_line": pack16(0), "dur": pack16(dur)}
-    if lead is not None:
-        params["lead"] = lead
+              "env_line": pack16(0), "dur": pack16(dur),
+              "lead": m.LEAD if lead is None else lead}
     rq.write_params(drv, m, 0, prog, params)
     dac = m.gate_dac(0) if channel == 0 else m.ro_dac(0)
     handle = drv.sim.dac_capture_arm(dac, n_capture)
@@ -155,13 +194,8 @@ def test_init_pulse_params_dac_window(cosim):
     f, a, ph = p.freq_code(m), p.amp_code(), p.phase_code()
     dur = len(lines)
 
-    prog = Program.from_image(compile_c(INIT_PARAMS_SRC, m))
-    rq.reset(drv, m, on=True)
-    rq.load_program(drv, m, 0, prog.image)
-    rq.check_magic(drv, m, 0, prog)
-    for core in range(1, m.params.qubit_num):
-        rq.park_core(drv, m, core)
-    rq.write_envelope(drv, m, 0, 0, 0, lines)   # core 0, gate channel, line 0
+    prog = _load(drv, m, INIT_PARAMS_SRC)
+    _upload_env(drv, m, 0, lines)               # core 0, gate channel, line 0
     rq.write_var(drv, m, 0, prog, "freq_code", pack16(f))
     base = prog.var_addr("tbl")                          # fill tbl[0] = {phase, amp, env, dur}
     for off, val in ((0, ph), (4, a), (8, 0), (12, dur)):   # seated like load_tables (spec 12)
@@ -258,6 +292,7 @@ def test_allocator_upload(cosim):
         for line0, lines in alloc.image():
             rq.write_envelope(drv, m, 0, channel, line0, lines)             # upload accepted (in-range)
         assert lb == len(pack_env(envelopes.gaussian(32, 3.0), spl))
+    _ENV.clear()        # this wrote over envelope line 0 on both channels: nothing cached is valid
 
 
 def test_timed_capture_start_batch(cosim):
@@ -269,6 +304,7 @@ def test_timed_capture_start_batch(cosim):
     rq.reset(drv, m, on=True)
     for core in range(m.params.qubit_num):
         rq.park_core(drv, m, core)
+    _RESIDENT.clear()          # the park word overwrote core 0's reset vector: no image is resident
     rq.reset(drv, m, on=False)
     drv.sim.advance(200)                                # batch time is running
     start = drv.sim.batch_time() + 2000                 # a target comfortably in the future

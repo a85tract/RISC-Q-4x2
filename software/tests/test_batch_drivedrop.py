@@ -57,7 +57,10 @@ def k_one(gate: ParamTable, out: Array):
     wait_until(t + gate["p"].dur + 8)  # noqa: F821
 
 
-_N_CAPTURE = 3200   # covers boot (~1k) + LEAD + dur + slack
+# Sized, not generous (01 §3.3): `dac_capture_get` blocks until the armed window is full. The fresh
+# pulse lands at capture index ~480 (boot + preamble + LEAD, measured), is 16 batches long, and the
+# program exits straight after — so 1000 covers it with ~500 batches of margin, and 3 captures.
+_N_CAPTURE = 1000
 
 
 def _burst(drv, m, drain: int, n=6, step=300, span=2000):
@@ -97,7 +100,13 @@ def _window_present(m, t_fire, t0, cap):
     return bool(cap[idx:idx + dur].any()) and np.array_equal(cap[idx:idx + dur], gold)
 
 
+@pytest.mark.batch_cap(42_000)
 def test_drive_survives_prior_multipulse_batch(cosim):
+    """FLOOR: ~40 k = FIVE core-0 program images (3 × `k_one` + 2 × `k_burst`, ~6.6 k each over AXI)
+    plus the drained burst's own ~3.6 k wait. The claim is about queue state carried ACROSS run
+    boundaries, and the discriminator needs three stages (fresh / after a drained burst / after an
+    un-drained one) with a different program on core 0 between each — so every image load is part
+    of the claim, and only the DAC captures (3 × 1000 batches) were free to size."""
     drv, m = cosim
 
     # 1. baseline: a fresh run with no prior batch plays its drive (sanity).

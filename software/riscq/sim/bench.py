@@ -291,6 +291,9 @@ class DriverServer:
     def set_model(self, spec):
         return self._submit("set_model", dict(spec))
 
+    def model_state(self):
+        return self._submit("model_state")
+
     def get_params(self):
         return self._params
 
@@ -389,6 +392,8 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
     if op == "set_model":
         st.model = models.build_model(dict(args[0]), st.m)
         return None
+    if op == "model_state":
+        return st.model.ground_truth()
     if op == "advance":
         await ClockCycles(dut.clk, args[0])
         return None

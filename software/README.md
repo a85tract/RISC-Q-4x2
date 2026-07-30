@@ -37,3 +37,36 @@ riscq-board-server [--bits ~/riscq-bits] [--bundle <name>] [--host 0.0.0.0] [--p
 Gateware reaches the board as a **bundle** (`top.xsa` + `params.json` + optional `board.json`)
 uploaded over the same Pyro5 connection — `riscq.driver.remote.upload_bundle(drv, name, ...)`,
 then `drv.board.load(name)`. See [specs/software/10-hardware-driver.md](../specs/software/10-hardware-driver.md).
+
+## Tests
+
+```bash
+PYTHONPATH=. pytest tests/ -q                 # host-pure only — seconds
+PYTHONPATH=. pytest tests/ --cosim -q         # + the verilator co-sim tier — minutes
+PYTHONPATH=. pytest tests/ --cosim --slow -q  # + the full-loop anchors — ~20 min extra
+```
+
+Tests are organised in **tiers**, chosen by what a test asserts rather than by what it imports.
+Design of record: [specs/software-test-refactor/](../specs/software-test-refactor/README.md).
+
+| Tier | Runs under | Asserts | Mechanism |
+|---|---|---|---|
+| **L0** host-pure | always | fits, config, packing, IR/C, model physics, **calibration convergence** | the `responder` fixture — the real cal class against an analytic population model, with only `riscq.run`'s four entry points replaced (`tests/responder.py`) |
+| **L1** model off | `--cosim` | *does the kernel emit the right samples on the right converter at the right batch?* | `drv.sim.dac_capture_arm/get` against `ZeroModel` |
+| **L2** state probe | `--cosim` | *does the emitted signal put the qubit where the gate intends?* | `tests/probe.py` — 1 shot, no noise, `drv.sim.model_state()` or a soft readout |
+| **L3** full loop | `--slow` | the whole chain end to end, with real shots, noise and fits | plain co-sim; the regression net for the tiers above |
+
+Why a co-sim test is expensive: the RTL runs at ~7 000 dspClk batches/s (11 500 with the ADC model
+off) and a batched sweep costs `points × shots × grid_period` batches, most of it an idle T1-relax
+head. Two facts make the fast tiers possible — `set_model` **rebuilds** the model, so resetting the
+qubit to |0⟩ costs *zero* simulated cycles; and in soft (`collapse=False`) mode the readout tone is
+`readout_amp · ⟨σz⟩`, a continuous signed function of the state, so **one shot is an exact
+measurement**.
+
+Every co-sim run prints a per-test **simulated-batch** table — the machine-independent cost unit.
+`--batch-cap N` fails a test that overruns (budget: 20 000/test; `--slow` anchors are exempt).
+
+Writing a new test: pick the tier from what you are asserting, and make the expected value
+**analytic** — never another run of the same model, which tests nothing. `probe.rabi_for()` plants
+the rate that makes a pulse an exact rotation. Never hand-write an amplitude code:
+`units.AMP_SCALE` is 19896, not 2**15.

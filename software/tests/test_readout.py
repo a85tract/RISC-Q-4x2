@@ -109,15 +109,21 @@ def _read_once(cosim, spec, code, dur):
     return int(out[0]), int(out[1]), int(out[2])
 
 
-def _mag(cosim, code, dur):
-    """Run one readout at demod `code`; return the integrated |z| (float)."""
-    _, r, i = _read_once(cosim, {"kind": "tone", "adc": cosim[1].adc_of(0),
-                                 "freq_hz": units.code_to_freq(F, cosim[1].params), "amp": RO_AMP},
-                         code, dur)
+def _mags(cosim, spec, codes, dur):
+    """The integrated |z| of one readout per demod `code`, from a SINGLE loaded image.
 
-    def s32(x):
-        return x - (1 << 32) if x >= (1 << 31) else x
-    return math.hypot(s32(r), s32(i))
+    `code` is left unbound at compile time, so it is a runtime param and the host-orchestrated
+    sweep is one `setup` plus one `rerun` per point instead of a full `run` — which reloads the
+    image — per point: ~8.4k simulated batches a point down to ~2k (01 §4.5). Each point is still
+    its own fixed-frequency readout with the demod carrier set up and played once, which is what
+    the sweep is asserting."""
+    drv, m = cosim
+    drv.sim.set_model(spec)
+    prog = compile_kernel(k_read_once, m, tables=dict(demod=demod_table(dur)), out=Array(3))
+    rq.setup(drv, m, {0: prog})
+    out = [rq.rerun(drv, m, {0: prog}, params={0: {"code": pack16(code)}},
+                    timeout=1_000_000)[0]["out"] for code in codes]
+    return np.array([math.hypot(int(o[1]), int(o[2])) for o in out])
 
 
 @pytest.fixture(scope="module")
@@ -155,7 +161,7 @@ def test_readout_integrator_golden(cosim):
     # A VNA point changes the demod carrier frequency, so each is a separate fixed-freq readout (the
     # demod carrier is set up + played once per shot) — the host orchestrates the sweep.
     codes = [F, 2 * F, 4 * F, 6 * F, 8 * F, 16 * F]
-    mags = np.array([_mag(cosim, code, dur) for code in codes])
+    mags = _mags(cosim, {"kind": "tone", "adc": m.adc_of(0), "freq_hz": f_hz, "amp": amp}, codes, dur)
     peak = int(np.argmax(mags))
     print(f"\n[golden] codes={codes} |z|={mags.astype(int).tolist()} peak@{codes[peak]}")
 

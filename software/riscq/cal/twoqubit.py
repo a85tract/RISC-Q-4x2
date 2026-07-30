@@ -898,17 +898,22 @@ def _branch_correction(off0: float, off1: float) -> float:
 
     Derivation on OUR sequence `Y90 · cz · Rz(φ) · Y90`, reading P(1) (qcal closes Y⁻90 and reads
     P(0) — the same fringe): the prep puts the ACTIVE qubit on +X and the CZ leaves it at azimuth
-    ψ_s per spectator state s — ψ₀ = θ (the gate's local phase), ψ₁ = θ + π + δ (the conditional π
-    plus the residual conditionality error δ). The close maps P(1) = (1 + cos(ψ_s + φ))/2, so each
-    branch peaks at φ = −ψ_s: off0 = −θ is ITSELF the correction (the vz phase that cancels θ —
-    qcal's C0 value, `wrap_phase(−phase/freq)`), and off1 = −θ − π − δ carries the conditional π.
-    Removing it (qcal's NEGATIVE-amplitude fit prior on the |1> branch: its reported zero is the raw
-    fringe's trough = peak ∓ π) leaves −θ − δ, and the shorter-arc midpoint with off0 is −θ − δ/2 —
-    the C0-referenced pure local phase with the residual conditional error split evenly between the
-    branches, continuous in δ of either sign. The RAW midpoint instead sits at −θ − (π + δ)/2 ≡
-    local ± π/2 with a noise-unstable sign (the raw peaks are ~π apart — `_mean_offset`'s wrap
-    boundary), calibrating an exp(iπ/4·ZZ)-like composite instead of diag(1,1,1,−1) (spec 04 §3,
-    fixed in X1). The ∓π shift's own sign is immaterial mod 2π."""
+    ψ_s per spectator state s — ψ₀ = θ_local + θ_ZZ, ψ₁ = ψ₀ + π + δ (the conditional π plus the
+    residual conditionality error δ = −2·θ_ZZ − π, zero at an exact conditional π).
+
+    A frame word SUBTRACTS from the accrued angle — the kernels apply it as the close's
+    `set_phase_offset`, so P(1) = (1 + cos(ψ_s − φ))/2 and each branch peaks at φ = +ψ_s (the
+    convention is pinned on RTL by the CZRPE zero-amp gate, where a planted config vz comes back
+    NEGATED; spec 14 §3 finding 9). So off0 = ψ₀ is ITSELF the correction — writing it makes the
+    kernels' effective local phase θ_raw − ψ₀, i.e. exactly −θ_ZZ — and off1 = ψ₀ + π + δ carries
+    the conditional π. Removing it (qcal's NEGATIVE-amplitude fit prior on the |1> branch: its
+    reported zero is the raw fringe's trough = peak ∓ π) leaves ψ₀ + δ, and the shorter-arc midpoint
+    with off0 is ψ₀ + δ/2 = θ_local − π/2, which lands the effective local phase on **+π/2 exactly,
+    whatever θ_ZZ is** — the residual conditional error split evenly between the branches, and
+    continuous in δ of either sign. The RAW midpoint instead sits at ψ₀ + (π + δ)/2 ≡ local ± π/2
+    with a noise-unstable sign (the raw peaks are ~π apart — `_mean_offset`'s wrap boundary),
+    calibrating an exp(iπ/4·ZZ)-like composite instead of diag(1,1,1,−1) (spec 04 §3, fixed in X1).
+    The ∓π shift's own sign is immaterial mod 2π."""
     return _mean_offset(off0, off1 - math.pi)
 
 
@@ -974,8 +979,9 @@ class SpectatorPhase:
     assert) — the coupler-form CONTROL+COUPLER role wiring is not built (no coupler config carries
     spectator entries; X6Y3, the chip in scope, has no couplers).
 
-    Analysis: per conditional branch c the fringe P(1) peaks at φ = −ψ_c (the φ that cancels the
-    accrued kick — the absolute vz correction, exactly LocalPhases' convention/X1 derivation); the
+    Analysis: per conditional branch c the fringe P(1) peaks at φ = +ψ_c — the φ the kernels then
+    SUBTRACT, so it is the absolute vz correction that cancels the accrued kick (exactly
+    LocalPhases' convention/X1 derivation, `_branch_correction`); the
     write-back is qcal's combination — the PLAIN MEAN of the two branch corrections (np.mean,
     cz.py:2512-2530), with NO conditional-π removal, because the spectator is OUTSIDE the gate: its
     |1>-branch fringe shifts only by the small spectator conditionality δ, never by π (qcal fits
@@ -1067,7 +1073,8 @@ class LocalPhases:
     """CZ local single-qubit phases — qcal `cz.LocalPhases` (spec 01 §4.6, cz.py:1848-1946). A CZ leaves
     each qubit with a single-qubit Z the config must undo; this measures it with a Ramsey around ONE CZ
     on the ACTIVE qubit (`Y90 · cz · Rz(φ) · Y90`) while the partner SPECTATES in |0> or |1>. The φ that
-    peaks the ACTIVE fringe is minus that qubit's frame phase for the spectator state; the correction is
+    peaks the ACTIVE fringe IS the phase that qubit accrued for the spectator state — a frame word
+    subtracts, so the peak is the correction; the correction written is
     the |0>-branch peak midpointed with the |1>-branch peak AFTER its conditional π is removed
     (`_branch_correction` — the qcal parity fix of spec 04 §3/X1; the raw midpoint carried ±π/2 of the
     conditional phase with a noise-unstable sign). Run with the ACTIVE role on the control (→ ZI) and

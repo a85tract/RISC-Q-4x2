@@ -207,12 +207,20 @@ def test_divmod_truncates_toward_zero(cosim):
     """`//` and `%` compile to C / and % — truncation toward zero, the DOCUMENTED deviation
     from python's floor semantics for negative operands (python: -7 // 3 == -3, -7 % 3 == 2;
     the kernel gives -2 and -1). Asserted against the C values, not the python golden."""
-    _, m = cosim
+    drv, m = cosim
     prog = compile_kernel(k_divmod, m, out=Array(2))
-    assert list(_run0(cosim, prog, dict(a=-7, b=3))["out"]) == [-2, -1]
-    assert list(_run0(cosim, prog, dict(a=7, b=-3))["out"]) == [-2, 1]
-    assert list(_run0(cosim, prog, dict(a=-7, b=-3))["out"]) == [2, -1]
-    assert list(_run0(cosim, prog, dict(a=7, b=3))["out"]) == [2, 1]
+    # a/b are runtime params of ONE image, so the four sign combinations are `setup` once + four
+    # `rerun`s, not four `run`s: the image reload dominates a run (~6.6k batches vs ~2k, 01 §4.5).
+    rq.setup(drv, m, {0: prog})
+
+    def quotrem(a, b):
+        return list(rq.rerun(drv, m, {0: prog}, params={0: dict(a=a, b=b)},
+                             timeout=2_000_000)[0]["out"])
+
+    assert quotrem(-7, 3) == [-2, -1]
+    assert quotrem(7, -3) == [-2, 1]
+    assert quotrem(-7, -3) == [2, -1]
+    assert quotrem(7, 3) == [2, 1]
 
 
 @kernel
@@ -264,17 +272,19 @@ def test_amplitude_staircase_no_recompile(cosim):
     dur = len(lines)
     f, ph = pulse.freq_code(m), units._phase_code(pulse.phase)
 
-    def once(n, a0, da, gap=48):
+    def once(n, a0, da, gap=48, load=True):
         rq.reset(drv, m, on=True)
-        rq.load_program(drv, m, 0, prog.image)
+        if load:                    # the image/envelopes/tables are not altered by a run, so the
+            rq.load_program(drv, m, 0, prog.image)     # second call rewrites ONLY params — which
+            rq.load_envelopes(drv, m, 0, prog)         # is exactly the claim being made
+            rq.load_tables(drv, m, 0, prog)
+            rq.park_core(drv, m, 1)
         rq.check_magic(drv, m, 0, prog)
-        rq.load_envelopes(drv, m, 0, prog)
-        rq.load_tables(drv, m, 0, prog)
         # a0/da are amp codes accumulated on-core (a0 + i·da); seat them so the sum lands in
         # data[31:16] (spec 12) — the seated pair accumulates in the seated domain.
         rq.write_params(drv, m, 0, prog, dict(n=n, a0=pack16(a0), da=pack16(da), gap=gap))
-        rq.park_core(drv, m, 1)
-        handle = drv.sim.dac_capture_arm(m.gate_dac(0), 3600)
+        # sized capture (01 §3.3): boot + preamble (~500 batches) then n steps of LEAD + dur + gap
+        handle = drv.sim.dac_capture_arm(m.gate_dac(0), 1000 + n * (LEAD + dur + gap))
         rq.reset(drv, m, on=False)
         rq.poll_done(drv, m, 0, prog, timeout=1_000_000)
         ts = [int(t) for t in rq.read_array(drv, m, 0, prog, "ts")[:n]]
@@ -293,7 +303,7 @@ def test_amplitude_staircase_no_recompile(cosim):
     runs = build.CC_RUNS
     once(4, 6000, 2500)
     assert build.CC_RUNS == runs, "first staircase run must not recompile"
-    once(3, 12000, -3000)               # rewrite a0/da/n via write_params, rerun
+    once(3, 12000, -3000, load=False)   # rewrite a0/da/n via write_params, rerun — no reload
     assert build.CC_RUNS == runs, "param rewrite must not recompile"
 
 
@@ -447,7 +457,7 @@ def test_data_driven_slots_circuit(cosim):
     n = len(seq)
     prog = compile_kernel(k_circuit, m, tables=dict(gate=gate),
                           slots=Array(n, input=True), ts=Array(n))
-    f = pulse.freq_code(m)
+    f = x90.freq_code(m)          # both slots share the table's 4 MHz carrier
 
     rq.reset(drv, m, on=True)
     rq.load_program(drv, m, 0, prog.image)
