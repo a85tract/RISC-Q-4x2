@@ -60,6 +60,32 @@ def _snr(iq0: np.ndarray, iq1: np.ndarray) -> float:
     return dist / (err or 1e-9)
 
 
+def res_fidelity(iq0: np.ndarray, iq1: np.ndarray, phase: float) -> float:
+    """What the ON-CHIP discriminator would score on these clusters at demod phase `phase`.
+
+    The host `Classifier` puts its boundary wherever the data says; the hardware's is `sign(sumR)`
+    at a HARD ZERO, and the only knob that moves the data relative to it is the demod phase — a
+    ROTATION. A rotation can put the |0>→|1> axis on the real axis, but it cannot move the cluster
+    MIDPOINT off it: whether the threshold ends up between the clusters is then a property of the
+    physics, not of the calibration.
+
+    It works out when the two responses are antipodal (a flat readout tone, `m1 = −m0`) or conjugate
+    (a dispersive resonator probed AT `f_r`) — in both the midpoint is on the imaginary axis once the
+    axis is rotated onto the real one. Probed OFF resonance it does not: for the spec-15 scenario at
+    `f_r + 1.5 MHz` the rotated midpoint sits at 0.44 against a half-separation of 0.35, so BOTH
+    clusters land on the +real side and the `res` bit stops discriminating while the host classifier
+    is untouched (spec 15 §9.6 measured 0.66 against qcal's 0.998).
+
+    So this is measured, not assumed: `½[P(res=0 | |0>) + P(res=1 | |1>)]` on the calibration's own
+    shots, rotated by the phase it is about to propose. The demod carrier carries `e^{iφ}`, so the
+    integral rotates the same way.
+    """
+    rot = np.exp(1j * float(phase))
+    z0 = (np.asarray(iq0, float) @ [1, 1j]) * rot
+    z1 = (np.asarray(iq1, float) @ [1, 1j]) * rot
+    return 0.5 * (float(np.mean(z0.real > 0)) + float(np.mean(z1.real < 0)))
+
+
 class Classifier:
     """Two labelled Gaussian IQ clusters (|0>, |1>). Classify along the cluster axis (a supervised
     linear discriminant — for labelled clusters, the same boundary a 2-component GMM finds); the
@@ -229,6 +255,12 @@ class ReadoutCalibration:
     ('X90' | 'X') is qcal's |1>-prep choice (spec 13 §4). The trained classifier rides on the Result
     (`Result.fit[q]`, and `self.classifier[q]`) so the later steps reuse it instead of retraining.
 
+    The verdict has TWO conditions, because the first does not imply the second: the clusters must
+    be separated (`separation > 0.5`) AND the proposal must actually work on-chip
+    (`res_fidelity > 0.75`). A rotation cannot move the cluster midpoint off the real axis, so a
+    well-separated pair probed off resonance can leave both clouds on one side of the hardware's
+    hard-zero threshold — `res` at chance while `separation` still reads healthy (spec 15 §9.6).
+
     The proposed demod phase rotates m0 − m1 (NOT m0) onto +real: the hardware discriminator is
     sign(sumR) with a ZERO threshold, so what has to lie along the real axis is the |0>→|1> DIFFERENCE
     (|0> on the + side), with the cluster midpoint left on the imaginary axis. For a π-out-of-phase
@@ -259,15 +291,24 @@ class ReadoutCalibration:
         for q in self.qubits:
             clf = Classifier(iq0[q], iq1[q])
             self.classifier[q] = clf
-            data[q] = {"iq0": iq0[q], "iq1": iq1[q], "separation": clf.separation}
             demod_phase = -math.atan2(*(clf.m0 - clf.m1)[::-1])   # |0>→|1> axis onto +real (|0> on +real)
+            res_fid = res_fidelity(iq0[q], iq1[q], demod_phase)
+            data[q] = {"iq0": iq0[q], "iq1": iq1[q], "separation": clf.separation,
+                       "res_fidelity": res_fid}
             proposal[f"readout/{q}/demod/phase"] = float(demod_phase)
             proposal[f"readout/{q}/res_sign"] = 1          # |0>→+real→res=0, |1>→res=1 (base.res_sign)
             fit[q] = clf
             # a 2σ split (qcal SNR 0.5) already trains a valid axis: the phase comes from the two
             # cluster MEANS, whose error at these shot counts is far below the cluster width. The
             # old 1.0 floor failed real data — qcal's own healthy X6Y3 sessions sit at 0.8–1.2.
-            oks[q] = bool(clf.separation > 0.5)
+            #
+            # `res_fidelity` is the SECOND condition, and it is not implied by the first: a well
+            # separated pair whose midpoint does not land on the imaginary axis after the rotation
+            # leaves both clusters on one side of the hardware's hard-zero threshold, so `res` — the
+            # bit every counts-mode step and every feedback branch reads — discriminates at chance
+            # while `separation` still looks healthy. Measured on this capture rather than assumed
+            # (spec 15 §9.6 found exactly that on a detuned dispersive readout, 0.66 vs 0.998).
+            oks[q] = bool(clf.separation > 0.5 and res_fid > 0.75)
         self.data, self.fit = data, fit
         return Result(all(oks.values()), data, fit, proposal, cfg,
                       f"ReadoutCalibration {self.qubits}", oks=oks)

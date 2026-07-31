@@ -736,8 +736,8 @@ def _herald_cfg(m):
 def _assert_herald_geometry(cosim, prog, params, period, seqlen, ddly, drive, hoff, label):
     """Play ONE heralded shot with the model off and pin the two-window grid on both converters:
     two readout-drive windows exactly `hoff` apart, the `seqlen`-batch gate train between them, a
-    full SEP of scheduling lead after the herald window closes, and a clean SEP before the
-    measurement opens."""
+    full LEAD of posting lead after the herald window closes (the read halts the core, so the next
+    drive is posted late — spec 16 §1.1), and a clean SEP before the measurement opens."""
     drv, m = cosim
     q = 0
     drv.sim.set_model({"kind": "zero"})            # the DACs carry only this core's own drive
@@ -757,8 +757,8 @@ def _assert_herald_geometry(cosim, prog, params, period, seqlen, ddly, drive, ho
     assert len(gate_win) == 1 and gate_win[0][1] - gate_win[0][0] == seqlen, \
         f"{label}: the sequence did not reach the gate DAC as one {seqlen}-batch train: {gate_win}"
     g_start, g_end = gate_win[0]
-    assert g_start - (h_start + ddly + READOUT_LEAD) == SEP, \
-        f"{label}: the drive gets no full scheduling lead after the herald read (the drive-drop trap)"
+    assert g_start - (h_start + ddly + READOUT_LEAD) == LEAD, \
+        f"{label}: the drive gets no full posting lead after the herald read (the drive-drop trap)"
     assert m_start - g_end == SEP, \
         f"{label}: the sequence does not end a clean SEP before the measurement"
 

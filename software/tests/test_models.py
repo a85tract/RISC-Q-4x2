@@ -122,6 +122,30 @@ def test_twolevel_shot_noise_reproducible_and_off_by_default():
     assert not np.array_equal(n1, clean)
 
 
+def test_twolevel_fast_forward_equals_repeated_relax():
+    """spec 15 C3's gate: `fast_forward(n)` is the n-th power of the per-batch relaxation map, so a
+    host driver may skip an idle gap instead of calling `adc_batch` once per batch."""
+    kw = dict(core=0, t1=600.0, t2=3000.0, init_excited=True)
+    for n in (1, 7, 3200):
+        ff = models.TwoLevelModel(M, **kw)
+        ff._b[:] = (0.3, -0.4, 0.5)                       # a generic Bloch vector, not a pole
+        ff.fast_forward(n)
+        step = models.TwoLevelModel(M, **kw)
+        step._b[:] = (0.3, -0.4, 0.5)
+        for _ in range(n):
+            step._relax()
+        assert np.allclose(ff._b, step._b, rtol=1e-12, atol=1e-15)   # differs only by float rounding
+    # no T1/T2 and n <= 0 are no-ops
+    idle = models.TwoLevelModel(M, core=0)
+    idle._b[:] = (0.3, -0.4, 0.5)
+    idle.fast_forward(1000)
+    assert np.array_equal(idle._b, np.array([0.3, -0.4, 0.5]))
+    ff = models.TwoLevelModel(M, **kw)
+    ff._b[:] = (0.3, -0.4, 0.5)
+    ff.fast_forward(0)
+    assert np.array_equal(ff._b, np.array([0.3, -0.4, 0.5]))
+
+
 def test_twolevel_state_is_qutip_qobj():
     import qutip
     tl = models.TwoLevelModel(M, init_excited=False)
@@ -223,6 +247,21 @@ def test_twolevel_projective_clusters_separate():
     assert clf.separation > 1.0, f"clusters not 4σ apart: qcal SNR {clf.separation:.2f}"
     assert float(clf.m0 @ clf.m1) < -0.9 * np.hypot(*clf.m0) * np.hypot(*clf.m1)   # antipodal
     assert np.array_equal(clf.confusion(), np.eye(2))
+
+
+def test_twolevel_decay_in_window_is_off_by_default_and_puts_a_tail_between_the_clusters():
+    """spec 15 §3.3's t1-tail scenario: a |1> shot that decays PART-WAY through the window
+    integrates part of each tone and lands between the clusters. Default off — with it off the |1>
+    shots are a clean cloud even at a T1 shorter than the window."""
+    kw = dict(collapse=True, readout_amp=20000.0, t1=20.0, noise_seed=3)   # T1 = half the window
+    off = [_shot_iq(models.TwoLevelModel(M, **kw), -1.0, i) for i in range(60)]
+    on = [_shot_iq(models.TwoLevelModel(M, decay_in_window=True, **kw), -1.0, i) for i in range(60)]
+    # the |0>/|1> poles integrate to +/-A on the real axis; a mid-window jump lands in between
+    a = abs(np.mean(off))
+    assert np.std(np.real(off)) < 1e-6 * a, "the latched tone must be constant across the window"
+    frac = np.mean([-0.9 * a < z.real < 0.9 * a for z in on])
+    assert frac > 0.4, f"only {frac:.0%} of |1> shots decayed mid-window at T1 = half the window"
+    assert np.mean(np.real(on)) > np.mean(np.real(off))     # the tail pulls |1> toward |0>
 
 
 # ── dispersive readout (chi != 0, spec 13 Q2) ──

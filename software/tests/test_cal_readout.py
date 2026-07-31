@@ -21,9 +21,9 @@ import math
 import numpy as np
 import pytest
 
-from riscq.cal import Config, ReadoutFidelity
+from riscq.cal import Classifier, Config, ReadoutFidelity
 from riscq.cal.base import GATE_ENV, gate_sigma
-from riscq.cal.readout import ClassifierN, _ef_prep_prog, _rawiq_prog, rcorr
+from riscq.cal.readout import ClassifierN, _ef_prep_prog, _rawiq_prog, rcorr, res_fidelity
 from riscq.pulses import Pulse, units
 from tests.probe import Probe
 
@@ -37,6 +37,49 @@ from tests.probe import Probe
 # the textbook gates their planted rates say they are.
 F_GE, F_EF = 150e6, 50e6
 GE_AMP, EF_AMP = 0.5, 0.5
+
+
+def _clusters(s0: complex, s1: complex, n: int = 400, sigma: float = 0.05, seed: int = 3):
+    """Two IQ clouds around planted complex responses — the shape a readout actually produces."""
+    rng = np.random.default_rng(seed)
+    return [np.column_stack([s.real + rng.normal(0, sigma, n), s.imag + rng.normal(0, sigma, n)])
+            for s in (s0, s1)]
+
+
+def _proposed_phase(iq0, iq1) -> float:
+    """ReadoutCalibration's rule: rotate the |0>->|1> cluster axis onto +real."""
+    return -math.atan2(*(iq0.mean(0) - iq1.mean(0))[::-1])
+
+
+def test_res_fidelity_is_perfect_when_the_two_responses_are_antipodal():
+    """A flat readout tone puts |1> exactly pi out of phase from |0>, so the rotated midpoint lands
+    on the imaginary axis and the hardware's hard-zero threshold sits between the clusters."""
+    iq0, iq1 = _clusters(0.6 + 0.8j, -0.6 - 0.8j)
+    assert res_fidelity(iq0, iq1, _proposed_phase(iq0, iq1)) > 0.99
+
+
+def test_res_fidelity_is_perfect_for_a_dispersive_readout_probed_at_f_r():
+    """At f_r the two Lorentzian responses are complex CONJUGATES, so their difference is purely
+    imaginary and their sum purely real — rotating the axis onto +real again centres the midpoint."""
+    s0 = 1.0 / (1.0 + 0.6j)
+    iq0, iq1 = _clusters(s0, s0.conjugate(), sigma=0.02)
+    assert res_fidelity(iq0, iq1, _proposed_phase(iq0, iq1)) > 0.99
+
+
+def test_res_fidelity_collapses_off_resonance_even_though_the_clusters_are_well_separated():
+    """spec 15 §9.7's finding: probed OFF f_r the responses are neither antipodal nor conjugate, so
+    a ROTATION cannot move the midpoint off the real axis. Both clusters end up on the +real side of
+    the hardware's hard-zero threshold and `res` discriminates at chance — while the host
+    classifier, which puts its boundary where the data is, is untouched. That is exactly why
+    ReadoutCalibration gates on this and not on `separation` alone."""
+    chi, kappa, det = 1.2e6, 4.0e6, 1.5e6
+    s0 = 1.0 / (1.0 + 2j * (det - chi) / kappa)
+    s1 = 1.0 / (1.0 + 2j * (det + chi) / kappa)
+    iq0, iq1 = _clusters(s0, s1, sigma=0.02)
+    clf = Classifier(iq0, iq1)
+    assert clf.separation > 2.0, "the clusters are well separated to a host classifier"
+    assert res_fidelity(iq0, iq1, _proposed_phase(iq0, iq1)) < 0.6, \
+        "the hard-zero res bit should be at chance here"
 
 
 def test_rcorr_inverts_a_planted_confusion():

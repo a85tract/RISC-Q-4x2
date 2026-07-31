@@ -51,6 +51,16 @@ class QuantumModel(Protocol):
         """
         return {}
 
+    def fast_forward(self, n: int) -> None:
+        """Advance `n` IDLE batches without generating ADC samples (specs/software/15 §3.3).
+
+        Only a host-side driver that knows the DAC is silent may call this — the co-sim never does,
+        it simulates every batch for real. It exists for the spec-15 virtual QubiC board, whose
+        passive-reset gaps (tens of thousands of batches per shot) would otherwise cost one Python
+        `adc_batch` call each. Models with no time evolution ignore it.
+        """
+        return None
+
 
 class ZeroModel:
     """ADC silence — the default (DAC-only tests). Drives nothing; the bench holds every ADC at 0."""
@@ -177,7 +187,7 @@ class TwoLevelModel:
                  t1: float | None = None, t2: float | None = None, init_excited: bool = False,
                  noise_scale: float = 0.0, noise_seed: int = 0, collapse: bool = False,
                  f_r: float = 0.0, kappa: float = 0.0, chi: float = 0.0,
-                 stark_rad_per_sigma: float = 0.0):
+                 stark_rad_per_sigma: float = 0.0, decay_in_window: bool = False):
         import qutip   # confined to TwoLevelModel (spec 05 §3)
         self._q = qutip
 
@@ -212,6 +222,14 @@ class TwoLevelModel:
         self._crng = np.random.default_rng(noise_seed + 0xC0BE)
         self._ro_active = False
         self._shot_amp = 0.0
+        # T1 DURING the window (spec 15 §3.3's t1-tail scenario). Off by default: the latched tone
+        # above is constant across the window, so |0> and |1> come back as two clean clouds. With it
+        # on, a |1> shot may jump to |0> partway through and integrate part of each tone — the heavy
+        # tail between the clusters that a real T1 puts there, and the one regime where an
+        # unsupervised GMM and a linear discriminant genuinely disagree.
+        self.decay_in_window = bool(decay_in_window)
+        self._decay_at = -1        # batches into the window at which the latched |1> jumps to |0>
+        self._win_k = 0
         # dispersive readout (chi != 0): a driven resonator at f_r of linewidth kappa, pulled ±chi by
         # the qubit state. chi = 0 (default) keeps the flat π-out-of-phase tone above, untouched.
         self.f_r, self.kappa, self.chi = float(f_r), float(kappa), float(chi)
@@ -242,10 +260,7 @@ class TwoLevelModel:
                 self._rotate(self.rabi_rad_per_amp * amp_est, self._drive_axis(t, samples))
             if self.stark_rad_per_sigma:      # the ac-Stark Z, accrued WITH the drive (spec 13 Q3)
                 self._rotate_z(self.stark_rad_per_sigma * amp_est)
-        if self.t1 or self.t2:
-            self._b[0] *= self._t2_decay
-            self._b[1] *= self._t2_decay
-            self._b[2] = 1.0 + (self._b[2] - 1.0) * self._t1_decay
+        self._relax()
 
         amp = self._projective_amp(dac) if self.collapse else self.readout_amp * self._b[2]
         # (soft: |0>→+amp, |1>→−amp, a continuous step of ⟨σz⟩; projective: a latched ±amp per shot)
@@ -258,6 +273,25 @@ class TwoLevelModel:
         if self._noise_scale:
             lanes = lanes + self._rng.normal(0.0, self._noise_scale, ADC_BATCH)
         return {self.adc: _clip16(lanes)}
+
+    def _relax(self) -> None:
+        """One batch of T1/T2 relaxation: an AFFINE map on the Bloch vector — xy scaled by the T2
+        decay, z pulled toward the ground pole (+1) by the T1 one. Linear, so `fast_forward` can
+        apply n of them in closed form."""
+        if self.t1 or self.t2:
+            self._b[0] *= self._t2_decay
+            self._b[1] *= self._t2_decay
+            self._b[2] = 1.0 + (self._b[2] - 1.0) * self._t1_decay
+
+    def fast_forward(self, n: int) -> None:
+        """n idle batches of relaxation in closed form (spec 15 §3.3): the n-th power of `_relax`'s
+        affine map. Exact in exact arithmetic — `x**n` and n multiplications differ only by float
+        rounding — and the ADC is not generated, so the caller must know the DAC is silent."""
+        if n <= 0 or not (self.t1 or self.t2):
+            return
+        self._b[0] *= self._t2_decay ** n
+        self._b[1] *= self._t2_decay ** n
+        self._b[2] = 1.0 + (self._b[2] - 1.0) * self._t1_decay ** n
 
     def _dispersive(self, ro, sz: float) -> np.ndarray:
         """The dispersive readout response (spec 13 Q2): this batch's ADC lanes.
@@ -330,8 +364,20 @@ class TwoLevelModel:
             s = 1 if self._crng.random() < (1.0 - self._b[2]) / 2.0 else 0
             self._b[:] = (0.0, 0.0, 1.0 - 2.0 * s)                 # collapse to the sampled pole
             self._shot_amp = self.readout_amp * (1.0 - 2.0 * s)    # +amp (s=0) / −amp (s=1)
+            # how many batches this |1> survives: geometric with the per-batch decay probability
+            # 1 − exp(−1/T1), i.e. the discrete T1 the rest of the model already uses
+            self._decay_at = int(self._crng.geometric(1.0 - self._t1_decay)) \
+                if (s and self.decay_in_window and self.t1) else -1
+            self._win_k = 0
         elif not ro_on:
             self._shot_amp = 0.0                                   # no drive ⇒ silent (decoder ignores it)
+            self._decay_at = -1
+        if ro_on:
+            self._win_k += 1
+            if 0 <= self._decay_at <= self._win_k:                 # the jump, mid-window
+                self._shot_amp = self.readout_amp
+                self._b[:] = (0.0, 0.0, 1.0)
+                self._decay_at = -1
         self._ro_active = ro_on
         return self._shot_amp
 
@@ -791,6 +837,11 @@ class MultiModel:
         of the `models` list in the spec passed to `set_model`."""
         return {"models": [md.ground_truth() for md in self._models]}
 
+    def fast_forward(self, n: int) -> None:
+        for md in self._models:
+            if hasattr(md, "fast_forward"):
+                md.fast_forward(n)
+
 
 def build_model(spec: dict, m) -> QuantumModel:
     """Construct the model named by a JSON-serializable spec (`{"kind": ...}`), in the sim
@@ -815,7 +866,8 @@ def build_model(spec: dict, m) -> QuantumModel:
             noise_scale=spec.get("noise_scale", 0.0), noise_seed=spec.get("noise_seed", 0),
             collapse=spec.get("collapse", False), f_r=spec.get("f_r", 0.0),
             kappa=spec.get("kappa", 0.0), chi=spec.get("chi", 0.0),
-            stark_rad_per_sigma=spec.get("stark_rad_per_sigma", 0.0))
+            stark_rad_per_sigma=spec.get("stark_rad_per_sigma", 0.0),
+            decay_in_window=spec.get("decay_in_window", False))
     if kind == "threelevel":
         return ThreeLevelModel(
             m, core=spec.get("core", 0), f_ge=spec.get("f_ge", 0.0), f_ef=spec.get("f_ef", 0.0),

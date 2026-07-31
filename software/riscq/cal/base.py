@@ -31,7 +31,14 @@ from riscq.lang import ParamTable
 from riscq.map import LEAD, READOUT_LEAD, READOUT_MAX_WIN_LOG2, pack16
 from riscq.pulses import Pulse, envelopes, golden, units
 
-SEP = LEAD              # pulse-end → readout separation (co-sim: the readout datapath needs ~LEAD)
+# The PHYSICAL gap (batches) between a sequence's last drive pulse and its readout window — every
+# kernel schedules its prep to end at `t_ro − SEP`. NOT a posting lead: every play is posted a full
+# grid period (≥ the relax head) before its startTime, so the post→startTime contract (LEAD) never
+# bounds pulse spacing (spec 16 §1.1). What SEP does is decay the excited prep for its duration —
+# at SEP = LEAD = 96 that cost 1.7–1.9× of cluster SNR at the co-sim's T1 = 600 batches, the whole
+# of spec 15's D2 deficit. The one place a real scheduling lead belongs after a pulse is the
+# core-halting herald read, which names LEAD explicitly (`_herald_extra` / `herald_offset`).
+SEP = 8                 # smallest clean prep→readout gap (spec 16 S1 sweep: 4 clips the window head)
 GATE_ENV = envelopes.square(16)   # default gate envelope (4 batches at gateInterp 4)
 GATE_CH = 0                       # the gate channel (the x90/x pulse table's channel)
 X90, X = 0, 1                     # the kernels' compile-time `prep_gate` binding (spec 13 §4)
@@ -166,29 +173,36 @@ def readout_tables(cfg, q: int, m, phase: float | None = None, win: float | None
 
 def _herald_extra(delay: int = 0) -> int:
     """The batches a heralded shot adds to the grid period (spec 13 §8): the pre-sequence herald read
-    (`delay + READOUT_LEAD`, its window covered by READOUT_LEAD) PLUS a full SEP of scheduling lead
-    after it — the herald `read_res()` HALTS the core, so without that lead the following drive would
-    post too late and drop (the qubit never rotates, the measurement reads |0>)."""
-    return int(delay) + READOUT_LEAD + SEP
+    (`delay + READOUT_LEAD`, its window covered by READOUT_LEAD) PLUS a full LEAD of scheduling lead
+    after it — the herald `read_res()` HALTS the core, so the following drive is posted only after
+    the read returns and genuinely needs the post→startTime lead, or it drops (the qubit never
+    rotates, the measurement reads |0>). This is the one post-pulse LEAD in the schedule; it is a
+    posting constraint, not a physical gap, so it does NOT shrink with SEP (spec 16 §1.1)."""
+    return int(delay) + READOUT_LEAD + LEAD
 
 
 def herald_offset(seq_batches: int, delay: int = 0) -> int:
-    """`hoff` = t_ro − t_h: place the herald read so it COMPLETES a full SEP scheduling-lead before the
-    earliest sequence pulse (`t_ro − SEP − seq_batches`) — the read halts the core, so the drive
-    scheduled right after it needs the same lead a normal shot has, or it drops (spec 13 §8). Derived
-    so `(t_ro − SEP − seq_batches) − (t_h + delay + READOUT_LEAD) == SEP`."""
-    return int(seq_batches) + int(delay) + READOUT_LEAD + 2 * SEP
+    """`hoff` = t_ro − t_h: place the herald read so it COMPLETES a full LEAD before the earliest
+    sequence pulse (`t_ro − SEP − seq_batches`) — the read halts the core, so the drive scheduled
+    right after it is posted late and needs the post→startTime lead, or it drops (spec 13 §8).
+    Derived so `(t_ro − SEP − seq_batches) − (t_h + delay + READOUT_LEAD) == LEAD`."""
+    return int(seq_batches) + int(delay) + READOUT_LEAD + SEP + LEAD
 
 
 def grid_period(relax: int, seq_batches: int, dur: int, delay: int = 0, herald: bool = False) -> int:
     """The fixed readout-grid period (batches) for a batched sweep (spec 08 §2.2): each shot fires on
     this grid, whose idle head is the T1 relax reset, so every readout lands at the same demod-LO
     phase. `seq_batches` is the longest point's drive prelude (earliest pulse start -> t_ro), `delay`
-    the demod's round-trip offset. Sized period >= relax + seq_batches + SEP + delay + dur +
-    READOUT_LEAD and rounded UP to a multiple of 8 (so the phase repeats). `herald` prepends one more
-    readout window + its SEP scheduling lead (the pre-sequence herald read, spec 13 §8) — the relax gap
-    is preserved (it grows by `dur`). Host-computed, fail-loud."""
-    need = int(relax) + int(seq_batches) + SEP + int(delay) + int(dur) + READOUT_LEAD
+    the demod's round-trip offset. Sized period >= relax + seq_batches + LEAD + delay + dur +
+    READOUT_LEAD and rounded UP to a multiple of 8 (so the phase repeats). The internal `+ LEAD` is
+    the POSTING MARGIN, not a physical gap: the kernels open on `t_ro = now() + period`, so the
+    first prep's post→startTime margin is `period − seq ≥ relax + LEAD + <readout tail>`, and the
+    same term is what lets the core re-post each next shot's params after `read_res` returns when
+    `relax` is short (the L1/L2 probe configs run with relax ≈ 0 — at SEP = LEAD the old `+ SEP`
+    covered this by accident; spec 16 S1 found it the hard way when the gap shrank). `herald`
+    prepends one more readout window + its LEAD posting lead (the pre-sequence herald read, spec 13
+    §8) — the relax gap is preserved (it grows by `dur`). Host-computed, fail-loud."""
+    need = int(relax) + int(seq_batches) + LEAD + int(delay) + int(dur) + READOUT_LEAD
     if herald:
         need += _herald_extra(delay)
     period = -(-need // 8) * 8
