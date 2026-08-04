@@ -152,7 +152,7 @@ class Amplitude:
             proposal.update(prop)
         self.data, self.fit = data, fit
         return Result(all(oks.values()), data, fit, proposal, cfg,
-                      f"Amplitude {self.qubits} {self.gate} n_gates={self.n_gates}")
+                      f"Amplitude {self.qubits} {self.gate} n_gates={self.n_gates}", oks=oks)
 
 
 class Frequency:
@@ -259,7 +259,8 @@ class Frequency:
             oks[q] = ok
             proposal.update(prop)
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Frequency {self.qubits}")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Frequency {self.qubits}",
+                      oks=oks)
 
 
 def _phase_sweep(lo: float, hi: float, n: int) -> tuple[int, int, np.ndarray]:
@@ -404,7 +405,8 @@ class Phase:
             if ok:
                 proposal[f"qubit/{q}/x90/vz"] = [phi, phi]     # qcal: ONE crossing, BOTH slots
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Phase {self.qubits}")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Phase {self.qubits}",
+                      oks=oks)
 
     def _run_x(self, drv) -> Result:
         """gate='X': one X90 · X · X90 run, cosine-fitted; the X's axis phase is the fringe MINIMUM."""
@@ -448,7 +450,8 @@ class Phase:
             if ok:
                 proposal[f"qubit/{q}/x/phase"] = float(phi)
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Phase {self.qubits} X")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"Phase {self.qubits} X",
+                      oks=oks)
 
 
 class T1:
@@ -506,7 +509,7 @@ class T1:
             oks[q] = ok
             proposal.update(prop)
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"T1 {self.qubits}")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"T1 {self.qubits}", oks=oks)
 
 
 class T2:
@@ -563,7 +566,7 @@ class T2:
             oks[q] = ok
             proposal.update(prop)
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"T2 {self.qubits}")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"T2 {self.qubits}", oks=oks)
 
 
 # ── EF subspace (spec two-qubit/01 §4.1): the CZ-frequency prerequisite ──
@@ -678,7 +681,7 @@ class EFAmplitude:
             proposal.update(prop)
         self.data, self.fit = data, fit
         return Result(all(oks.values()), data, fit, proposal, cfg,
-                      f"EFAmplitude {self.qubits} {self.gate} n_gates={self.n_gates}")
+                      f"EFAmplitude {self.qubits} {self.gate} n_gates={self.n_gates}", oks=oks)
 
 
 class EFFrequency:
@@ -760,7 +763,8 @@ class EFFrequency:
             oks[q] = ok
             proposal.update(prop)
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFFrequency {self.qubits}")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFFrequency {self.qubits}",
+                      oks=oks)
 
 
 class EFPhase:
@@ -864,7 +868,8 @@ class EFPhase:
             if ok:
                 proposal[f"qubit/{q}/EF/x90/vz"] = [phi, phi]  # qcal: ONE crossing, BOTH slots
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFPhase {self.qubits}")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFPhase {self.qubits}",
+                      oks=oks)
 
     def _run_x(self, drv) -> Result:
         """gate='X': one EF-X90 · EF-X · EF-X90 run; the EF X's axis phase is the P(|2>) MINIMUM."""
@@ -911,4 +916,5 @@ class EFPhase:
             if ok:
                 proposal[f"qubit/{q}/EF/x/phase"] = float(phi)
         self.data, self.fit = data, fit_out
-        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFPhase {self.qubits} X")
+        return Result(all(oks.values()), data, fit_out, proposal, cfg, f"EFPhase {self.qubits} X",
+                      oks=oks)

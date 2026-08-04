@@ -108,3 +108,58 @@ def test_ill_conditioned_fits_return_not_ok():
     # a NaN in the data is likewise refused, not silently fitted
     x = np.linspace(0, 5, 20)
     assert not fits.fit_cosine(x, np.full(20, np.nan)).ok
+
+
+def test_sub_period_sweep_does_not_lock_a_harmonic():
+    """spec 17 D17 (found by E7, pinned by spec 18 S0): on a sweep covering ~0.54 of a period the
+    FFT peak sits at the span's own fundamental — ABOVE the true frequency — and a single-seed fit
+    locks onto a harmonic of it. E7 measured the damage on the real Rabi sweep: 3.5x the true
+    frequency, an amplitude of 0.1327 against a true 0.4630, silently inside `Amplitude`'s own
+    in-range guard. The sub-harmonic starts (`_SEED_SCALES`) must recover the truth; reverting to
+    a single seed makes this test fail."""
+    rng = np.random.default_rng(7)                      # own stream: keep the module RNG's intact
+    x = np.linspace(0.0, 1.0, 21)
+    y = 0.5 - 0.5 * np.cos(2 * np.pi * 0.54 * x) + rng.normal(0, 0.02, x.size)
+    f = fits.fit_cosine(x, y)
+    assert f.ok
+    assert abs(f.value - 0.54) < 0.05, f"harmonic lock: f = {f.value:.4f} vs true 0.54"
+    assert abs(f.params["amp"] - 0.5) < 0.1
+
+    d = fits.fit_damped_cosine(x, 0.5 - 0.5 * np.exp(-x / 2.0) * np.cos(2 * np.pi * 0.54 * x)
+                               + rng.normal(0, 0.01, x.size))
+    assert d.ok
+    assert abs(d.value - 0.54) < 0.08, f"harmonic lock: f = {d.value:.4f} vs true 0.54"
+
+
+def test_best_of_skips_a_non_finite_residual_candidate(monkeypatch):
+    """spec 18 S0 (A2): scipy can return a finite popt whose model output still overflows
+    (`exp(-t/tau)` at a tiny negative tau -> inf·cos -> NaN residual). A NaN SSR compares False to
+    everything, so if it were stored first every later good fit would lose — `_best_of` must skip
+    the non-finite candidate instead."""
+    x = np.linspace(0.0, 1.0, 5)
+    y = 2.0 * x
+
+    def model(t, a):
+        return np.full_like(t, np.nan) if a == 999.0 else a * t
+
+    fake = iter([(np.array([999.0]), np.eye(1)), (np.array([2.0]), np.eye(1))])
+    monkeypatch.setattr(fits, "curve_fit", lambda *a, **k: next(fake))
+    ssr, popt, _ = fits._best_of(model, x, y, [[999.0], [1.0]])
+    assert popt[0] == 2.0 and np.isfinite(ssr)
+
+
+def test_an_empty_sweep_is_refused_not_raised():
+    """spec 17 G3 — every helper SEEDS from the data before `curve_fit` sees it (`y.max()`, `y[0]`,
+    an FFT peak), so a sweep whose points all failed upstream used to raise `ValueError: attempt to
+    get argmin of an empty sequence` out of the helper instead of coming back refused.
+
+    Found by E8: `Frequency` fits `a·|x − b| + c` over only the detunings whose fringe fit
+    succeeded, and when none did it handed the V-fit an empty array — crashing the calibration
+    rather than letting its own `len(x) >= 3` guard decline to write the config.
+    """
+    for fit in (fits.fit_cosine, fits.fit_damped_cosine, fits.fit_exp_decay, fits.fit_parabola,
+                fits.fit_absolute_value, fits.fit_linear):
+        assert not fit([], []).ok, f"{fit.__name__} did not refuse an empty sweep"
+        assert not fit(np.array([]), np.array([])).ok
+    # and a mismatched pair, which would otherwise fit whatever numpy broadcast
+    assert not fits.fit_linear([0.0, 1.0, 2.0], [1.0, 2.0]).ok

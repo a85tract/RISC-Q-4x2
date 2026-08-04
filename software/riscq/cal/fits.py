@@ -22,6 +22,17 @@ _FAIL = (RuntimeError, ValueError, TypeError)
 _NONE = Fit(False, math.nan, math.nan, {})
 
 
+def _fittable(x: np.ndarray, y: np.ndarray, n_params: int) -> bool:
+    """Enough points, and enough of them, to seed and fit `n_params` coefficients?
+
+    Every helper below SEEDS from the data — `y.max()`, `y[0]`, an FFT peak — before `curve_fit` is
+    ever reached, so a sweep whose points all failed upstream would raise out of the helper instead
+    of coming back as a refused fit. `ok=False, never an exception` is the one thing every caller
+    relies on: a calibration decides whether to write the config on it (spec 17 G3).
+    """
+    return len(x) >= n_params and len(x) == len(y)
+
+
 def _fft_freq_seed(x: np.ndarray, y: np.ndarray) -> float:
     """Dominant non-DC FFT frequency of y on a ~uniform x grid (cycles per x-unit) — the seed
     that lets curve_fit lock onto the right sinusoid instead of a harmonic."""
@@ -34,50 +45,83 @@ def _fft_freq_seed(x: np.ndarray, y: np.ndarray) -> float:
     return float(freqs[1 + int(np.argmax(spec[1:]))]) or 1.0 / (n * dx)
 
 
+#: Sub-harmonics of the FFT peak that every sinusoidal fit is ALSO started from (see `_best_of`).
+_SEED_SCALES = (1.0, 0.5, 1 / 3.0, 0.25)
+
+
+def _best_of(model, x, y, starts):
+    """Fit `model` from several starting points and keep the lowest-residual result.
+
+    One FFT seed is not enough for a sweep covering less than a full period: the peak bin then sits
+    at the span's own fundamental — well ABOVE the true frequency — and curve_fit locks onto a
+    harmonic of it. Measured on a real half-period Rabi sweep (spec 17 E7): the FFT-seeded fit
+    returned 3.5x the true frequency with SSR 2.36, a sub-harmonic seed returned the right one with
+    SSR 0.033, and the wrong answer passed the caller's in-range guard silently. The residual is
+    what decides, exactly as `fit_absolute_value` already does for its two orientations.
+
+    Returns `(ssr, popt, perr)` or None when every start failed.
+    """
+    best = None
+    for p0 in starts:
+        try:
+            popt, pcov = curve_fit(model, x, y, p0=list(p0), maxfev=20000)
+        except _FAIL:
+            continue
+        if not np.all(np.isfinite(popt)):
+            continue
+        ssr = float(np.sum((y - model(x, *popt)) ** 2))
+        if not np.isfinite(ssr):     # finite popt can still overflow the model (exp -> inf·cos);
+            continue                 # a NaN ssr compares False forever and would shadow later fits
+        if best is None or ssr < best[0]:
+            best = (ssr, popt, np.sqrt(np.diag(pcov)))
+    return best
+
+
 def fit_cosine(x, y) -> Fit:
-    """y ≈ A·cos(2π·f·x + φ) + C, frequency seeded from the FFT peak. value = f (≥ 0)."""
+    """y ≈ A·cos(2π·f·x + φ) + C, frequency seeded from the FFT peak and its sub-harmonics.
+    value = f (≥ 0)."""
     x, y = np.asarray(x, float), np.asarray(y, float)
-    p0 = [max((y.max() - y.min()) / 2, 1e-9), _fft_freq_seed(x, y), 0.0, y.mean()]
+    if not _fittable(x, y, 4):
+        return _NONE
+    seed, amp, off = _fft_freq_seed(x, y), max((y.max() - y.min()) / 2, 1e-9), y.mean()
 
     def model(t, A, f, phi, C):
         return A * np.cos(2 * np.pi * f * t + phi) + C
 
-    try:
-        popt, pcov = curve_fit(model, x, y, p0=p0, maxfev=20000)
-    except _FAIL:
+    best = _best_of(model, x, y, [[amp, seed * k, 0.0, off] for k in _SEED_SCALES])
+    if best is None:
         return _NONE
-    perr = np.sqrt(np.diag(pcov))
-    A, f, phi, C = popt
+    _, (A, f, phi, C), perr = best
     if A < 0:                 # canonicalise to A ≥ 0 (A·cos(θ+φ) = |A|·cos(θ+φ+π)) so `phase` alone
         phi = phi + np.pi     # locates the maximum, at x = −phase/(2π·freq)
     params = {"amp": abs(A), "freq": abs(f), "phase": phi, "offset": C}
-    ok = bool(np.all(np.isfinite(popt)) and np.all(np.isfinite(perr)))
-    return Fit(ok, abs(f), float(perr[1]), params)
+    return Fit(bool(np.all(np.isfinite(perr))), abs(f), float(perr[1]), params)
 
 
 def fit_damped_cosine(x, y) -> Fit:
     """y ≈ A·exp(−x/τ)·cos(2π·f·x + φ) + C. value = f (≥ 0); params carry the decay τ too."""
     x, y = np.asarray(x, float), np.asarray(y, float)
+    if not _fittable(x, y, 5):
+        return _NONE
     span = (x.max() - x.min()) or 1.0
-    p0 = [max((y.max() - y.min()) / 2, 1e-9), span, _fft_freq_seed(x, y), 0.0, y.mean()]
+    seed, amp, off = _fft_freq_seed(x, y), max((y.max() - y.min()) / 2, 1e-9), y.mean()
 
     def model(t, A, tau, f, phi, C):
         return A * np.exp(-t / tau) * np.cos(2 * np.pi * f * t + phi) + C
 
-    try:
-        popt, pcov = curve_fit(model, x, y, p0=p0, maxfev=20000)
-    except _FAIL:
+    best = _best_of(model, x, y, [[amp, span, seed * k, 0.0, off] for k in _SEED_SCALES])
+    if best is None:
         return _NONE
-    perr = np.sqrt(np.diag(pcov))
-    A, tau, f, phi, C = popt
+    _, (A, tau, f, phi, C), perr = best
     params = {"amp": A, "tau": tau, "freq": abs(f), "phase": phi, "offset": C}
-    ok = bool(np.all(np.isfinite(popt)) and np.all(np.isfinite(perr)))
-    return Fit(ok, abs(f), float(perr[2]), params)
+    return Fit(bool(np.all(np.isfinite(perr))), abs(f), float(perr[2]), params)
 
 
 def fit_exp_decay(x, y) -> Fit:
     """y ≈ A·exp(−x/τ) + C (A may be either sign). value = τ (> 0)."""
     x, y = np.asarray(x, float), np.asarray(y, float)
+    if not _fittable(x, y, 3):
+        return _NONE
     span = (x.max() - x.min()) or 1.0
     p0 = [(y[0] - y[-1]) or 1.0, span / 2, y[-1]]
 
@@ -98,6 +142,8 @@ def fit_exp_decay(x, y) -> Fit:
 def fit_parabola(x, y) -> Fit:
     """y ≈ a·x² + b·x + c. value = the vertex x = −b/(2a) (the Amplitude n_gates>1 optimum)."""
     x, y = np.asarray(x, float), np.asarray(y, float)
+    if not _fittable(x, y, 3):
+        return _NONE
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")           # RankWarning on degenerate x -> caught below
@@ -124,6 +170,8 @@ def fit_absolute_value(x, y) -> Fit:
     the caller's negative-curvature guard (`a < 0` → fail, qcal's) can only be honest if the fit is
     able to land on an inverted V at all."""
     x, y = np.asarray(x, float), np.asarray(y, float)
+    if not _fittable(x, y, 3):
+        return _NONE
 
     def model(t, a, b, c):
         return a * np.abs(t - b) + c
@@ -140,7 +188,7 @@ def fit_absolute_value(x, y) -> Fit:
         except _FAIL:
             continue
         ssr = float(np.sum((y - model(x, *popt)) ** 2))
-        if np.all(np.isfinite(popt)) and (best is None or ssr < best[0]):
+        if np.isfinite(ssr) and np.all(np.isfinite(popt)) and (best is None or ssr < best[0]):
             best = (ssr, popt, np.sqrt(np.diag(pcov)))
     if best is None:
         return _NONE
@@ -154,6 +202,8 @@ def fit_linear(x, y) -> Fit:
     for the Phase/Frequency crossing fits, and the unweighted reduced chi-squared (`redchi` =
     SSR/(N−2)) that qcal's underfitting guard tests (`FitLinear.error > 10`, spec 13 §6)."""
     x, y = np.asarray(x, float), np.asarray(y, float)
+    if not _fittable(x, y, 2):
+        return _NONE
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")           # RankWarning on degenerate x -> caught below

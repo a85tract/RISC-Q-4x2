@@ -124,7 +124,8 @@ class Config:
     def save_qcal(self, path) -> None:
         """Write the CALIBRATED fields back into the qcal tree this Config was loaded from: GE and EF
         freq / T1 / T2*, the X90 and X amp + phase + envelope kwargs + virtual-Z pair (both
-        subspaces), the readout freq/amp, the demod window + phase, and each `two_qubit` pair's WHOLE
+        subspaces), the readout freq/amp, the three readout TIMINGS `Window` sweeps (the drive
+        length, the demod window and its delay), the demod phase, and each `two_qubit` pair's WHOLE
         subtree — our copy is authoritative (it was carried verbatim on load), so `CZ/pulse`'s
         string-reference entries survive AND config-added keys like JAZZ's `ZZ11` reach the artefact
         (spec 14 F0). Everything outside those paths — the `reset` section, `readout/esp`, `hardware`
@@ -149,6 +150,11 @@ class Config:
             ro["freq"] = float(self[f"readout/{q}/freq"])
             ro["amp"] = float(self[f"readout/{q}/amp"])
             ro["demod"]["time"] = float(self[f"readout/{q}/demod/dur"])
+            # the two other readout TIMINGS `Window` calibrates (spec 20 U1): the drive length and
+            # when the integration window opens after it. Seconds on both sides — no unit
+            # conversion, so an untouched tree still round-trips verbatim.
+            ro["time"] = float(self[f"readout/{q}/dur"])
+            ro["demod"]["delay"] = float(self[f"readout/{q}/demod/delay"])
             # degrees↔radians is not float-exact both ways — rewrite only a RECALIBRATED phase, so an
             # untouched one stays verbatim (the load → save round-trip contract).
             if float(self[f"readout/{q}/demod/phase"]) != math.radians(float(ro["demod"]["phase"])):

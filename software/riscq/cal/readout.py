@@ -14,8 +14,9 @@ spec 13 §5):
                        measures the 3×3 matrix instead, host-side over RAW shots at the |0>/|1>/|2>
                        preps (the `res` bit cannot tell |1> from |2>).
   rcorr              — qcal's `rcorr_cmat`: undo a confusion matrix on measured populations.
-  Window             — OURS, not qcal's: the demod integration window (`readout/{q}/demod/dur`) sweep,
-                       scored exactly like Fidelity. `calibration_x6y3` does not run it.
+  Window             — the readout TIMING sweeps (`dur` / `demod/dur` / `demod/delay`), scored
+                       exactly like Fidelity. The class is ours; the knobs are qcal's, which its
+                       sessions sweep with `Separation`/`Fidelity` (spec 20 U3).
 
 Every cal takes `qubits: list` (a bare int is one qubit) and runs them SIMULTANEOUSLY (spec 13 §8):
 one program per core, ONE setup + the reruns over all of them, then per-qubit analysis on the host.
@@ -239,13 +240,14 @@ def _diagonal(drv, m, progs, shots, timeout, signs, herald=False, extra=None):
     the resident programs (prep=0, prep=1) → ({q: P(1|0)}, {q: P(1|1)}, {q: ½[P(0|0) + P(1|1)]}). The
     discriminator is the `res` bit under the demod phase ReadoutCalibration fixed — NOT retrained per
     point, so this scoring cannot train on test (spec 13 §5). `herald` selects the interleaved
-    (count, kept) decode (spec 13 §8) and must match what _ro_amp_prog compiled. `extra` adds per-run
-    params to both reruns (the demod-delay sweep's runtime `ddly`)."""
-    more = dict(extra or {})
-    p0 = rerun_counts(drv, m, progs, {q: {"prep": 0, **more} for q in progs}, shots, timeout, signs,
-                      herald=herald)
-    p1 = rerun_counts(drv, m, progs, {q: {"prep": 1, **more} for q in progs}, shots, timeout, signs,
-                      herald=herald)
+    (count, kept) decode (spec 13 §8) and must match what _ro_amp_prog compiled. `extra` is a
+    `{q: {param: value}}` dict of PER-CORE run params added to both reruns — the demod-delay sweep's
+    runtime `ddly`, which each qubit centres on its own delay (spec 20 U3)."""
+    more = extra or {}
+    p0 = rerun_counts(drv, m, progs, {q: {"prep": 0, **more.get(q, {})} for q in progs}, shots,
+                      timeout, signs, herald=herald)
+    p1 = rerun_counts(drv, m, progs, {q: {"prep": 1, **more.get(q, {})} for q in progs}, shots,
+                      timeout, signs, herald=herald)
     return p0, p1, {q: 0.5 * ((1.0 - p0[q]) + p1[q]) for q in progs}
 
 
@@ -590,8 +592,9 @@ class Window:
     hardware discriminator, argmax over the candidate `durs` (seconds). `knob` picks which of the three
     timings it moves — the name is the window, its original and default knob:
 
-      'demod/dur'   — the demod INTEGRATION WINDOW (`readout/{q}/demod/dur`). OURS, not qcal's
-                      (spec 13 §5), which is why `calibration_x6y3` does not run it;
+      'demod/dur'   — the demod INTEGRATION WINDOW (`readout/{q}/demod/dur`). The class OURS rather
+                      than qcal's (spec 13 §5), but the knob is qcal's `demod/time`, which its
+                      sessions sweep with `Separation` — so `calibration_x6y3` runs it (spec 20 U3);
       'dur'         — the readout DRIVE length (`readout/{q}/dur`), qcal's readout `time` (spec 14 F2);
       'demod/delay' — when the window OPENS after the drive starts (`readout/{q}/demod/delay`), the
                       ADC round trip qcal calibrates as `demod/delay`.
@@ -602,14 +605,22 @@ class Window:
     — that sizes the envelopes and the grid period for every point — and `rq.setup` runs once. Each
     point then just retunes and reruns the two preps (spec 08 §4): the two durations are table slot
     fields (`write_slot`), while the delay is not a field at all (the kernel adds it to the demod's
-    play time), so it is compiled as a per-run param instead."""
+    play time), so it is compiled as a per-run param instead.
+
+    `durs` (seconds) is one shared list, or a `{q: [seconds]}` dict of EQUAL LENGTH lists — the
+    per-qubit candidates a session centred on each qubit's own current timing (`± span + cfg[...]`,
+    spec 20 U3). Every qubit still steps through its list together, one rerun pair per index, so the
+    readout stays simultaneous (spec 13 §8): only the value each core is given differs."""
 
     KNOBS = ("demod/dur", "dur", "demod/delay")
 
     def __init__(self, cfg, qubits, durs=(160e-9, 400e-9), shots=32, gate="X90", knob="demod/dur"):
         assert knob in self.KNOBS, f"knob must be one of {self.KNOBS}, got {knob!r}"
         self.cfg, self.qubits = cfg, qubits_list(qubits)
-        self.durs = [float(d) for d in durs]
+        self.durs = {q: [float(d) for d in (durs[q] if isinstance(durs, dict) else durs)]
+                     for q in self.qubits}
+        lengths = {len(v) for v in self.durs.values()}
+        assert len(lengths) == 1, f"every qubit's `durs` list must be the same length, got {lengths}"
         self.shots, self.gate, self.knob = int(shots), gate, knob
         self.data, self.fit = {}, {}
 
@@ -619,16 +630,16 @@ class Window:
     def run(self, drv) -> Result:
         m = socmap(drv)
         cfg = self.cfg
-        vals = [batches(d, m) for d in self.durs]
+        vals = {q: [batches(d, m) for d in self.durs[q]] for q in self.qubits}
         if self.knob == "demod/dur":
-            for w in vals:
+            for w in (w for row in vals.values() for w in row):
                 assert w <= (1 << READOUT_MAX_WIN_LOG2), \
                     f"demod window {w} over the decoder no-overflow cap {1 << READOUT_MAX_WIN_LOG2}"
         delay = self.knob == "demod/delay"
         progs, signs, timeout = {}, {}, 0
         for q in self.qubits:
-            worst = cfg.copy()                     # compile at the LONGEST candidate: it sizes the
-            worst[self._path(q)] = max(self.durs)  # envelopes and the grid period for every point
+            worst = cfg.copy()                        # compile at the LONGEST candidate: it sizes the
+            worst[self._path(q)] = max(self.durs[q])  # envelopes and the grid period for every point
             a = units._amp_code(float(cfg[f"readout/{q}/amp"]))
             prog, period = _ro_amp_prog(m, worst, q, self.gate, self.shots, 1, a << 16, 0,
                                         runtime_ddly=delay)
@@ -639,11 +650,11 @@ class Window:
         table, field = {"demod/dur": ("demod", "dur"),
                         "dur": ("ro", "dur")}.get(self.knob, (None, None))
         fids = {q: [] for q in self.qubits}
-        for v in vals:
+        for i in range(len(self.durs[self.qubits[0]])):    # one rerun pair per point, all cores at once
             if table is not None:                  # a slot field: retune it, no recompile
                 for q in self.qubits:
-                    rq.write_slot(drv, m, q, progs[q], table, 0, field, v)
-            extra = {"ddly": v} if delay else None                     # ... or a per-run param
+                    rq.write_slot(drv, m, q, progs[q], table, 0, field, vals[q][i])
+            extra = {q: {"ddly": vals[q][i]} for q in self.qubits} if delay else None   # ... or a param
             diag = _diagonal(drv, m, progs, self.shots, timeout, signs, heralding(cfg), extra)[2]
             for q in self.qubits:
                 fids[q].append(float(np.ravel(diag[q])[0]))   # one point per rerun
@@ -651,8 +662,8 @@ class Window:
         data, fit, proposal, oks = {}, {}, {}, {}
         for q in self.qubits:
             best = int(np.argmax(fids[q]))
-            data[q] = {"x": np.array(vals, float), "y": np.array(fids[q])}
-            proposal[self._path(q)] = seconds(vals[best], m)
+            data[q] = {"x": np.array(vals[q], float), "y": np.array(fids[q])}
+            proposal[self._path(q)] = seconds(vals[q][best], m)
             fit[q] = None
             oks[q] = bool(fids[q][best] > 0.75)
         self.data, self.fit = data, fit

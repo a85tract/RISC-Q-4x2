@@ -111,6 +111,10 @@ class CosimDriver:
             else:
                 uri = f"PYRO:riscq.cosim@{uri}"
         self._proxy = Pyro5.api.Proxy(uri)
+        # A reply lost at the socket layer otherwise blocks the client FOREVER while the bench
+        # idles healthy (measured: a 4.5 h silent hang mid-E-run). 900 s sits above the bench's
+        # own 600 s per-op cap, so a healthy long op never trips it and a lost reply raises.
+        self._proxy._pyroTimeout = 900.0
         self.sim = _SimExtras(self._proxy)
         self.remote = None   # opt-in server-side batch runner (enable_remote); OFF by default so
         #                      the run layer keeps its per-op path and existing tests are unchanged

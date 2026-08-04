@@ -591,13 +591,25 @@ class TwoQubitModel:
     Readout: each qubit emits the readout tone at a phase set by its level (`level_phases`, 3 tones
     120° apart -> 3 IQ clusters a ClassifierN tells apart); the two tones ride distinct readout codes
     and SUM on the shared ADC (frequency-multiplexed, each core's demod integrating out its own). Soft
-    mode emits the population-weighted phasor of each qubit's MARGINAL; `collapse` mode samples one
-    JOINT (a, b) from |psi|² on the readout-drive rising edge, collapses the pair to it, and latches
-    each qubit's level for the window — so the two cores' per-shot bits are drawn from the correlated
-    pair state and zip into the joint P(00..11) (spec 01 §5).
+    mode emits the population-weighted phasor of each qubit's MARGINAL; `collapse` mode measures
+    PER QUBIT on each readout DAC's rising edge — sample that qubit's level from its marginal,
+    PROJECT the joint state onto it, latch for its window (`_update_shot`). Sequential local
+    projection reproduces the joint P(00..11) exactly (the second draw is conditioned on the
+    first), so on a shared readout DAC both qubits collapse on one edge — the joint sampling —
+    while split converters may open their windows at different times without corrupting a partner
+    still finishing its own local sequence (spec 01 §5 / spec 19 §7.1).
+
+    Dispersive readout (`chi != 0`, spec 19 §2): instead of the flat tone, each qubit's response is
+    a driven RESONATOR at `f_r[i]` of linewidth `kappa`, pulled +chi / -chi / chi2 by its level —
+    TwoLevelModel's `_dispersive` mechanism per qubit, built from that qubit's OWN readout drive on
+    its own converter pair (the split-converter xcheck-2q map; the collapse trigger watches every
+    distinct readout DAC). `f_cz_offset_hz` plants a resonance error off the spectrum arithmetic and
+    `cz_phase_offset` a per-line electrical delay on the drive-form phasors — the planted truths the
+    CZ cross-check's Frequency and RelativePhase experiments recover.
 
     Pure-state numpy evolution; optional `t1` amplitude-damps the pair toward |00> on IDLE batches so
-    the batched grid's idle head resets each shot (the counterpart of ThreeLevelModel's reset). The
+    the batched grid's idle head resets each shot (the counterpart of ThreeLevelModel's reset), and
+    `fast_forward` applies n of them (plus the every-batch ZZ phase) in closed form. The
     light co-sim gates recover planted f_CZ / ζ / conditional phase; full physics is manual (§6)."""
 
     _DRIVE_FLOOR = 100.0
@@ -608,11 +620,17 @@ class TwoQubitModel:
                  rabi_cz_rad_per_amp: float = 0.0, zz_rad_per_batch: float = 0.0,
                  readout_code=(2048, 2048), readout_amp=(20000.0, 20000.0), readout_phase=(0.0, 0.0),
                  level_phases=None, init=(0, 0), collapse: bool = False, t1: float | None = None,
-                 noise_scale: float = 0.0, noise_seed: int = 0):
+                 noise_scale: float = 0.0, noise_seed: int = 0,
+                 f_r=(0.0, 0.0), kappa: float = 0.0, chi: float = 0.0, chi2: float | None = None,
+                 f_cz_offset_hz: float = 0.0, cz_phase_offset=(0.0, 0.0)):
         self.params = m.params
         self.gate = [m.gate_dac(control), m.gate_dac(target)]
         self.coupler_dac = None if coupler is None else m.gate_dac(coupler)
-        self.ro_dac = m.ro_dac(control)                # the shared readout-drive DAC (window trigger)
+        # each qubit's readout-drive DAC: shared on the multiplexed builds (sim-2q1c), per-qubit on
+        # the split-converter one (xcheck-2q) — the window trigger watches every distinct one
+        self.ro_dacs = [m.ro_dac(control), m.ro_dac(target)]
+        self._ro_set = list(dict.fromkeys(self.ro_dacs))
+        self.ro_dac = self.ro_dacs[0]
         self.adc = [m.adc_of(control), m.adc_of(target)]
         self.rabi = [{(0, 1): float(rabi_ge[i]), (1, 2): float(rabi_ef[i])} for i in (0, 1)]
         self._code = [{(0, 1): units._freq_code(float(f_ge[i]), m.params),   # plain reference codes
@@ -621,7 +639,10 @@ class TwoQubitModel:
             f_cz = (float(f_ge[0]) + 2.0 * float(f_ge[1]) + float(f_ef[1])) / 4.0
         else:                                          # |11>-|02> parametric resonance (spec 01 §4.2)
             f_cz = abs(float(f_ef[1]) - float(f_ge[0]))
-        self._cz_code = units._freq_code(f_cz, m.params)
+        # a planted resonance error (spec 19 §2): the pair's |11>-|02> resonance sits off the
+        # spectrum arithmetic by this much — what the CZ Frequency cross-check has to find
+        self._cz_code = units._freq_code(f_cz + float(f_cz_offset_hz), m.params)
+        self.cz_phase_offset = (float(cz_phase_offset[0]), float(cz_phase_offset[1]))
         self.rabi_cz = float(rabi_cz_rad_per_amp)
         self.zz = float(zz_rad_per_batch)
         self.readout_code = [int(readout_code[0]), int(readout_code[1])]
@@ -636,15 +657,22 @@ class TwoQubitModel:
         self._noise_scale = float(noise_scale)
         self._rng = np.random.default_rng(noise_seed)
         self._crng = np.random.default_rng(noise_seed + 0xC0BE)
-        self._ro_active = False
-        self._shot = None                              # latched joint shot (a, b); None ⇒ silent
+        self._ro_on = {d: False for d in self._ro_set}
+        self._shot: list = [None, None]                # latched level per qubit; None ⇒ silent
+        # dispersive readout (chi != 0, spec 19 §2): per-qubit resonators at f_r[i] of linewidth
+        # kappa, pulled +chi by |0>, -chi by |1> and chi2 by |2> — TwoLevelModel's mechanism, lifted.
+        # chi = 0 (default) keeps the flat absolute-time tone above, untouched.
+        self.f_r = [float(f_r[0]), float(f_r[1])]
+        self.kappa, self.chi = float(kappa), float(chi)
+        self.chi2 = float(chi2) if chi2 is not None else -3.0 * self.chi
+        assert not self.chi or self.kappa > 0, "a dispersive readout (chi != 0) needs kappa > 0"
 
     def dac_ids(self) -> list[int]:
         ids = [self.gate[0], self.gate[1]]
         if self.coupler_dac is not None:
             ids.append(self.coupler_dac)
-        if self.collapse and self.ro_dac not in ids:
-            ids.append(self.ro_dac)
+        if self.collapse or self.chi:
+            ids.extend(d for d in self._ro_set if d not in ids)
         return ids
 
     def populations(self) -> np.ndarray:
@@ -706,7 +734,10 @@ class TwoQubitModel:
         if self.coupler_dac is None:                   # drive form: the CZ tone rides this channel too
             bcz = self._demod(t, samples, self._cz_code)
             if abs(bcz) > abs(b01) and abs(bcz) > abs(b12):
-                return True, amp_est * cmath.exp(1j * math.atan2(bcz.imag, bcz.real))
+                # cz_phase_offset[idx] is the line's planted electrical delay (spec 19 §2): it
+                # shifts where the two lines' coherent sum peaks, which is what RelativePhase finds
+                return True, amp_est * cmath.exp(
+                    1j * (math.atan2(bcz.imag, bcz.real) + self.cz_phase_offset[idx]))
         pair, b = ((0, 1), b01) if abs(b01) >= abs(b12) else ((1, 2), b12)
         if self.rabi[idx][pair]:
             self._rotate(idx, pair, self.rabi[idx][pair] * amp_est, math.atan2(b.imag, b.real))
@@ -751,17 +782,24 @@ class TwoQubitModel:
             self._relax()                              # idle batch: reset the pair toward |00>
         if self.collapse:
             self._update_shot(dac)
-        return self._emit(t)
+        return self._emit(t, dac)
 
-    def _emit(self, t: int) -> dict:
-        """Both qubits' readout tones, frequency-multiplexed and summed on the shared ADC."""
+    def _emit(self, t: int, dac) -> dict:
+        """Both qubits' readout responses. Flat mode (chi = 0): each qubit's tone from absolute
+        batch time, frequency-multiplexed and summed on the shared ADC. Dispersive mode (chi != 0):
+        each qubit's resonator answers ITS OWN readout drive on its own converter pair —
+        TwoLevelModel._dispersive per qubit, the correlations carried by the joint collapse."""
         out: dict[int, np.ndarray] = {}
         k = np.arange(ADC_BATCH)
         for idx in (0, 1):
-            phasor = self._phasor(idx)
-            ang = math.pi * self.readout_code[idx] * (ADC_BATCH * t + k) / (1 << 15) \
-                + self.readout_phase[idx]
-            lanes = self.readout_amp[idx] * (phasor.real * np.cos(ang) - phasor.imag * np.sin(ang))
+            if self.chi:
+                lanes = self._dispersive(idx, dac[self.ro_dacs[idx]])
+            else:
+                phasor = self._phasor(idx)
+                ang = math.pi * self.readout_code[idx] * (ADC_BATCH * t + k) / (1 << 15) \
+                    + self.readout_phase[idx]
+                lanes = self.readout_amp[idx] * (phasor.real * np.cos(ang)
+                                                 - phasor.imag * np.sin(ang))
             a = self.adc[idx]
             out[a] = lanes if a not in out else out[a] + lanes
         if self._noise_scale:
@@ -769,28 +807,98 @@ class TwoQubitModel:
                 out[a] = out[a] + self._rng.normal(0.0, self._noise_scale, ADC_BATCH)
         return {a: _clip16(v) for a, v in out.items()}
 
+    def _dispersive(self, idx: int, ro) -> np.ndarray:
+        """Qubit `idx`'s dispersive response this batch — TwoLevelModel._dispersive lifted to a
+        qutrit: S is the level-population mixture over three pulls (+chi, -chi, chi2), the response
+        is built from the qubit's OWN readout drive (amplitude AND phase), silent when undriven.
+        In collapse mode the populations are the latched joint shot's one-hot, so the two qubits'
+        responses are drawn from the correlated pair state."""
+        x = ro.astype(float)
+        if math.sqrt(2.0 * float(np.mean(x * x))) <= self._DRIVE_FLOOR:
+            return np.zeros(ADC_BATCH)                            # not driven ⇒ no response
+        p = self._levels(idx)
+        if not p.any():
+            return np.zeros(ADC_BATCH)                            # collapse mode, no window latched
+        code = TwoLevelModel._carrier_code(x)
+        f = units.code_to_freq(code, self.params)
+        s = sum(p[L] * self._lorentzian(idx, f, L) for L in range(3))
+        i_lanes, q_lanes = TwoLevelModel._analytic(x, code)
+        psi = self.readout_phase[idx] + cmath.phase(s)
+        return ((self.readout_amp[idx] / units.AMP_SCALE) * abs(s)
+                * (i_lanes * math.cos(psi) - q_lanes * math.sin(psi)))
+
+    def _lorentzian(self, idx: int, f: float, level: int) -> complex:
+        """Qubit `idx`'s resonator at probe `f`, pulled by `level` (|0> → +chi, |1> → -chi,
+        |2> → chi2 — the planted level-2 pull, spec 19 §2)."""
+        pull = (self.chi, -self.chi, self.chi2)[level]
+        return 1.0 / (1.0 + 2j * (f - self.f_r[idx] - pull) / self.kappa)
+
+    def _levels(self, idx: int) -> np.ndarray:
+        """Qubit `idx`'s level distribution as the readout sees it: the latched collapsed level's
+        one-hot (collapse mode; all-zero before a window has latched) or its marginal (soft)."""
+        if self.collapse:
+            p = np.zeros(3)
+            if self._shot[idx] is not None:
+                p[self._shot[idx]] = 1.0
+            return p
+        return self.marginals()[idx]
+
     def _phasor(self, idx: int) -> complex:
         """Qubit `idx`'s readout phasor: its collapsed level's tone (collapse mode) or the
         population-weighted sum over its marginal (soft mode)."""
         if self.collapse:
-            return 0j if self._shot is None else cmath.exp(1j * self.level_phases[self._shot[idx]])
+            return 0j if self._shot[idx] is None \
+                else cmath.exp(1j * self.level_phases[self._shot[idx]])
         pops = self.marginals()[idx]
         return sum(pops[L] * cmath.exp(1j * self.level_phases[L]) for L in range(3))
 
     def _update_shot(self, dac) -> None:
-        """On the readout drive's rising edge sample one JOINT (a, b) from |psi|², collapse the pair to
-        it, and latch it for the window (both qubits read the same correlated shot); silent when undriven."""
-        ro = dac[self.ro_dac].astype(float)
-        on = math.sqrt(2.0 * float(np.mean(ro * ro))) > self._DRIVE_FLOOR
-        if on and not self._ro_active:
-            p = self.populations().ravel()
-            i = int(self._crng.choice(9, p=p / p.sum()))
-            self._psi[:] = 0.0
-            self._psi[i // 3, i % 3] = 1.0
-            self._shot = (i // 3, i % 3)
-        elif not on:
-            self._shot = None
-        self._ro_active = on
+        """PER-QUBIT projective readout: on a readout DAC's rising edge, each qubit reading on it
+        samples its level from its marginal of the CURRENT joint state, PROJECTS the pair onto that
+        level, and latches it for its window; the latch clears when its drive falls.
+
+        Sequential projection in the computational basis reproduces the joint statistics exactly —
+        the second qubit's marginal is conditioned on the first's outcome — and, because each
+        measurement is local, it commutes with any LOCAL operation still in flight on the partner.
+        That is the physics of split per-qubit converters, and it is what makes the model immune to
+        the cross-core grid skew C7 measured (one core's readout opening before the partner's close
+        has played; spec 19 §7.1): the early qubit's collapse cannot corrupt the partner's own
+        close → readout sequence. On the multiplexed builds both qubits share one DAC and collapse
+        on the same edge — the joint sampling, unchanged."""
+        for d in self._ro_set:
+            on = math.sqrt(2.0 * float(np.mean(np.square(dac[d].astype(float))))) \
+                > self._DRIVE_FLOOR
+            if on and not self._ro_on[d]:
+                idle = [i for i in (0, 1) if self.ro_dacs[i] == d and self._shot[i] is None]
+                if idle == [0, 1]:
+                    # both qubits on one edge (the multiplexed builds): the ONE joint draw,
+                    # bit-identical to the pre-split-converter behavior (same RNG consumption)
+                    p = self.populations().ravel()
+                    k = int(self._crng.choice(9, p=p / p.sum()))
+                    self._psi[:] = 0.0
+                    self._psi[k // 3, k % 3] = 1.0
+                    self._shot = [k // 3, k % 3]
+                else:
+                    for i in idle:
+                        self._collapse_one(i)
+            elif not on:
+                for i in (0, 1):
+                    if self.ro_dacs[i] == d:
+                        self._shot[i] = None
+            self._ro_on[d] = on
+
+    def _collapse_one(self, idx: int) -> None:
+        """Sample qubit `idx`'s level from its marginal and project the joint state onto it."""
+        p = self.marginals()[idx]
+        lv = int(self._crng.choice(3, p=p / p.sum()))
+        keep = (self._psi[lv, :] if idx == 0 else self._psi[:, lv]).copy()
+        norm = math.sqrt(float(np.vdot(keep, keep).real))
+        self._psi[:] = 0.0
+        if idx == 0:
+            self._psi[lv, :] = keep / norm
+        else:
+            self._psi[:, lv] = keep / norm
+        self._shot[idx] = lv
 
     def _relax(self) -> None:
         """Amplitude-damp the pair toward |00> one idle batch: shrink every amplitude but |00>'s by the
@@ -803,6 +911,28 @@ class TwoQubitModel:
         if lost > 0.0:
             mag = math.sqrt(max(0.0, abs(a00) ** 2 + lost))
             self._psi[0, 0] = mag * (a00 / abs(a00)) if abs(a00) > 1e-12 else mag
+
+    def fast_forward(self, n: int) -> None:
+        """n idle batches in closed form — `Medium.idle`'s contract (spec 15 §3.3 / spec 19 §2).
+        The ZZ phase applies every batch, so |11> accrues n·ζ; the damping is `_relax`'s map at
+        decay^n (each step scales every non-|00> amplitude by the same factor, so the n-fold
+        composition depends only on the current state). The collapse latch clears exactly as
+        stepping n silent batches through `_update_shot` would have."""
+        if n <= 0:
+            return
+        if self.zz:
+            self._psi[1, 1] *= cmath.exp(-1j * self.zz * n)
+        if self.t1:
+            a00 = self._psi[0, 0]
+            self._psi *= self._t1_decay ** n
+            self._psi[0, 0] = a00
+            lost = 1.0 - float(np.vdot(self._psi, self._psi).real)
+            if lost > 0.0:
+                mag = math.sqrt(max(0.0, abs(a00) ** 2 + lost))
+                self._psi[0, 0] = mag * (a00 / abs(a00)) if abs(a00) > 1e-12 else mag
+        if self.collapse:
+            self._shot = [None, None]
+            self._ro_on = {d: False for d in self._ro_set}
 
 
 class MultiModel:
@@ -891,5 +1021,9 @@ def build_model(spec: dict, m) -> QuantumModel:
             readout_phase=spec.get("readout_phase", (0.0, 0.0)),
             level_phases=spec.get("level_phases"), init=spec.get("init", (0, 0)),
             collapse=spec.get("collapse", False), t1=spec.get("t1"),
-            noise_scale=spec.get("noise_scale", 0.0), noise_seed=spec.get("noise_seed", 0))
+            noise_scale=spec.get("noise_scale", 0.0), noise_seed=spec.get("noise_seed", 0),
+            f_r=spec.get("f_r", (0.0, 0.0)), kappa=spec.get("kappa", 0.0),
+            chi=spec.get("chi", 0.0), chi2=spec.get("chi2"),
+            f_cz_offset_hz=spec.get("f_cz_offset_hz", 0.0),
+            cz_phase_offset=spec.get("cz_phase_offset", (0.0, 0.0)))
     raise ValueError(f"unknown QuantumModel kind {kind!r}")

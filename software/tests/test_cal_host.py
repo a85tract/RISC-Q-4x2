@@ -57,6 +57,16 @@ def _cfg(m, qfreq=F_GE, x90_amp=0.5, dur=40, drive=None, relax=1600):
     return c
 
 
+def _cfg2(m, freqs=(F_GE, F_GE), x90_amp=0.5, relax=1600):
+    """`_cfg`'s two-core twin (spec 13 §8): the same tree with a block for core 0 AND core 1, each on
+    its own carrier — what a simultaneous multi-qubit cal reads."""
+    c = _cfg(m, qfreq=freqs[0], x90_amp=x90_amp, relax=relax)
+    other = _cfg(m, qfreq=freqs[1], x90_amp=x90_amp, relax=relax)
+    c["qubit/1"] = other["qubit/0"]
+    c["readout/1"] = other["readout/0"]
+    return c
+
+
 def _sigma_per_code(m, carrier=F_GE):
     """The drive integral per amplitude code — linear, so one evaluation fixes the whole axis.
     This is the model's own Σ amp_est, i.e. what `rabi_rad_per_amp` multiplies."""
@@ -359,6 +369,84 @@ def test_frequency_proposal_moves_the_carrier_toward_f_ge(responder, socmap, d0_
         "the config frequency did not move toward f_ge"
 
 
+# ── §8's per-qubit verdict: a cal that runs the whole chip refuses PER QUBIT (spec 20 U0) ──
+
+def test_frequency_verdict_is_per_qubit(responder, socmap):
+    """`Frequency` computes `oks = {q: bool}` and used to drop it at the `Result`. With an empty
+    `oks`, `Result.apply` is all-or-nothing and raises the moment ANY qubit fails — so one drifted
+    qubit vetoed the update of all the others, exactly what the per-qubit apply of spec 13 §8
+    exists to prevent (and what the notebook's per-qubit refusal branch reads).
+
+    Both runs answer the textbook Ramsey fringe of a carrier detuned by δ, one δ per core (the
+    single-core test's physics, twice). In the second, core 1's T2 is far shorter than the first
+    wait, so its fringe is already dead when the sweep starts and every damped-cosine fit refuses:
+    core 1 gets no V and no proposal, while core 0's is untouched. `apply()` then has to write core
+    0 rather than refuse the pair."""
+    m = socmap
+    r = responder(CONFIG)
+    d_code = {0: 60, 1: -60}                                # each core its own planted detuning
+    drive = {q: units.code_to_freq(units._freq_code(F_GE, m.params) + d, m.params)
+             for q, d in d_code.items()}
+
+    def run(t2):
+        @r.answer
+        def _(progs, params):
+            out = {}
+            for q, prog in progs.items():
+                waits = int_axis(prog, params.get(q), x0="w0", dx="dw")
+                t_s = units.ns(waits, m.params) * 1e-9
+                delta_hz = units.code_to_freq(d_code[q], m.params)
+                phi = _vz_phase(prog, params[q]) + 2 * math.pi * delta_hz * t_s
+                out[q] = {"out": _out(0.5 + 0.5 * np.exp(-waits / t2[q]) * np.cos(phi), prog)}
+            return out
+
+        cfg = _cfg2(m, freqs=(drive[0], drive[1]), relax=800)
+        cal = Frequency(cfg, [0, 1], detune=units.code_to_freq(200, m.params), n_detune=4,
+                        t0=_s(8, m), dt=_s(4, m), points=12, shots=96)
+        return cfg, cal.run(r.drv)
+
+    _, both = run({0: 3000.0, 1: 3000.0})
+    assert both.ok and both.oks == {0: True, 1: True}
+
+    cfg, one = run({0: 3000.0, 1: 2.0})                     # core 1 dephases before the first wait
+    assert not one.ok and one.oks == {0: True, 1: False}
+    before = cfg["qubit/1/freq"]
+    one.apply()                                             # must NOT raise: core 0 passed
+    assert cfg["qubit/0/freq"] == one.proposal["qubit/0/freq"], "core 0's fit was thrown away"
+    assert cfg["qubit/1/freq"] == before, "core 1 failed — its carrier must stay put"
+
+
+def test_phase_verdict_is_per_qubit(responder, socmap):
+    """The same claim for `Phase`, through a different guard: qcal fails a line crossing that falls
+    OUTSIDE the swept span (`_line_crossing`'s in_range), so a qubit whose Stark shift is larger
+    than the sweep half-width refuses while its neighbour, centred in the span, still writes.
+
+    The answer is `test_heralded_phase_matches_unheralded`'s pair of three-X90 composites, each
+    core's projections ½(1 ∓ sin(φ − φ*)) around its OWN planted frame φ*."""
+    m = socmap
+    r = responder(CONFIG)
+    span = 0.3
+    stark = {0: 0.1, 1: 0.6}                     # core 1's frame is beyond ±span: no crossing swept
+
+    @r.answer
+    def _(progs, params):
+        out = {}
+        for q, prog in progs.items():
+            d = np.sin(_vz_phase(prog, params[q]) - stark[q])
+            p1 = 0.5 * (1 - d) if prog.bindings["seq"] == Y180_X90 else 0.5 * (1 + d)
+            out[q] = {"out": _out(p1, prog)}
+        return out
+
+    cfg = _cfg2(m, relax=1000)
+    res = Phase(cfg, [0, 1], points=11, span=span, shots=64).run(r.drv)
+    assert not res.ok and res.oks == {0: True, 1: False}
+    assert res.proposal["qubit/0/x90/vz"][0] == pytest.approx(stark[0], abs=0.02)
+    assert "qubit/1/x90/vz" not in res.proposal
+    res.apply()                                             # must NOT raise: core 0 passed
+    assert cfg["qubit/0/x90/vz"] == res.proposal["qubit/0/x90/vz"]
+    assert "qubit/1/x90/vz" not in cfg, "core 1 failed — no frame may be written for it"
+
+
 # ── the readout cals (spec 13 §5): clusters, the discrimination frame, the confusion diagonal ──
 
 def _antipodal_answer(a_over_sigma=RO_A_OVER_SIGMA):
@@ -553,6 +641,83 @@ def test_window_picks_the_longer_integration(responder, socmap):
     assert res.ok
     assert fid[1] > fid[0] + 0.05, "the longer integration window did not read out better"
     assert res.proposal["readout/0/demod/dur"] == pytest.approx(_s(durs[1], m))
+
+
+def test_window_sweeps_each_qubit_around_its_own_timing(responder, socmap):
+    """spec 20 U3 — `durs` as a `{q: [seconds]}` dict. The reference centres each window sweep on
+    THAT qubit's current timing (`± span + cfg[readout/{q}/…]`), which one shared list cannot do
+    once two qubits sit at different timings; the cores still step through their lists TOGETHER, one
+    rerun pair per index, so the readout stays simultaneous (spec 13 §8).
+
+    The answer is the matched filter, from first principles: a readout tone lasting T batches puts
+    signal ∝ min(w, T) into a window of w while the noise grows as √w, so the SNR peaks exactly at
+    w = T. The two cores are planted with different T and each given the three candidates centred on
+    its own; each argmax has to land on its own optimum. One shared list — or a retune that reached
+    only one core — cannot satisfy both."""
+    m = socmap
+    r = responder(CONFIG)
+    tone = {0: 32, 1: 96}                               # each core's readout tone length (batches)
+    durs = {q: [_s(t // 2, m), _s(t, m), _s(3 * t // 2, m)] for q, t in tone.items()}
+
+    @r.answer
+    def _(progs, params):
+        out = {}
+        for q, prog in progs.items():
+            w = r.slot(q, "demod", 0, "dur")
+            assert w is not None, f"Window did not retune core {q}'s demod slot before rerunning"
+            eps = _misassign(0.2 * min(w, tone[q]) / math.sqrt(w))
+            out[q] = {"out": _out([eps if int(params[q]["prep"]) == 0 else 1 - eps], prog)}
+        return out
+
+    cfg = _cfg2(m, x90_amp=0.495)
+    for q in tone:                                      # the config sits at the longest candidate
+        cfg[f"readout/{q}/demod/dur"] = _s(3 * max(tone.values()) // 2, m)
+        cfg[f"readout/{q}/dur"] = _s(2 * max(tone.values()), m)
+    res = Window(cfg, [0, 1], durs=durs, shots=200).run(r.drv)
+
+    assert res.ok
+    for q, t in tone.items():
+        assert int(np.argmax(res.data[q]["y"])) == 1, \
+            f"core {q}'s best window is not the one matched to its own tone: {res.data[q]['y']}"
+        assert res.proposal[f"readout/{q}/demod/dur"] == pytest.approx(_s(t, m))
+
+
+def test_window_delay_is_swept_as_a_per_core_param(responder, socmap):
+    """The same dict sweep on `demod/delay`, which is NOT a table field — the kernel adds it to the
+    demod's play time — so it rides a per-run param instead of a `write_slot`, and that param has to
+    be written per CORE (spec 20 U3).
+
+    The answer is the echo's arrival: core q's readout comes back after its own round trip τ_q, so a
+    window as long as the tone collects max(0, T − |d − τ_q|) of it and the diagonal peaks exactly at
+    d = τ_q. One `ddly` shared by both cores would move them together and one of them would miss."""
+    m = socmap
+    r = responder(CONFIG)
+    tone = 32                                           # the echo's length (batches), both cores
+    tau = {0: 16, 1: 48}                                # ... but each core's round trip differs
+    durs = {q: [_s(t - 16, m), _s(t, m), _s(t + 16, m)] for q, t in tau.items()}
+
+    @r.answer
+    def _(progs, params):
+        out = {}
+        for q, prog in progs.items():
+            overlap = max(0.0, tone - abs(int(params[q]["ddly"]) - tau[q]))
+            eps = _misassign(0.06 * overlap)
+            out[q] = {"out": _out([eps if int(params[q]["prep"]) == 0 else 1 - eps], prog)}
+        return out
+
+    cfg = _cfg2(m, x90_amp=0.495)
+    longest = max(tau.values()) + 16
+    for q in tau:                                       # the config sits at the longest candidate
+        cfg[f"readout/{q}/demod/dur"] = _s(tone, m)
+        cfg[f"readout/{q}/demod/delay"] = _s(longest, m)
+        cfg[f"readout/{q}/dur"] = _s(2 * (longest + tone), m)
+    res = Window(cfg, [0, 1], durs=durs, shots=200, knob="demod/delay").run(r.drv)
+
+    assert res.ok
+    for q, t in tau.items():
+        assert int(np.argmax(res.data[q]["y"])) == 1, \
+            f"core {q} did not peak on its own round trip: {res.data[q]['y']}"
+        assert res.proposal[f"readout/{q}/demod/delay"] == pytest.approx(_s(t, m))
 
 
 # ── Separation / Punchout: the dispersive resonator sweeps ──

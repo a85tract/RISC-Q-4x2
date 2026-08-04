@@ -226,6 +226,31 @@ def test_from_qcal_save_qcal_uncalibrated_is_verbatim(tmp_path):
     assert b == a
 
 
+def test_save_qcal_persists_the_window_timings(tmp_path):
+    """(20 U1 gate) `from_qcal` reads the readout DRIVE LENGTH (`readout[q].time`) and the demod
+    DELAY, and `Window(knob='dur'|'demod/delay')` proposes both — but `save_qcal` used to write back
+    only the demod window, so those two proposals were lost the moment the session was persisted.
+
+    Move them on one qubit, save, reload: both must come back. The untouched-tree verbatim
+    round-trip (`test_from_qcal_save_qcal_uncalibrated_is_verbatim`) is the other half of the claim
+    — these are seconds on both sides, so writing them unconditionally cannot perturb a tree
+    nothing calibrated."""
+    cfg = Config.from_qcal(X6Y3_YAML)
+    cfg["readout/0/dur"] = 6.4e-7                      # a longer readout drive (Window knob='dur')
+    cfg["readout/0/demod/delay"] = 4.2e-7              # the window opens later (knob='demod/delay')
+    out = tmp_path / "config.yaml"
+    cfg.save_qcal(out)
+
+    with open(out) as f:
+        tree = yaml.safe_load(f)
+    assert tree["readout"][0]["time"] == 6.4e-7
+    assert tree["readout"][0]["demod"]["delay"] == 4.2e-7
+    back = Config.from_qcal(out)
+    assert back["readout/0/dur"] == 6.4e-7
+    assert back["readout/0/demod/delay"] == 4.2e-7
+    assert back.to_dict() == cfg.to_dict()             # nothing else moved
+
+
 def test_from_qcal_loads_ef_and_two_qubit_and_writes_back(tmp_path):
     """(X0 gate) the EF keys land on the paths the EF consumers read (base.ef_pulse:
     `qubit/{q}/EF/x90/...`), the two_qubit subtrees are carried verbatim, and a calibrated EF/CZ

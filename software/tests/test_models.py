@@ -707,10 +707,10 @@ def test_twoqubit_collapse_samples_the_joint_pair_state():
     n, counts = 8000, {}
     for i in range(n):
         md._psi[:] = target
-        md._ro_active = False
+        md._ro_on = {d: False for d in md._ro_set}
         md.adc_batch(2 * i, {0: z, 1: z, 3: z, 2: z})            # ro idle → arm the edge
         md.adc_batch(2 * i + 1, {0: z, 1: z, 3: z, 2: on})       # rising edge → sample + collapse
-        counts[md._shot] = counts.get(md._shot, 0) + 1
+        counts[tuple(md._shot)] = counts.get(tuple(md._shot), 0) + 1
     for cell, amp in (((0, 0), 0.5), ((1, 1), 0.3), ((0, 1), 0.2)):
         assert abs(counts.get(cell, 0) / n - amp) < 0.03, f"{cell}: {counts.get(cell, 0) / n:.3f} vs {amp}"
     assert set(counts) <= {(0, 0), (1, 1), (0, 1)}, f"sampled a zero-amplitude state: {set(counts)}"
@@ -945,3 +945,106 @@ def test_classifiern_separates_three_clusters():
     assert np.all(np.diag(conf) > 0.95)                  # each level classified as itself
     assert np.allclose(conf.sum(1), 1.0)
     assert clf.separation > 1.0                          # well separated (qcal SNR)
+
+
+# ── TwoQubitModel spec-19 extensions: fast_forward, dispersive split converters, planted CZ errors ──
+
+MX = SocMap(SocParams.load(Path(__file__).resolve().parents[1] / "xcheck" / "configs" / "xcheck-2q.json"))
+
+
+def test_twoqubit_fast_forward_equals_stepped_idle():
+    """`fast_forward(n)` is exactly n silent batches (Medium.idle's contract): the ZZ phase accrues
+    n·ζ, the |00>-refilling damping composes in closed form, and the collapse latch clears as
+    stepping through `_update_shot` would."""
+    kw = dict(zz_rad_per_batch=0.03, t1=40.0, collapse=True, noise_seed=5)
+    a, b = _tqd(**kw), _tqd(**kw)
+    psi = np.zeros((3, 3), complex)
+    psi[0, 0], psi[1, 1], psi[0, 2], psi[1, 0] = 0.5, 0.6j, 0.4, math.sqrt(1 - .25 - .36 - .16)
+    a._psi[:] = psi; b._psi[:] = psi
+    a._shot, a._ro_on = [1, 1], {d: True for d in a._ro_set}
+    b._shot, b._ro_on = [1, 1], {d: True for d in b._ro_set}
+    n = 50
+    silent = {d: np.zeros(BATCH_SIZE, dtype=np.int64) for d in a.dac_ids()}
+    for t in range(n):
+        a.adc_batch(t, silent)
+    b.fast_forward(n)
+    assert np.allclose(a._psi, b._psi, atol=1e-12), f"max dev {np.abs(a._psi - b._psi).max():.2e}"
+    assert a._shot == [None, None] and b._shot == [None, None]
+    assert not any(a._ro_on.values()) and not any(b._ro_on.values())
+
+
+def test_twoqubit_dispersive_matches_twolevel_and_splits_converters():
+    """Dispersive mode (chi != 0) on the split-converter xcheck-2q map: each qubit's response is
+    TwoLevelModel._dispersive's, computed from ITS OWN readout drive on its own converter pair —
+    exactly equal on the pure |0>/|1> states — and an undriven qubit's ADC stays silent."""
+    fr = [units.code_to_freq(509, MX.params) - 0.5e6, units.code_to_freq(253, MX.params) - 0.5e6]
+    kw = dict(f_r=tuple(fr), kappa=4e6, chi=1.2e6, readout_amp=(6500.0, 6500.0))
+    md = models.TwoQubitModel(MX, coupler=None, f_ge=(50e6, 60e6), f_ef=(400e6, 450e6), **kw)
+    assert md.ro_dacs[0] != md.ro_dacs[1], "xcheck-2q must give each core its own readout DAC"
+    assert set(md.dac_ids()) >= set(md.ro_dacs), "chi != 0 must pull the readout drives in"
+    k = np.arange(BATCH_SIZE)
+    ro = {i: np.rint(6000 * np.cos(math.pi * c * k / (1 << 15))).astype(np.int64)
+          for i, c in ((0, 509), (1, 253))}
+    z = np.zeros(BATCH_SIZE, dtype=np.int64)
+    for a, b in ((0, 0), (1, 1), (0, 1)):
+        md._psi[:] = 0.0; md._psi[a, b] = 1.0
+        dac = {d: z for d in md.dac_ids()}
+        dac[md.ro_dacs[0]] = ro[0]; dac[md.ro_dacs[1]] = ro[1]
+        out = md.adc_batch(0, dac)
+        for idx, level in ((0, a), (1, b)):
+            tl = models.TwoLevelModel(MX, core=idx, f_r=fr[idx], kappa=4e6, chi=1.2e6,
+                                      readout_amp=6500.0)
+            want = _clip16(tl._dispersive(ro[idx], +1.0 if level == 0 else -1.0))
+            assert np.array_equal(out[md.adc[idx]], want), f"state {(a, b)} qubit {idx} response"
+    md._psi[:] = 0.0; md._psi[1, 0] = 1.0
+    dac = {d: z for d in md.dac_ids()}
+    dac[md.ro_dacs[0]] = ro[0]                               # only qubit 0's readout driven
+    out = md.adc_batch(1, dac)
+    assert np.any(out[md.adc[0]]), "driven qubit must respond"
+    assert not np.any(out[md.adc[1]]), "undriven qubit's converter must stay silent"
+    # the three levels answer with three distinct phasors (|2> at its own planted pull chi2)
+    resp = {}
+    for lv in (0, 1, 2):
+        md._psi[:] = 0.0; md._psi[lv, 0] = 1.0
+        lanes = md.adc_batch(2, dac)[md.adc[0]].astype(float)
+        # demod against the drive's own batch-local phase (ADC lane j = DAC sample 4j)
+        resp[lv] = complex(np.sum(lanes * np.exp(
+            -1j * math.pi * 509 * 4 * np.arange(ADC_BATCH) / (1 << 15))))
+    for x, y in ((0, 1), (0, 2), (1, 2)):
+        assert abs(resp[x] - resp[y]) > 0.1 * abs(resp[0]), f"levels {x}/{y} indistinct"
+
+
+def test_twoqubit_cz_line_phase_offset_shifts_the_null():
+    """A planted per-line phase offset (spec 19 §2) moves the coherent-sum optimum: in-phase lines
+    with an offset of π extinguish the CZ activation (the 2A·cos(Δφ/2) null), 2π/3 halves the
+    transfer, and a config relative phase of −offset restores it — RelativePhase's answer."""
+    A, N = 10000.0, 40
+    rabi = math.pi / (2 * A * N)                             # a π on {|11>,|02>} at Δφ = 0
+    def p02(off, dphi=0.0):
+        md = _tqd(rabi_cz_rad_per_amp=rabi, cz_phase_offset=(0.0, off))
+        md._psi[:] = 0.0; md._psi[1, 1] = 1.0
+        for t in range(N):
+            md.adc_batch(t, _two_line_dac(_DCZ_CODE, A, A, dphi, t))
+        return float(md.populations()[0, 2])
+    assert p02(0.0) > 0.98, f"aligned lines must fully transfer: {p02(0.0):.3f}"
+    assert abs(p02(2 * math.pi / 3) - 0.5) < 0.03, f"2π/3 offset should halve: {p02(2 * math.pi / 3):.3f}"
+    assert p02(math.pi) < 0.02, f"π offset must extinguish: {p02(math.pi):.3f}"
+    assert p02(0.4, dphi=-0.4) > 0.98, f"a −offset relative phase must restore: {p02(0.4, -0.4):.3f}"
+
+
+def test_twoqubit_f_cz_offset_moves_the_resonance():
+    """A planted `f_cz_offset_hz` (spec 19 §2) moves the {|11>,|02>} resonance off the spectrum
+    arithmetic by exactly the code-rounded offset — what the CZ Frequency cross-check must find."""
+    A, N, off_codes = 10000.0, 40, 40
+    off_hz = units.code_to_freq(off_codes, M.params)
+    md = _tqd(f_cz_offset_hz=off_hz)
+    assert md._cz_code == _DCZ_CODE + off_codes
+    rabi = math.pi / (2 * A * N)
+    def p02(code):
+        md = _tqd(rabi_cz_rad_per_amp=rabi, f_cz_offset_hz=off_hz)
+        md._psi[:] = 0.0; md._psi[1, 1] = 1.0
+        for t in range(N):
+            md.adc_batch(t, _two_line_dac(code, A, A, 0.0, t))
+        return float(md.populations()[0, 2])
+    assert p02(_DCZ_CODE + off_codes) > 0.95, "no transfer at the shifted resonance"
+    assert p02(_DCZ_CODE + off_codes) > p02(_DCZ_CODE) + 0.3, "resonance did not move"
