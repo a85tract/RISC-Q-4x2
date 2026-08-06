@@ -23,7 +23,8 @@ import pytest
 
 from riscq.cal import Classifier, Config, ReadoutFidelity
 from riscq.cal.base import GATE_ENV, gate_sigma
-from riscq.cal.readout import ClassifierN, _ef_prep_prog, _rawiq_prog, rcorr, res_fidelity
+from riscq.cal.readout import (ClassifierN, _ef_prep_prog, _gmm_fit, _gmm_predict, _rawiq_prog,
+                               _snr, rcorr, res_fidelity)
 from riscq.pulses import Pulse, units
 from tests.probe import Probe
 
@@ -80,6 +81,140 @@ def test_res_fidelity_collapses_off_resonance_even_though_the_clusters_are_well_
     assert clf.separation > 2.0, "the clusters are well separated to a host classifier"
     assert res_fidelity(iq0, iq1, _proposed_phase(iq0, iq1)) < 0.6, \
         "the hard-zero res bit should be at chance here"
+
+
+# ── the unsupervised GMM classifier (spec 21) ──
+#
+# The prep label is not the true state at measurement: preparation errs and the qubit decays
+# across the prep→readout gap (14.8 % of |1> at the old SEP = 96, spec 15 §9.3), so shots that
+# actually read out as |0> carry a |1> label. qcal therefore fits its classifier UNSUPERVISED on
+# the pooled shots (labels only seed means_init and score); these tests plant exactly that error
+# and check the fit shrugs it off where the labelled statistics measurably do not.
+
+M0, M1 = np.array([1.0, 0.0]), np.array([-1.0, 0.5])     # true cluster centroids, ‖Δ‖ ≈ 2.06
+
+
+def _decayed_clusters(eps: float, n: int = 400, sigma: float = 0.15, seed: int = 7):
+    """The prep-error scenario the GMM cut-over exists for: a fraction `eps` of the |1>-prep shots
+    decayed before the window and actually read out as |0> — they sit in the |0> cloud with a |1>
+    label. Returns (iq0, iq1) with the decayed shots at the TAIL of iq1."""
+    rng = np.random.default_rng(seed)
+    k = int(round(eps * n))
+    iq0 = rng.normal(M0, sigma, (n, 2))
+    iq1 = np.vstack([rng.normal(M1, sigma, (n - k, 2)), rng.normal(M0, sigma, (k, 2))])
+    return iq0, iq1
+
+
+def test_gmm_recovers_the_true_means_under_prep_decay():
+    """8 % decay drags the LABELLED |1> mean toward the |0> cloud by ε·dist ≈ 0.16; the fitted
+    component mean stays within shot noise (σ/√n ≈ 0.008) of the true centroid."""
+    iq0, iq1 = _decayed_clusters(0.08)
+    clf = Classifier(iq0, iq1)
+    assert np.hypot(*(clf.m0 - M0)) < 0.05
+    assert np.hypot(*(clf.m1 - M1)) < 0.05
+    assert np.hypot(*(iq1.mean(0) - M1)) > 0.1     # the labelled mean the old classifier trained on
+
+
+def test_gmm_assigns_decayed_shots_to_the_cluster_they_landed_in():
+    """The 32 decayed shots ARE |0> at measurement; the confusion's row-1 off-diagonal becomes the
+    honest prep error instead of being absorbed into a shifted threshold."""
+    iq0, iq1 = _decayed_clusters(0.08)
+    clf = Classifier(iq0, iq1)
+    assert np.all(clf.classify(iq1[-32:]) == 0)
+    conf = clf.confusion()
+    assert abs(conf[1, 0] - 0.08) < 0.02
+    assert conf[0, 0] > 0.99
+
+
+def test_fitted_separation_is_immune_to_the_decay_inflated_variance():
+    """The labelled |1> cloud is BIMODAL under decay — its variance carries an ε(1−ε)·dist² term
+    that depresses the labelled-cloud `_snr` by ~2× here, exactly the statistic Separation used to
+    argmax. The fitted σ is the within-cluster width, so the fitted SNR stays at its clean value."""
+    iq0, iq1 = _decayed_clusters(0.08)
+    clean = Classifier(*_decayed_clusters(0.0)).separation
+    clf = Classifier(iq0, iq1)
+    assert abs(clf.separation - clean) / clean < 0.05
+    assert clf.separation > 1.5 * _snr(iq0, iq1)
+
+
+def test_gmm_fit_is_deterministic():
+    """No RNG anywhere in the fit (unlike sklearn's, which k-means-seeds weights/variances even
+    when means_init is given): two fits of the same input are bit-identical."""
+    iq0, iq1 = _decayed_clusters(0.08)
+    for a, b in zip(_gmm_fit([iq0, iq1]), _gmm_fit([iq0, iq1])):
+        assert np.array_equal(a, b)
+
+
+def test_gmm_matches_sklearn():
+    """Dev-env-only parity with the reference implementation qcal actually calls (NOT a package
+    dependency): same pooled data, same init → same converged mixture and the same assignments."""
+    mixture = pytest.importorskip("sklearn.mixture")
+    iq0, iq1 = _decayed_clusters(0.08)
+    means, sigmas, weights = _gmm_fit([iq0, iq1])
+    x = np.vstack([iq0, iq1])
+    g = mixture.GaussianMixture(2, covariance_type="spherical", random_state=0,
+                                means_init=np.vstack([iq0.mean(0), iq1.mean(0)]))
+    g.fit(x)
+    ours, theirs = np.argsort(means[:, 0]), np.argsort(g.means_[:, 0])
+    assert np.allclose(means[ours], g.means_[theirs], atol=5e-3)
+    assert np.allclose(sigmas[ours], np.sqrt(g.covariances_)[theirs], atol=5e-3)
+    agree = float(np.mean(_gmm_predict(x, means, sigmas, weights) == g.predict(x)))
+    assert max(agree, 1.0 - agree) > 0.995         # order-insensitive: identical boundaries
+
+
+def test_classifier_anchor_invariant():
+    """The anchor guard's invariant: whatever EM converges to, the component holding the majority
+    of the |0>-prep shots is named 0 — including under heavy overlap, where the component order is
+    at EM's mercy and qcal's init-anchoring-only scheme could silently flip labels."""
+    for s0, s1, sigma in ((0.6 + 0.8j, -0.6 - 0.8j, 0.05),
+                          (1.0 + 0.0j, 1.02 + 0.02j, 0.4),      # nearly coincident
+                          (0.0 + 0.0j, 0.1 + 0.1j, 0.02)):
+        iq0, iq1 = _clusters(s0, s1, sigma=sigma, seed=11)
+        clf = Classifier(iq0, iq1)
+        assert float(np.mean(clf.classify(iq0) == 0)) >= 0.5
+
+
+def test_gmm_survives_coincident_clusters():
+    """The reg_covar floor: identical (zero-variance) clouds neither NaN nor divide by zero;
+    separation honestly reads 0."""
+    pts = np.zeros((64, 2))
+    clf = Classifier(pts, pts.copy())
+    assert np.all(np.isfinite(clf.means)) and np.all(np.isfinite(clf.sigmas))
+    assert np.isfinite(clf.separation) and clf.separation < 0.5
+
+
+def test_fitted_snr_argmax_matches_the_labelled_argmax_on_clean_sweeps():
+    """Separation's per-point statistic moved from the labelled-cloud `_snr` to the fitted GMM SNR
+    (spec 21 §2.5): on clean data the two numbers track closely and the DECISION — the argmax over
+    the sweep — must agree exactly."""
+    dists = [0.6, 1.2, 2.0, 1.4, 0.8]
+    fitted, labelled = [], []
+    for i, d in enumerate(dists):
+        iq0, iq1 = _clusters(0j, complex(d), n=200, sigma=0.15, seed=20 + i)
+        fitted.append(Classifier(iq0, iq1).separation)
+        labelled.append(_snr(iq0, iq1))
+    assert int(np.argmax(fitted)) == int(np.argmax(labelled)) == 2
+
+
+def test_plot_draws_the_qcal_figure():
+    """The qcal readout figure (spec 21 §2.4), smoke-tested on the Agg backend: one panel per
+    qubit carrying the shot density (hexbin), the decision regions (contourf) and the 0/1 legend;
+    `raw=True` swaps the hexbin for the prep-labelled scatter."""
+    mpl = pytest.importorskip("matplotlib")
+    mpl.use("Agg")
+    from matplotlib.collections import PathCollection
+
+    from riscq.cal import ReadoutCalibration
+    rc = ReadoutCalibration(None, [0, 1], shots=8)
+    for q in rc.qubits:
+        rc.classifier[q] = Classifier(*_decayed_clusters(0.05, n=64, seed=5 + q))
+    fig = rc.plot()
+    assert len(fig.axes) == 2                    # one panel per qubit
+    for ax in fig.axes:
+        assert len(ax.collections) >= 2          # hexbin + decision regions
+        assert ax.get_legend() is not None
+    raw = rc.plot(raw=True)
+    assert any(isinstance(c, PathCollection) for c in raw.axes[0].collections)
 
 
 def test_rcorr_inverts_a_planted_confusion():

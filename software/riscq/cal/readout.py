@@ -24,9 +24,10 @@ The `Result.data`/`fit` are per-qubit dicts; `proposal` merges (the paths carry 
 
 Discrimination stays ON-CHIP (spec 13 §2): the `res` bit is the classifier that actually gates
 feedback, so Fidelity/ReadoutFidelity/Window score IT (counts mode) rather than a host classifier
-retrained per point. The host Classifier is a supervised linear discriminant over the two labelled
-prep clusters (the boundary a 2-component GMM finds on labelled Gaussians); only its SNR is qcal's
-(`_snr`).
+retrained per point. The host Classifier is qcal's: an UNSUPERVISED 2-component spherical GMM fit
+on the pooled shots (spec 21) — the prep labels only initialize the fit, name the components and
+score, never place the boundary, so state-prep errors (thermal init, decay across the prep→readout
+gap) do not bias it.
 
 Every knob is PHYSICAL (spec 13 §2): `span` in Hz, `amp_span` a normalized amplitude, `durs` in
 seconds; the relax head comes from the Config (`reset/relax`). The |1> prep is qcal's `gate=` choice
@@ -55,10 +56,59 @@ def _snr(iq0: np.ndarray, iq1: np.ndarray) -> float:
     that thresholds and argmaxes are comparable numbers): ‖Δmeans‖ / Σ(2·√cov), where `cov` is the
     SPHERICAL cluster variance its GMM fits — the mean of the per-axis variances. Note the
     denominator is 2σ₀ + 2σ₁, so SNR = 1 means the cluster means are 4σ apart (~2 % assignment
-    error), and the number is ~4× smaller than a plain distance/σ SNR."""
+    error), and the number is ~4× smaller than a plain distance/σ SNR. This is the LABELLED-cloud
+    version (ClassifierN); `Classifier.separation` feeds the same formula the FITTED parameters,
+    like qcal (spec 21 §1)."""
     dist = float(np.hypot(*(iq1.mean(0) - iq0.mean(0))))
     err = sum(2.0 * math.sqrt(float(np.mean(iq.var(0)))) for iq in (iq0, iq1))
     return dist / (err or 1e-9)
+
+
+def _gmm_fit(clusters, tol=1e-3, max_iter=100, reg=1e-6):
+    """Deterministic spherical EM on the POOLED points (spec 21 §2.1) — the in-house equivalent of
+    qcal's `GaussianMixture(covariance_type='spherical', means_init=labelled means)` fit, without the
+    RNG sklearn hides in its init (with only `means_init` given it still seeds weights/variances from
+    a k-means pass on the global RNG; our gates are bit-reproducible, so the fit must be).
+
+    `clusters` are the prep-labelled clouds — used ONLY to initialize (means = labelled means, qcal's
+    `means_init`; weights = shot fractions; σ² = each cloud's mean per-axis variance). EM then runs
+    unsupervised on the pooled points: sklearn's semantics (`reg_covar` 1e-6 variance floor, converge
+    when the mean log-likelihood moves < `tol`, `max_iter` 100). Returns (means (k,2), sigmas (k,),
+    weights (k,))."""
+    clusters = [np.atleast_2d(np.asarray(c, float)) for c in clusters]
+    x = np.vstack(clusters)
+    n, d = x.shape
+    means = np.array([c.mean(0) for c in clusters])
+    var = np.array([float(np.mean(c.var(0))) + reg for c in clusters])
+    w = np.array([len(c) / n for c in clusters])
+    prev = -np.inf
+    for _ in range(max_iter):
+        d2 = ((x[:, None, :] - means[None, :, :]) ** 2).sum(2)             # (n, k)
+        logp = np.log(w) - 0.5 * d * np.log(2 * np.pi * var) - d2 / (2 * var)
+        top = logp.max(1, keepdims=True)
+        lse = top[:, 0] + np.log(np.exp(logp - top).sum(1))                # log-sum-exp per point
+        resp = np.exp(logp - lse[:, None])
+        nk = resp.sum(0)
+        w = nk / n
+        means = (resp.T @ x) / nk[:, None]
+        d2 = ((x[:, None, :] - means[None, :, :]) ** 2).sum(2)
+        var = (resp * d2).sum(0) / (d * nk) + reg
+        ll = float(lse.mean())
+        if abs(ll - prev) < tol:
+            break
+        prev = ll
+    return means, np.sqrt(var), w
+
+
+def _gmm_predict(iq: np.ndarray, means, sigmas, weights) -> np.ndarray:
+    """Posterior argmax of the fitted spherical mixture — the component 0..k-1 of each point. The
+    2π constant drops; the variance and weight terms stay, so the boundary honours them (NOT the
+    nearest-mean or labelled-midpoint rule: with prep decay the pooled clusters are unequal and the
+    honest boundary is off the midpoint)."""
+    iq = np.atleast_2d(np.asarray(iq, float))
+    var = np.asarray(sigmas) ** 2
+    d2 = ((iq[:, None, :] - np.asarray(means)[None, :, :]) ** 2).sum(2)
+    return (np.log(weights) - np.log(var) - d2 / (2 * var)).argmax(1)
 
 
 def res_fidelity(iq0: np.ndarray, iq1: np.ndarray, phase: float) -> float:
@@ -88,25 +138,30 @@ def res_fidelity(iq0: np.ndarray, iq1: np.ndarray, phase: float) -> float:
 
 
 class Classifier:
-    """Two labelled Gaussian IQ clusters (|0>, |1>). Classify along the cluster axis (a supervised
-    linear discriminant — for labelled clusters, the same boundary a 2-component GMM finds); the
-    `separation` is qcal's cluster SNR (`_snr`)."""
+    """Two prep-labelled Gaussian IQ clusters (|0>, |1>) → an UNSUPERVISED 2-component spherical GMM
+    fit on the pooled shots (qcal's scheme, spec 21 §1-2.2): the labels only initialize the fit and
+    name the components — they never place the boundary, so a |1>-prep shot that decayed into the
+    |0> cloud is assigned where it LANDED instead of dragging a supervised threshold toward it.
+    `m0`/`m1` are the fitted component means, `separation` qcal's SNR on the FITTED parameters,
+    `classify` the posterior argmax (weights and variances included — with prep decay the pooled
+    clusters are unequal and the honest boundary is off the labelled midpoint)."""
 
     def __init__(self, iq0: np.ndarray, iq1: np.ndarray):
         self.iq0, self.iq1 = iq0, iq1
-        self.m0, self.m1 = iq0.mean(0), iq1.mean(0)
-        axis = self.m1 - self.m0
-        self.axis = axis / (np.hypot(*axis) or 1.0)
-        self.mid = 0.5 * (self.m0 + self.m1)
-        p0, p1 = iq0 @ self.axis, iq1 @ self.axis
-        self.thresh = 0.5 * (p0.mean() + p1.mean())
-        self.separation = _snr(iq0, iq1)
+        means, sigmas, weights = _gmm_fit([iq0, iq1])
+        if float(np.mean(_gmm_predict(iq0, means, sigmas, weights))) > 0.5:
+            # anchor guard: EM started on the labelled means, but if it converged with the
+            # components swapped (majority of the |0>-prep shots in component 1), swap back — qcal
+            # trusts the init anchoring alone (its majority-vote remap is commented out); this only
+            # fires where qcal would silently flip labels, and it is deterministic.
+            means, sigmas, weights = means[::-1], sigmas[::-1], weights[::-1]
+        self.means, self.sigmas, self.weights = means, sigmas, weights
+        self.m0, self.m1 = means[0], means[1]
+        self.separation = float(np.hypot(*(self.m1 - self.m0)) / (2.0 * sigmas.sum()))
 
     def classify(self, iq: np.ndarray) -> np.ndarray:
-        """0 (|0>) / 1 (|1>) per point, by which side of the threshold along the cluster axis."""
-        side = np.atleast_2d(iq) @ self.axis
-        return (side > self.thresh).astype(int) if (self.m1 @ self.axis) > (self.m0 @ self.axis) \
-            else (side < self.thresh).astype(int)
+        """0 (|0>) / 1 (|1>) per point — the fitted mixture's posterior argmax."""
+        return _gmm_predict(iq, self.means, self.sigmas, self.weights)
 
     def confusion(self) -> np.ndarray:
         """2×2 confusion: row = prepared state, col = classified state (normalised)."""
@@ -296,7 +351,8 @@ class ReadoutCalibration:
             demod_phase = -math.atan2(*(clf.m0 - clf.m1)[::-1])   # |0>→|1> axis onto +real (|0> on +real)
             res_fid = res_fidelity(iq0[q], iq1[q], demod_phase)
             data[q] = {"iq0": iq0[q], "iq1": iq1[q], "separation": clf.separation,
-                       "res_fidelity": res_fid}
+                       "res_fidelity": res_fid, "means": clf.means, "sigmas": clf.sigmas,
+                       "weights": clf.weights}
             proposal[f"readout/{q}/demod/phase"] = float(demod_phase)
             proposal[f"readout/{q}/res_sign"] = 1          # |0>→+real→res=0, |1>→res=1 (base.res_sign)
             fit[q] = clf
@@ -314,6 +370,48 @@ class ReadoutCalibration:
         self.data, self.fit = data, fit
         return Result(all(oks.values()), data, fit, proposal, cfg,
                       f"ReadoutCalibration {self.qubits}", oks=oks)
+
+    def plot(self, raw=False):
+        """qcal's readout-calibration figure (calibration/readout.py:248-436, spec 21 §2.4): one
+        panel per qubit — the pooled IQ shots under the trained classifier's decision regions
+        (`contourf` of `classify` over a 200×200 mesh of the data bbox). Default draws the shots as
+        a Greys hexbin; `raw=True` scatters them coloured by PREP label (the one place the labels
+        appear — the regions come from the unsupervised fit). Differences from qcal, each for a
+        reason: matplotlib imports lazily (headless CI imports cal without it); nothing is saved
+        (no data manager — the notebooks show inline); the scatter alpha adapts to the shot count
+        (qcal's 0.03 assumes thousands of shots; co-sim runs 16-64). Returns the figure."""
+        import matplotlib.pyplot as plt          # lazy: headless CI must import cal without it
+        from matplotlib.colors import ListedColormap
+        from matplotlib.patches import Patch
+        ncols = min(len(self.qubits), 4)
+        nrows = -(-len(self.qubits) // ncols)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows),
+                                 layout="constrained", squeeze=False)
+        cmap = ListedColormap([(0.122, 0.467, 0.706), (1.0, 0.498, 0.055)])   # qcal's |0>/|1> pair
+        for ax, q in zip(axes.ravel(), self.qubits):
+            clf = self.classifier[q]
+            xy = np.vstack([clf.iq0, clf.iq1])
+            x_min, x_max = xy[:, 0].min() - 1, xy[:, 0].max() + 1
+            y_min, y_max = xy[:, 1].min() - 1, xy[:, 1].max() + 1
+            xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200), np.linspace(y_min, y_max, 200))
+            zz = clf.classify(np.column_stack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
+            if raw:
+                prep = np.repeat([0, 1], [len(clf.iq0), len(clf.iq1)])
+                ax.scatter(xy[:, 0], xy[:, 1], c=prep, cmap=cmap, vmin=0, vmax=1,
+                           alpha=max(0.03, min(1.0, 100 / len(xy))))
+            else:
+                ax.hexbin(xy[:, 0], xy[:, 1], cmap="Greys", gridsize=75)
+            ax.contourf(xx, yy, zz, cmap=cmap, alpha=0.15)
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+            ax.set_xlabel("I")
+            ax.set_ylabel("Q")
+            ax.ticklabel_format(axis="both", style="sci", scilimits=(0, 0))
+            ax.text(0.05, 0.9, f"R{q}", size=15, transform=ax.transAxes)
+            ax.legend(handles=[Patch(color=cmap(i), alpha=1.0) for i in (0, 1)], labels=[0, 1])
+        for ax in axes.ravel()[len(self.qubits):]:
+            ax.axis("off")
+        return fig
 
 
 class Separation:
@@ -370,7 +468,11 @@ class Separation:
         data, fit, proposal, oks = {}, {}, {}, {}
         for q in self.qubits:
             i0, i1 = iq0[q], iq1[q]
-            seps = np.array([_snr(i0[i], i1[i]) for i in range(npts)])
+            # one GMM per point, like qcal's Separation (it re-runs the full RCal per point and
+            # reads the FITTED snr): under prep decay the labelled |1> cloud is bimodal and _snr's
+            # inflated variance would depress every point; the fitted SNR is immune (spec 21 §2.5).
+            clfs = [Classifier(i0[i], i1[i]) for i in range(npts)]
+            seps = np.array([c.separation for c in clfs])
             mag0 = np.hypot(i0[:, :, 0].mean(1), i0[:, :, 1].mean(1))   # what the OLD cal argmax'd
             best = int(np.argmax(seps))
             # DELTA-based physical Hz (spec 13 §2: codes never leave run()): the swept codes alias
@@ -383,7 +485,7 @@ class Separation:
             freqs = f0 + units.code_to_freq(meta[q] - c0, m.params)
             data[q] = {"x": freqs, "y": seps, "mag0": mag0}
             proposal[f"readout/{q}/freq"] = float(freqs[best])
-            fit[q] = Classifier(i0[best], i1[best])
+            fit[q] = clfs[best]
             # at least a 2σ split (see _snr), AND an INTERIOR argmax: a best point pinned to the
             # sweep edge means the resonator drifted to or past the span (X6Y3's hybridised q4/q5
             # pair hops MHz between sessions) — the value is a bound, not a peak; recentre or widen.
