@@ -1,14 +1,15 @@
 """riscq.cal — the calibration suite (spec 06): the fit helpers (`fits`), the YAML config tree
 (`Config`), and the calibration classes (Amplitude, Frequency, Phase, T1, T2, ReadoutCalibration,
-Separation, Fidelity, ReadoutFidelity, Window, Punchout) plus the autocalibration sequences."""
+Separation, Fidelity, ReadoutFidelity, Window, Punchout, Resonator) plus the autocalibration
+sequences."""
 
 from riscq.cal import fits
 from riscq.cal.base import Result
 from riscq.cal.config import Config
 from riscq.cal.drag import Leakage, optimize_fast_drag
 from riscq.cal.qubit import Amplitude, EFAmplitude, EFFrequency, EFPhase, Frequency, Phase, T1, T2
-from riscq.cal.readout import (Classifier, ClassifierN, Fidelity, Punchout,
-                               ReadoutCalibration, ReadoutFidelity, Separation, Window, rcorr)
+from riscq.cal.readout import (Classifier, ClassifierN, Fidelity, Punchout, ReadoutCalibration,
+                               ReadoutFidelity, Resonator, Separation, Window, rcorr)
 from riscq.cal.rpe import (Angles, CZRPE, RPEAmplitude, RPEBranchError, RPEFrequency, RPEPhase,
                            cz_angles, damped_update, freq_error_hz, idle_angles, vz_correction,
                            x90_angles)
@@ -21,7 +22,7 @@ from riscq.cal.twoqubit import (JAZZ, CZAmpFreqSweep, CZAmplitude, CZFrequency, 
 __all__ = ["Config", "Result", "fits", "Amplitude", "Frequency", "Phase", "T1", "T2",
            "EFAmplitude", "EFFrequency", "EFPhase",
            "ReadoutCalibration", "ReadoutFidelity", "Separation", "Fidelity", "Window",
-           "Punchout", "rcorr", "Leakage", "optimize_fast_drag",
+           "Punchout", "Resonator", "rcorr", "Leakage", "optimize_fast_drag",
            "Angles", "RPEBranchError", "RPEAmplitude", "RPEFrequency", "RPEPhase", "CZRPE",
            "cz_angles", "damped_update", "freq_error_hz", "idle_angles", "vz_correction",
            "x90_angles",

@@ -7,6 +7,9 @@ spec 13 §5):
                        (k_vna RAW, two reruns), argmax of the two-state cluster SNR — qcal's statistic,
                        not the |0>-magnitude peak (§5: on a dispersive resonator they are different
                        frequencies).
+  Resonator          — resonator spectroscopy: the |0> magnitude/phase over an arbitrary frequency
+                       list (k_vna IQSUM, the shots summed on-core), the wide scan that FINDS a
+                       resonator. Characterization — it proposes nothing.
   Fidelity           — readout DRIVE AMPLITUDE (`readout/{q}/amp`, qcal's knob): argmax of the
                        confusion diagonal ½[P(0|0) + P(1|1)] under the FIXED hardware discriminator.
   ReadoutFidelity    — the confusion matrix at the calibrated amplitude, straight from the `res` bit
@@ -493,6 +496,84 @@ class Separation:
         self.data, self.fit = data, fit
         return Result(all(oks.values()), data, fit, proposal, cfg, f"Separation {self.qubits}",
                       oks=oks)
+
+
+class Resonator:
+    """RESONATOR SPECTROSCOPY (qcal's `Resonator`, spec 20 §8): the |0> readout response over an
+    arbitrary frequency list — the wide scan you run to FIND a resonator, before anything about the
+    readout is calibrated. No prep and no discrimination: the qubit stays in |0> and what comes back
+    is the driven cavity's transmission.
+
+    It is the same measurement as `Punchout`'s rows and `Separation`'s |0> leg; what it adds is the
+    WIDTH. k_vna in IQSUM mode sums each point's `shots` IQ integrals ON-CORE (coherently — qcal's
+    own `iq.mean(axis=1)`), so a point costs TWO words instead of 2·shots and the reference session's
+    1000-point 6.53 → 6.85 GHz scan is one core-RAM buffer and ONE run. Shots then cost run time
+    only, never RAM (`sh` is the pre-sum shift that keeps the accumulator in int32).
+
+    `freqs` is qcal's argument — `{q: [Hz]}`, per qubit because the resonators sit MHz apart (a bare
+    array applies to every qubit). The on-core sweep is a linear Q16 ramp, so the list must be evenly
+    spaced, and its code span must not wrap Nyquist (a wrap fails loud in `sweep_q16` — split the
+    scan, as `vna.ipynb` does with its own int32 accumulator).
+
+    Like `Punchout` it PROPOSES NOTHING and writes nothing: `data[q]` carries the mean IQ, its
+    magnitude and the realized frequency axis, and the caller picks the extremum — qcal reads a DIP
+    (`analyze` runs `find_peaks` on the smoothed −dB, falling back to `argmin`), which is the notch
+    geometry of a hanger-coupled resonator; a transmission-coupled one answers with a peak. Since
+    nothing is written there is also nothing to restore afterwards (the reference cell saves and
+    puts back the readout params + `reset/passive/delay` it swept under).
+
+    The per-shot idle head is the Config's `reset/relax` like every other cal — but this sweep never
+    excites the qubit, so it needs resonator ring-down, not T1: shorten `reset/relax` on the loaded
+    tree (nothing saves it back) when the scan is long."""
+
+    def __init__(self, cfg, qubits, freqs, shots=64):
+        self.cfg, self.qubits = cfg, qubits_list(qubits)
+        self.freqs = freqs if isinstance(freqs, dict) else {q: freqs for q in self.qubits}
+        self.shots = int(shots)
+        self.data, self.fit = {}, {}
+
+    def run(self, drv) -> Result:
+        m = socmap(drv)
+        cfg = self.cfg
+        shots = self.shots
+        sh = max(0, (shots - 1).bit_length())    # pre-sum shift: `shots` integrals stay inside int32
+        fs = units.sample_rate(m.params)
+        relax = relax_batches(cfg, m)
+        progs, meta, timeout = {}, {}, 0
+        for q in self.qubits:
+            f = np.asarray(self.freqs[q], float)
+            npts = len(f)
+            assert 8 * npts <= m.mem_bytes // 2, \
+                (f"a {npts}-point scan needs {8 * npts} B of IQ sums — over half the core's "
+                 f"{m.mem_bytes} B RAM; split the range")
+            step = np.diff(f)
+            assert npts > 1 and np.allclose(step, step[0]), \
+                "the on-core sweep is a linear ramp — `freqs` must be evenly spaced"
+            ro, demod, _, dur, ddly = readout_tables(cfg, q, m)
+            # the sweep is c0 + Δcode: the SPAN is taken unfolded (a Nyquist wrap would break the
+            # monotone on-core ramp, and sweep_q16's 16-bit assert then says so).
+            c0 = units._freq_code(float(f[0]), m.params)
+            c0q, dcq, xs = sweep_q16(c0, c0 + round((f[-1] - f[0]) * (1 << 16) / fs), npts)
+            period = grid_period(relax, 0, dur, ddly)
+            progs[q] = compile_kernel(kernels.k_vna, m, tables=dict(ro=ro, demod=demod),
+                                      out=Array(2 * npts), npts=npts, shots=shots, period=period,
+                                      sh=sh, ddly=ddly, mode=kernels.IQSUM,
+                                      c0q=int(c0q), dcq=int(dcq))
+            meta[q] = (float(f[0]), c0, np.array(xs, float))
+            timeout = max(timeout, batch_timeout(npts * shots * period))
+        out = rq.run(drv, m, progs, results=["out"], timeout=timeout)
+
+        data, fit = {}, {}
+        for q in self.qubits:
+            f0, c0, xs = meta[q]
+            z = out[q]["out"].astype(float).reshape(-1, 2) * (1 << sh) / shots   # mean IQ per point
+            iq = z[:, 0] + 1j * z[:, 1]
+            # DELTA-based physical Hz, as in Separation: the swept codes alias, so report the
+            # caller's own band rather than the baseband image of the folded code.
+            data[q] = {"x": f0 + units.code_to_freq(xs - c0, m.params), "iq": iq, "mag": np.abs(iq)}
+            fit[q] = None
+        self.data, self.fit = data, fit
+        return Result(True, data, fit, {}, cfg, f"Resonator {self.qubits}")
 
 
 class Punchout:

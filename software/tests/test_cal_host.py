@@ -23,11 +23,11 @@ import pytest
 from scipy.special import erfc
 
 from riscq.cal import (Amplitude, Classifier, Config, Fidelity, Frequency, Phase, Punchout,
-                       ReadoutCalibration, ReadoutFidelity, Separation, T1, T2, Window)
+                       ReadoutCalibration, ReadoutFidelity, Resonator, Separation, T1, T2, Window)
 from riscq.cal.base import GATE_ENV, gate_sigma
 from riscq.cal.readout import _rawiq_prog, _ro_amp_prog
 from riscq.pulses import Pulse, units
-from tests.responder import counts, counts_heralded, int_axis, q16_axis, raw_iq
+from tests.responder import counts, counts_heralded, int_axis, iq_sum, q16_axis, raw_iq
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "sim-2q.json"
 F_GE = 50e6                      # planted qubit frequency (freq code 2048)
@@ -749,6 +749,25 @@ def _vna_answer(r, m, noise=VNA_NOISE, amp_slot=False):
     return answer
 
 
+def _iqsum_answer(m, noise=0.0):
+    """The same cavity for a k_vna IQSUM sweep: |0> only (spectroscopy never preps), the shots
+    summed on-core the way the kernel does."""
+    f_r = units.demod_code_to_freq(2048, m.params)
+    chi, kappa = (units.code_to_freq(c, m.params) for c in (CHI_CODE, KAPPA_CODE))
+
+    def answer(progs, params):
+        out = {}
+        for q, prog in progs.items():
+            shots, sh = (int(prog.bindings[k]) for k in ("shots", "sh"))
+            s = _lorentzian(_vna_freqs(prog, params.get(q), m), f_r, kappa, chi, +1)
+            if noise:
+                rng = np.random.default_rng(q)
+                s = s + noise * (rng.normal(0, 1, s.size) + 1j * rng.normal(0, 1, s.size))
+            out[q] = {"out": iq_sum(IQ_SCALE * s, shots, sh)}
+        return out
+    return answer
+
+
 def test_separation_picks_max_separation_not_the_magnitude_peak(responder, socmap):
     """spec 13 §5 — THE regression that catches the old Separation. On a dispersive readout the |0>
     response peaks at f_r + χ while the two-state separation peaks at f_r, so the |0>-magnitude
@@ -828,6 +847,44 @@ def test_punchout_maps_frequency_against_drive_power(responder, socmap):
     assert np.all(np.diff(rowmax) > 0), f"the response did not grow with drive amplitude: {rowmax}"
     assert rowmax[2] / rowmax[0] == pytest.approx(
         units._amp_code(amps[2]) / units._amp_code(amps[0]), rel=0.01)
+
+
+def test_resonator_scans_the_cavity_coherently(responder, socmap):
+    """Resonator spectroscopy (qcal's `Resonator`, spec 20 §8) — the reference session's first cell:
+    the |0> response over an arbitrary frequency list, `shots` integrals summed ON-CORE (k_vna
+    IQSUM) so the scan is ONE run of two words per point.
+
+    Same planted cavity as `Separation`'s, so the answers are known from first principles: the |0>
+    magnitude peaks at the dressed resonance f_r + χ, and the reported x-axis is the caller's own
+    frequencies. Two things this sweep must not lose:
+
+      * the SCALE — the mean IQ has to come back through `>> sh` and `/ shots`, so it is checked
+        against the Lorentzian itself, not just its argmax;
+      * the PHASE — the sum is coherent (qcal's `iq.mean(axis=1)`, the reason its figure has an
+        unwrapped-phase panel), so the response swings through ~π across the resonance. A power
+        sum (`re² + im²`, what `vna.ipynb`'s wideband kernel accumulates) would still peak in the
+        right place and would still pass every magnitude assert here."""
+    m = socmap
+    r = responder(CONFIG)
+    r.answer(_iqsum_answer(m))
+    cfg = _cfg(m, x90_amp=0.495)
+    f_r = float(cfg["readout/0/freq"])
+    chi, kappa = (units.code_to_freq(c, m.params) for c in (CHI_CODE, KAPPA_CODE))
+    freqs = f_r + np.linspace(-2 * chi, 4 * chi, 13)          # the |0> peak lands on index 6
+
+    res = Resonator(cfg, 0, freqs={0: freqs}, shots=64).run(r.drv)
+    x, iq, mag = (res.data[0][k] for k in ("x", "iq", "mag"))
+    step = float(x[1] - x[0])
+    assert np.allclose(x, freqs, atol=step)          # the caller's band, not the folded code's alias
+    assert int(np.argmax(mag)) == 6, f"|S| did not peak at the |0> dressed resonance: {mag}"
+    assert mag == pytest.approx(IQ_SCALE * np.abs(_lorentzian(x, f_r, kappa, chi, +1)), rel=0.01), \
+        "the on-core sum did not come back as the mean IQ (>> sh / shots)"
+    phase = np.unwrap(np.angle(iq))
+    assert np.all(np.diff(phase) < 0), f"the coherent phase is not monotone across the cavity: {phase}"
+    assert phase == pytest.approx(np.angle(_lorentzian(x, f_r, kappa, chi, +1)), abs=0.01), \
+        "the phase is not the cavity's — the sum was not coherent"
+    assert phase[0] - phase[-1] > 2.0, \
+        "the response barely turned across ±3χ (arctan bound: 2.26 rad here, π asymptotically)"
 
 
 # ── §8 heralding: the (count, kept) decode and its denominator ──

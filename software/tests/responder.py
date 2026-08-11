@@ -64,6 +64,15 @@ def raw_iq(z) -> np.ndarray:
     return np.stack([z.real, z.imag], axis=1).reshape(-1).astype(np.int64)
 
 
+def iq_sum(z, shots: int, sh: int) -> np.ndarray:
+    """IQSUM mode: one (Σreal, Σimag) pair per point — `shots` identical integrals, each shifted
+    right by `sh` before it is accumulated, exactly as k_vna's `out[2i] += read_real() >> sh`
+    (`out` sized 2·npts)."""
+    z = np.asarray(z, dtype=complex).reshape(-1)
+    pair = np.stack([np.rint(z.real), np.rint(z.imag)], axis=1).astype(np.int64) >> int(sh)
+    return (pair * int(shots)).reshape(-1)
+
+
 # ── point axes: the exact integers the on-core sweep realizes ──
 
 def _descriptor(prog, params):
