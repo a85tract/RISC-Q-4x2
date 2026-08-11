@@ -216,12 +216,27 @@ def batch_timeout(nbatches: int) -> int:
     return int(nbatches) * 4 + 20_000_000
 
 
-def sweep_q16(x0: int, x1: int, n: int) -> tuple[int, int, np.ndarray]:
+def sweep_q16(x0: int, x1: int, n: int, fold: bool = False) -> tuple[int, int, np.ndarray]:
     """(x0q, dxq) kernel params + the EXACT int x-axis the kernel realizes (host-mirrored
-    integer arithmetic, not the float linspace). Asserts every point is a legal 16-bit code."""
+    integer arithmetic, not the float linspace). Asserts every point is a legal 16-bit code —
+    for an AMPLITUDE or a phase ramp that assert is an overflow guard and stays on.
+
+    `fold=True` is for a FREQUENCY ramp that runs past the DAC's half rate (a code past ±2^15 —
+    a bring-up scan that starts below 4 GHz and ends above it, X6Y3's readout band): there the
+    16-bit range is not a bound at all. The kernel's accumulator is a plain int32 (`-fwrapv`), so
+    its wrap IS the fold the phase accumulator does in hardware, and the register keeps the code
+    mod 2^16 — exactly the aliasing `units._freq_code` applies to a single tone. The axis returned
+    stays UNFOLDED: it is the frequency ramp the caller asked for, and the frequency callers map it
+    back to Hz as a delta from their own first point (so it never jumps a whole `fs` at the fold).
+    What still fails loud is a scan wider than one full turn, which would alias onto itself."""
     dxq = 0 if n <= 1 else round(((x1 - x0) << 16) / (n - 1))
     xs = (x0 * (1 << 16) + np.arange(n, dtype=np.int64) * dxq) >> 16
-    assert np.all(np.abs(xs) < (1 << 15))
+    if fold:
+        assert abs(x0) < (1 << 15), f"the sweep must START on a legal 16-bit code, got {x0}"
+        assert int(xs.max() - xs.min()) < (1 << 16), \
+            "a folded sweep may not cover more than one full turn of the band"
+    else:
+        assert np.all(np.abs(xs) < (1 << 15))
     return x0 << 16, dxq, xs.astype(int)
 
 

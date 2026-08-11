@@ -512,8 +512,9 @@ class Resonator:
 
     `freqs` is qcal's argument — `{q: [Hz]}`, per qubit because the resonators sit MHz apart (a bare
     array applies to every qubit). The on-core sweep is a linear Q16 ramp, so the list must be evenly
-    spaced, and its code span must not wrap Nyquist (a wrap fails loud in `sweep_q16` — split the
-    scan, as `vna.ipynb` does with its own int32 accumulator).
+    spaced; it MAY run past the DAC's half rate (`sweep_q16(fold=True)`) — the accumulator's int32
+    wrap is the same Nyquist fold the converter does, so the band above 4 GHz is scanned through its
+    alias, as `vna.ipynb` scans the full zone. Only a scan wider than one whole turn fails loud.
 
     Like `Punchout` it PROPOSES NOTHING and writes nothing: `data[q]` carries the mean IQ, its
     magnitude and the realized frequency axis, and the caller picks the extremum — qcal reads a DIP
@@ -550,10 +551,12 @@ class Resonator:
             assert npts > 1 and np.allclose(step, step[0]), \
                 "the on-core sweep is a linear ramp — `freqs` must be evenly spaced"
             ro, demod, _, dur, ddly = readout_tables(cfg, q, m)
-            # the sweep is c0 + Δcode: the SPAN is taken unfolded (a Nyquist wrap would break the
-            # monotone on-core ramp, and sweep_q16's 16-bit assert then says so).
+            # the sweep is c0 + Δcode, and the SPAN is taken unfolded: the ramp stays monotone
+            # across Nyquist on the host, and the kernel's int32 wrap folds it into the register
+            # the way the converter folds a tone (fold=True).
             c0 = units._freq_code(float(f[0]), m.params)
-            c0q, dcq, xs = sweep_q16(c0, c0 + round((f[-1] - f[0]) * (1 << 16) / fs), npts)
+            c0q, dcq, xs = sweep_q16(c0, c0 + round((f[-1] - f[0]) * (1 << 16) / fs), npts,
+                                     fold=True)
             period = grid_period(relax, 0, dur, ddly)
             progs[q] = compile_kernel(kernels.k_vna, m, tables=dict(ro=ro, demod=demod),
                                       out=Array(2 * npts), npts=npts, shots=shots, period=period,

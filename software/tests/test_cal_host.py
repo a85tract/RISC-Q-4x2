@@ -887,6 +887,35 @@ def test_resonator_scans_the_cavity_coherently(responder, socmap):
         "the response barely turned across ±3χ (arctan bound: 2.26 rad here, π asymptotically)"
 
 
+def test_resonator_scan_folds_past_the_half_rate(responder, socmap):
+    """A bring-up scan that crosses the DAC's half rate — start below it, end above, which is where
+    X6Y3's readout band lives. The code ramp runs past 2^15, and that is not an error: the kernel's
+    accumulator is a plain int32, so its wrap IS the fold the phase accumulator does in hardware and
+    the register keeps the code mod 2^16 — the same aliasing `units._freq_code` applies to a single
+    tone. So the host keeps the ramp UNFOLDED (it is the frequency axis the caller asked for, and it
+    must not jump a whole fs at the crossing), and what the register sees at each point must be the
+    code that frequency would have been programmed with directly."""
+    m = socmap
+    r = responder(CONFIG)
+    r.answer(_iqsum_answer(m))
+    fs = units.sample_rate(m.params)
+    freqs = np.linspace(0.4 * fs, 0.6 * fs, 21)          # straight through the half rate
+
+    res = Resonator(_cfg(m), 0, freqs={0: freqs}, shots=16).run(r.drv)
+    x = res.data[0]["x"]
+    assert np.all(np.diff(x) > 0), f"the reported axis folded with the code: {x}"
+    code = fs / (1 << 16)
+    assert x == pytest.approx(freqs, abs=1.5 * code)    # the ramp is integer codes: the `>> 16`
+    #                        floor costs up to a code, the rounded Q16 step up to half of one more
+
+    codes = q16_axis(r.setups[-1][0], x0="c0q", dx="dcq")      # the host's unfolded ramp
+    assert codes.max() >= (1 << 15), "the scan never crossed the fold — the gate is vacuous"
+    seen = ((codes + (1 << 15)) % (1 << 16)) - (1 << 15)       # what the int32 wrap leaves behind
+    want = [units._freq_code(float(f), m.params) for f in x]
+    assert np.all(np.abs(seen - want) <= 1), \
+        f"the folded codes are not the tones' own: {seen[:3]}... vs {want[:3]}..."
+
+
 # ── §8 heralding: the (count, kept) decode and its denominator ──
 
 def test_heralding_matches_unheralded_on_clean_qubit(responder, socmap):
