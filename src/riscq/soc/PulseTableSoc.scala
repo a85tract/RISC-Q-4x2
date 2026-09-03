@@ -75,8 +75,14 @@ case class PulseTableSoc(
     // specs/dsp-fmax.md converter-edge lever, default off / bit-exact (the B1-alt gate-table distributed
     // RAM and the B2 dcOffset MAX_FANOUT cap are baked into PulseParamBuffer; the B3 queue lean-pop into
     // TimedQueue; the C1 registered head is a TimedQueue-level option, no longer plumbed here).
+    freqWidth: Int = 0,                 // M7b: frequency-word width; 0 = dataWidth (16-bit, 120 kHz
+                                        // steps). 32 = SF(32) words (1.83 Hz) — same MSB weight, so
+                                        // legacy seated writes are bit-exact; costs +3 pipeline
+                                        // stages and +2 DSP48E2 per carrier.
     adcPipe: Int = 3,                   // C2: register stages on the ADC nets off the RFDC edge
-) extends Zcu216Top(dacNum = dacNum, adcNum = adcNum, dacBatch = 16, adcBatch = 4, dataWidth = 16, vivado = vivado) {
+    dspFreqHz: Long = 500000000L,       // FREQ_HZ tag on dspClk in vivado mode (491.52 MHz on the 4x2)
+) extends Zcu216Top(dacNum = dacNum, adcNum = adcNum, dacBatch = 16, adcBatch = 4, dataWidth = 16, vivado = vivado,
+    dspFreqHz = dspFreqHz) {
   val N        = 16    // DAC drive batch
   val adcBatch = 4
   val w        = 16
@@ -123,7 +129,19 @@ case class PulseTableSoc(
   riscqMemBus   at SizeMapping(map.coreMemBase,    map.regionSize) of hostBus
   riscqMemBus.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
 
-  val robs = BramFiber(1, robWidth, robDepth, hostCd, dspCd, withOutReg = true)
+  // Trace RAM banking. ONE deep memory is fine up to a few thousand lines, but a 65536-line trace
+  // infers a 64-deep RAMB36E2 depth-cascade column: Vivado then refuses the bitstream (DRC CASC-31,
+  // "cascade crosses rbrk" — the dedicated cascade path may not cross a clock region) and the tall
+  // forced-column placement displaces the cores enough to break their timing (measured: WNS -0.014
+  // at 65536 vs +0.001 at 32768). Splitting into `robBankDepth`-line banks removes the cascade and
+  // lets each bank place freely. The host layout is UNCHANGED: BramFiber maps bank i at
+  // i * (robWidth*bankDepth/8) bytes, so batch n still lands at byte 16*n — one contiguous trace,
+  // no software or SocParams change (rob_width / rob_depth / rob_bytes all keep their meaning).
+  val robBankDepth = 4096
+  val robBanks = if (robDepth > robBankDepth) robDepth / robBankDepth else 1
+  require(robDepth % robBanks == 0 && (robBanks == 1 || robDepth / robBanks == robBankDepth),
+    s"robDepth $robDepth must be a multiple of $robBankDepth when deeper than one bank")
+  val robs = BramFiber(robBanks, robWidth, robDepth / robBanks, hostCd, dspCd, withOutReg = true)
   val robAdapter = WidthAdapter()
   robAdapter.up at SizeMapping(map.readoutBufBase, map.regionSize) of hostBus
   robs.up at SizeMapping(0, map.regionSize) of robAdapter.down
@@ -168,7 +186,11 @@ case class PulseTableSoc(
       RiscqRfWithPulseTableFiber(
         plugins = cp.plugins(), dspCd = dspCd, hostCd = hostCd, riscqCd = riscqCd,
         time = coreTimes(i), batchSize = N, dataWidth = w, adcBatch = adcBatch,
-        envDepth = envDepth, readoutInterp = readoutInterp, gateInterp = gateInterp, demodInterp = demodInterp,
+        envDepth = envDepth, envAddrWidth = log2Up(envDepth), freqWidth = freqWidth,   // M7a: address width MUST follow the
+        // depth — the fiber's own default is a fixed 10, which silently truncates every envelope
+        // line index above 1023 when envDepth is raised (Codex M7 finding 1). log2Up(1024) = 10,
+        // so all existing builds are bit-identical.
+        readoutInterp = readoutInterp, gateInterp = gateInterp, demodInterp = demodInterp,
         linkPipe = linkPipe, withTestTap = withTest, memDepth = memDepth, gatePulseNum = gatePulseNum,
         queueDepth = queueDepth))
 
@@ -263,12 +285,33 @@ case class PulseTableSoc(
     val rbAddr = Reg(UInt(log2Up(robDepth) bits))
     when(fire)(rbAddr := rbAddr + 1).otherwise(rbAddr := 0)
 
-    // robs(0): per-lane sum of the MAPPED ADC inputs (a 32-bit-per-lane integrated trace).
+    // robs: per-lane sum of the MAPPED ADC inputs (a 32-bit-per-lane integrated trace).
     val adcSum = Vec.tabulate(adcBatch)(k => RegNext(AdderTree(mappedAdcIds.map(id => adcBufs(id)(k)), 32)))
-    val rb0 = robs.rams(0).fastPort
-    rb0.enable := True; rb0.mask.setAllTo(True)
-    rb0.address := RegNext(rbAddr); rb0.write := fire
-    rb0.wdata   := Vec(adcSum).asBits
+    if (robBanks == 1) {
+      val rb0 = robs.rams(0).fastPort
+      rb0.enable := True; rb0.mask.setAllTo(True)
+      rb0.address := RegNext(rbAddr); rb0.write := fire
+      rb0.wdata   := Vec(adcSum).asBits
+    } else {
+      // Banked write (see `robBanks` above). The bank select, the in-bank address, the data and the
+      // write enable all take ONE extra register stage TOGETHER, so their pairing is unchanged and
+      // only the write instant shifts by a cycle. Registering the one-hot decode (rather than
+      // driving `robBanks` write-enable cones off a combinational compare at 491.52 MHz) is the
+      // topology the dev-line split-bank capture closed timing with.
+      val addrQ = RegNext(rbAddr)
+      val lowW  = log2Up(robDepth / robBanks)
+      val wrLow  = RegNext(addrQ(0, lowW bits))
+      val wrOh   = RegNext(UIntToOh(addrQ(lowW, log2Up(robBanks) bits)))
+      val wrEn   = RegNext(fire)
+      val wrData = RegNext(Vec(adcSum).asBits)
+      for ((ram, i) <- robs.rams.zipWithIndex) {
+        val p = ram.fastPort
+        p.enable := True; p.mask.setAllTo(True)
+        p.address := wrLow
+        p.write   := wrEn && wrOh(i)
+        p.wdata   := wrData
+      }
+    }
   }
 
   // ── host control block (host clock domain) ──
@@ -283,10 +326,24 @@ case class PulseTableSoc(
   val timeOffset = Reg(UInt(64 bit)) init 0
   riscqArea.timeOffset := dspCd(BufferCC(timeOffset))
 
+  // Liveness counters (RFSoC 4x2 bring-up): host-readable proof that each clock domain is running
+  // BEFORE any dsp-domain access — a dead dspClk never answers the first host read into that domain
+  // and wedges the whole host bus (board-proven failure mode). dspAlive crosses domains through a
+  // per-bit BufferCC: torn multi-bit values are fine, the only question asked is "is it advancing".
+  val dspAliveCnt = dspCd(new Area {
+    val v = Reg(UInt(32 bits)) init 0
+    v := v + 1
+  }).v
+  val dspAliveHost = BufferCC(dspAliveCnt)
+  val hostAliveCnt = Reg(UInt(32 bits)) init 0
+  hostAliveCnt := hostAliveCnt + 1
+
   val hostCtrlDriver = MemMapDriverFiber(addressWidth = 10, dataWidth = 32, driveProc = { factory =>
     factory.drive(riscqResetHostCd, 0)
     factory.write(timeOffset(0, 32 bits), 64)
     factory.write(timeOffset(32, 32 bits), 68)
+    factory.read(dspAliveHost, 0x100)
+    factory.read(hostAliveCnt, 0x104)
   })
   hostCtrlDriver.up.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
   hostCtrlDriver.up at SizeMapping(map.hostCtrlBase, map.regionSize) of hostBus

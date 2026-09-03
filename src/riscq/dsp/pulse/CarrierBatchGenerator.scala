@@ -29,18 +29,37 @@ import riscq.dsp._
  * Per-input latencies are exported as sums of sub-module latencies (no hard-coded literals).
  */
 case class CarrierBatchGenerator(batchSize: Int, dataWidth: Int, timeWidth: Int, correctGain: Boolean = true,
-    saturate: Boolean = true) extends Component {
+    saturate: Boolean = true, freqWidth: Int = 0) extends Component {
   require(isPow2(batchSize), "batchSize must be a power of two (time·N is an exact left shift)")
   val N     = batchSize
   val w     = dataWidth
   val log2N = log2Up(N)
   val amax  = (BigInt(1) << (w - 1)) - 1
 
+  /** Frequency-word width (M7b). `0` (default) = `dataWidth`, the historic SF(16) word. A wider word
+   *  keeps the SAME physical MSB weight — the CORDIC still takes a `w`-bit angle, now sliced from the
+   *  TOP of the product — so a legacy `F16 << (fw - w)` write reproduces the narrow behaviour bit for
+   *  bit, and the extra low bits become fractional frequency (fw = 32: 1.83 Hz instead of 120 kHz). */
+  val fw = if (freqWidth <= 0) dataWidth else freqWidth
+  require(fw >= dataWidth, s"freqWidth $fw must be at least dataWidth $dataWidth")
+  // The phase is exact mod 2π only while `(t·N) mod 2^fw` loses nothing to the time counter's own
+  // wrap: the counter must carry at least the fw bits the product consumes. Otherwise the
+  // fractional phase would jump when `time` wraps.
+  require(timeWidth + log2Up(batchSize) >= fw,
+    s"timeWidth $timeWidth + log2(N) ${log2Up(batchSize)} must cover freqWidth $fw")
+
+  /** Extra pipeline stages INSIDE the freq×time product, and the ONE place that number is written.
+   *  Measured OOC on xczu48dr at 2.035 ns (`m7b-bench`, effective 28×28 / 30×30 sliced products):
+   *  flat misses by ~296 ps; 1–2 stages change nothing (the critical path is inside the multiplier,
+   *  not after it); 3 stages close it at +0.389 ns; a 4th buys 0–3 ps. Every latency export below
+   *  derives from this constant, so the queue lead times track it automatically. */
+  val extraMulLatency = if (fw > dataWidth) 3 else 0
+
   val io = new Bundle {
     val time    = in port UInt(timeWidth bits)
     val amp     = slave port Flow(SInt(w bits))
     val phase   = slave port Flow(SInt(w bits))
-    val freq    = slave port Flow(SInt(w bits))
+    val freq    = slave port Flow(SInt(fw bits))
     val phasors = slave port Flow(ComplexBatch(N, w))
     val carrier = out port ComplexBatch(N, w)
   }
@@ -72,9 +91,23 @@ case class CarrierBatchGenerator(batchSize: Int, dataWidth: Int, timeWidth: Int,
   })
 
   // phase pipeline → gPhase (all truncating-wrap = exact phase wrap):
-  val batchTime = RegNext(((io.time << log2N).resize(w bits)).asSInt)        // (t·N) mod 2^w, SF(w)
-  val timePhase = RegNext(freqReg * batchTime)                              // 1 DSP, full width
-  val gPhase    = RegNext(timePhase.resize(w bits) + phaseReg)              // low w bits + phase, mod 2^w
+  // (t·N) mod 2^fw, SF(fw). The `+ extraMulLatency` PRE-COMPENSATES the deeper product: without it
+  // the phase emitted at a given output cycle would correspond to a time `extraMulLatency` batches
+  // EARLIER than in the narrow build, i.e. the same startTime/freq/phase would come out rotated by
+  // −extraMulLatency·N·freq. With it, the absolute-time phase law `phase = freq·N·t + phase` holds
+  // unchanged at every width, so software keeps ONE formula and a legacy seated word is equivalent
+  // cycle for cycle, not merely bit for bit. At extraMulLatency = 0 this is the original expression.
+  val batchTime = RegNext((((if (extraMulLatency == 0) io.time else io.time + extraMulLatency)
+                            << log2N).resize(fw bits)).asSInt)
+  // `extraMulLatency` registers give retiming material to pull INTO the DSP cascade (see above);
+  // at fw = dataWidth there are none and this is the historic single-register product.
+  val timePhase = (0 until extraMulLatency)
+    .foldLeft(RegNext(freqReg * batchTime))((s, _) => RegNext(s))
+  // The phase is the TOP `w` bits of the product. At fw = w that IS the low-w truncation, written
+  // in the original inline form so the narrow build's Verilog stays bit-identical (a named `val`
+  // here would rename the wire and move the non-regression hash for no logical reason).
+  val gPhase    = RegNext((if (fw == w) timePhase.resize(w bits)
+                           else timePhase(fw - 1 downto fw - w)) + phaseReg)  // + phase, mod 2^w
 
   // One CORDIC: amp·exp(iπ·gPhase), amplitude on the x input. When correctGain = false the
   // gain stage is dropped — software must prescale amp by 1/K so K·(amp/K) = amp.
@@ -103,7 +136,14 @@ case class CarrierBatchGenerator(batchSize: Int, dataWidth: Int, timeWidth: Int,
   private def tail: Int = cordic.latency + 1 + ComplexMul.latency(saturate) // cordic + broadcast + ComplexMul
   def ampLatency: Int    = 1 + tail            // ampReg → cordic.xy
   def phaseLatency: Int  = 2 + tail            // phaseReg → gPhase → cordic.z
-  def freqLatency: Int   = 3 + tail            // freqReg → timePhase → gPhase → cordic.z
+  def freqLatency: Int   = 3 + extraMulLatency + tail  // freqReg → timePhase(+extra) → gPhase → cordic.z
   def phasorLatency: Int = 2 + ComplexMul.latency(saturate) // phValBuf + snapshot → ComplexMul.b
-  def timeLatency: Int   = 3 + tail            // time → batchTime → timePhase → gPhase
+  def timeLatency: Int   = 3 + extraMulLatency + tail  // time → batchTime → timePhase(+extra) → gPhase
+  // The freq and time paths are the same physical depth (they meet at gPhase); the freq queue's lead
+  // uses that depth directly.
+  require(freqLatency == timeLatency, "freq and time paths must have equal latency into gPhase")
+  /** Batches the time input is PRE-ADVANCED by (see `batchTime`). A consumer that predicts the
+   *  emitted phase from absolute time — the golden model — must subtract this from `timeLatency`:
+   *  the extra product stages are already cancelled, so the phase REFERENCE is unchanged. */
+  def timePhaseOffset: Int = extraMulLatency
 }

@@ -39,11 +39,22 @@ case class PulseParamBufferParams(
     startTimeAddr: Int = 0x4100,
     pulseOffset: Int = 0x10,     // 4 words per table entry; entry i at (i+1)*pulseOffset
     bitOffset: Int = 16,         // 16-bit fields packed in data[31:16]
+    freqWidth: Int = 0,          // M7b: frequency-register width; 0 = dataWidth (the seated 16-bit
+                                 // field at data[31:16]). Set to the FULL data width (32) to take the
+                                 // whole RfCmd word as an SF(32) frequency: a legacy seated write
+                                 // (code << 16) then means exactly the same physical frequency, and
+                                 // the low bits — previously discarded — become 1.83 Hz resolution.
     useMem: Boolean = true       // table storage: true (default) = distributed-RAM Mem; false = FF Vec
                                  // register file. Clamped to a register file when pulseNum = 1 (a depth-1
                                  // table has no address, e.g. ro/demod) — see `memTable` in the body.
 ) {
   require(pulseNum >= 1)
+  // Only two widths are meaningful here: the seated `dataWidth` field, or the FULL 32-bit RfCmd data
+  // word. 17..31 would silently drop the legacy word's top bits, and >32 would slice past the word.
+  require(freqWidth == 0 || freqWidth == dataWidth || freqWidth == 32,
+    s"freqWidth must be 0 (= dataWidth), dataWidth, or 32 — got $freqWidth")
+  /** effective frequency-register width */
+  def fw: Int = if (freqWidth <= 0) dataWidth else freqWidth
   require(addrWidth >= log2Up(startTimeAddr + 1), "addrWidth too small for startTimeAddr")
   // the parallel cmd decode splits the address at the 16-byte slot boundary (slot = address >> 4,
   // field = address[3:2]), so the layout must respect it:
@@ -75,7 +86,7 @@ case class PulseParamBuffer(p: PulseParamBufferParams) extends Component {
     val amp       = master port Flow(SInt(w bits))
     val addr      = master port Flow(UInt(envAddrWidth bits))
     val dur       = master port Flow(UInt(durWidth bits))
-    val freq      = master port Flow(SInt(w bits))
+    val freq      = master port Flow(SInt(p.fw bits))
     val time      = out    port UInt(timeWidth bits)     // local copy → pg.io.time
     val startTime = out    port UInt(timeWidth bits)     // per-buffer, cmd-written → pg.io.startTime
     val dcOffset  = out    port SInt(w bits)             // per-buffer, cmd-written → real-lane DC bias
@@ -194,7 +205,11 @@ case class PulseParamBuffer(p: PulseParamBufferParams) extends Component {
   // timing-invisible (the timed queue still captures the same startTime ⇒ bit-exact). valid inits False —
   // reset-clean, no X-driven spurious freq push at t=0 (mirrors outParamFlow above).
   io.freq.valid   := RegNext(hit(freqAddr)) init False
-  io.freq.payload := RegNext(field(w).asSInt)
+  // At the default width this is the seated 16-bit field; when widened to the full word width the
+  // WHOLE data word is the frequency (see `freqWidth`), which is why no new register/address is
+  // needed and every existing `set_freq(code << 16)` write keeps its exact meaning.
+  io.freq.payload := RegNext(if (p.fw == w) field(w).asSInt
+                             else cmd.payload.data(0, p.fw bits).asSInt)
 
   // fire the popped table entry into the generator's queues.
   io.phase.valid := outParamFlow.valid; io.phase.payload := outParamFlow.phase.asSInt

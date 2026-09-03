@@ -50,15 +50,15 @@ case class PulseGeneratorAligned(p: PulseGeneratorParams) extends Component {
     val time      = in port UInt(p.timeWidth bits)                 // external SoC time, batch units
     val startTime = in port UInt(p.timeWidth bits)                 // sampled at the params push
     val params    = slave port Flow(AlignedPulseParams(w, p.addrWidth, p.durWidth)) // amp/phase/addr/dur, ONE valid
-    val freq      = slave port Flow(SInt(w bits))                  // separate signal (own queues)
+    val freq      = slave port Flow(SInt(p.fw bits))               // separate signal (own queues)
     val memPort   = master port MemReadPort(Bits(N * 2 * w bits), p.addrWidth)
     val pulse     = master port Flow(ComplexBatch(N, w))
   }
 
   // ── sub-blocks (identical to PulseGenerator; their exported latencies drive the lead times) ──
   val correctGain = !p.prescaleAmp
-  val phasorGen = PhasorBatchGenerator(N, w, correctGain, p.saturate, p.phasorMethod)
-  val carrierGen = CarrierBatchGenerator(N, w, p.timeWidth, correctGain, p.saturate)
+  val phasorGen = PhasorBatchGenerator(N, w, correctGain, p.saturate, p.phasorMethod, p.freqWidth)
+  val carrierGen = CarrierBatchGenerator(N, w, p.timeWidth, correctGain, p.saturate, p.freqWidth)
   val envReader = EnvelopeReader(EnvelopeReaderParams(N, w, p.addrWidth, p.memLatency))
   val envMuls = Array.fill(N)(ComplexMul(w, p.saturate, resetValid = false))
   val Lm = ComplexMul.latency(p.saturate)
@@ -72,7 +72,7 @@ case class PulseGeneratorAligned(p: PulseGeneratorParams) extends Component {
   val leadAddr  = envReader.latency + Lm + gateLatency
   val leadDur   = gateLatency + 1 // + the down-counter load register
   /** time → pulse output latency (for the golden model's carrier time alignment). */
-  def timeToPulse: Int = carrierGen.timeLatency + Lm + gateLatency
+  def timeToPulse: Int = carrierGen.timeLatency - carrierGen.timePhaseOffset + Lm + gateLatency
 
   // ── one combined TimedQueue for {amp, phase, addr, dur}, popped at the LATEST of their leads ──
   val maxLead = Seq(leadAmp, leadPhase, leadAddr, leadDur).max
@@ -85,7 +85,7 @@ case class PulseGeneratorAligned(p: PulseGeneratorParams) extends Component {
 
   // ── frequency: own separate queues (left as a separate signal, QubiC-style) ──
   def mkFreqQueue(lead: Int): TimedQueue[SInt] = {
-    val q = TimedQueue(SInt(w bits), p.timeWidth, p.queueDepth, lead, p.timeOffset, p.queueUseVec, p.queueForFMax,
+    val q = TimedQueue(SInt(p.fw bits), p.timeWidth, p.queueDepth, lead, p.timeOffset, p.queueUseVec, p.queueForFMax,
       impl = p.queueImpl)
     q.io.time := io.time
     q.io.push.valid             := io.freq.valid

@@ -45,6 +45,8 @@ case class RiscqRfWithPulseTableFiber(
     batchSize: Int = 16,
     dataWidth: Int = 16,
     envAddrWidth: Int = 10,
+    freqWidth: Int = 0,            // M7b: frequency-word width (0 = dataWidth); see PulseDriveChannel
+
     timeWidth: Int = 32,
     durWidth: Int = 16,
     adcBatch: Int = 4,
@@ -146,7 +148,7 @@ case class RiscqRfWithPulseTableFiber(
     // one CPU-writable drive channel off a demuxed sub-window of the (piped) posted command stream.
     def mkDriveChannel(pulseNum: Int, base: BigInt, cmdDn: Flow[RfCmd]) = {
       val ch = PulseDriveChannel(pulseNum = pulseNum, batchSize = batchSize, dataWidth = w,
-        envAddrWidth = envAddrWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
+        envAddrWidth = envAddrWidth, freqWidth = freqWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
         prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod, realOutput = true,
         queueDepth = queueDepth)
       ch.io.cmd << RfLink.demux(cmdDn, base, 0x10000, 16)
@@ -163,7 +165,7 @@ case class RiscqRfWithPulseTableFiber(
     // channel; software programs a matched-filter envelope once and fires the demod aligned with the
     // readout window. adcBatch lanes (the ADC batch), not batchSize.
     val demodChannel = DemodChannel(pulseNum = demodPulseNum, batchSize = adcBatch, dataWidth = w,
-      envAddrWidth = envAddrWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
+      envAddrWidth = envAddrWidth, freqWidth = freqWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
       prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod, queueDepth = queueDepth)
     demodChannel.io.cmd << RfLink.demux(getPipe(riscvSoc.cmd, linkPipe), 0x20000, 0x10000, 16)
     demodChannel.io.timeBcast := time

@@ -30,6 +30,9 @@ case class PulseDriveChannel(
     phasorMethod: SinCosMethod,
     realOutput: Boolean,
     queueDepth: Int = 4,          // per-parameter TimedQueue depth (scheduled-ahead pulses per param)
+    freqWidth: Int = 0,           // M7b: frequency-word width; 0 = dataWidth (seated 16-bit field).
+                                  // 32 takes the whole RfCmd word as SF(32) -> 1.83 Hz steps, at
+                                  // +3 pipeline stages in the freq x time product (lead times follow).
     rfAddrWidth: Int = 16,
     useAligned: Boolean = false   // false = per-parameter lead-time TimedQueues (PulseGenerator);
                                   // true = QubiC-style single combined params FIFO + SRL alignment
@@ -45,14 +48,14 @@ case class PulseDriveChannel(
 
   val buf = PulseParamBuffer(PulseParamBufferParams(
     pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrWidth, durWidth = durWidth,
-    timeWidth = timeWidth, addrWidth = rfAddrWidth))
+    timeWidth = timeWidth, addrWidth = rfAddrWidth, freqWidth = freqWidth))
   buf.io.cmd << io.cmd
   buf.io.timeBcast := io.timeBcast
 
   val pgParams = PulseGeneratorParams(
     batchSize = N, dataWidth = w, timeWidth = timeWidth, addrWidth = envAddrWidth, durWidth = durWidth,
     memLatency = memLatency, prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod,
-    realOutput = realOutput, queueDepth = queueDepth)
+    realOutput = realOutput, queueDepth = queueDepth, freqWidth = freqWidth)
 
   // The generator's raw pulse (pre-dcOffset), captured here so the dcOffset stage below is shared
   // across both generator variants.
@@ -134,6 +137,9 @@ case class DemodChannel(
     saturate: Boolean,
     phasorMethod: SinCosMethod,
     queueDepth: Int = 4,          // per-parameter TimedQueue depth (scheduled-ahead pulses per param)
+    freqWidth: Int = 0,           // M7b: frequency-word width; 0 = dataWidth (seated 16-bit field).
+                                  // 32 takes the whole RfCmd word as SF(32) -> 1.83 Hz steps, at
+                                  // +3 pipeline stages in the freq x time product (lead times follow).
     rfAddrWidth: Int = 16
 ) extends Component {
   val N = batchSize; val w = dataWidth
@@ -146,14 +152,14 @@ case class DemodChannel(
 
   val buf = PulseParamBuffer(PulseParamBufferParams(
     pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrWidth, durWidth = durWidth,
-    timeWidth = timeWidth, addrWidth = rfAddrWidth))
+    timeWidth = timeWidth, addrWidth = rfAddrWidth, freqWidth = freqWidth))
   buf.io.cmd << io.cmd
   buf.io.timeBcast := io.timeBcast
 
   val pg = PulseGenerator(PulseGeneratorParams(
     batchSize = N, dataWidth = w, timeWidth = timeWidth, addrWidth = envAddrWidth, durWidth = durWidth,
     memLatency = memLatency, prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod,
-    realOutput = false, queueDepth = queueDepth))
+    realOutput = false, queueDepth = queueDepth, freqWidth = freqWidth))
   pg.io.time := buf.io.time; pg.io.startTime := buf.io.startTime
   pg.io.phase.valid := buf.io.phase.valid; pg.io.phase.payload := buf.io.phase.payload + buf.io.phaseOffset
   pg.io.amp << buf.io.amp; pg.io.addr << buf.io.addr

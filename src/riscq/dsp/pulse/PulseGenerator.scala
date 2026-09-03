@@ -35,9 +35,17 @@ case class PulseGeneratorParams(
                                  // io.pulse.im = 0 so synthesis prunes each envelope ComplexMul's
                                  // imag-output multiply (3→2 DSP/lane) — even inside a KEEP_HIERARCHY
                                  // fence, since the dead output is then intra-block.
+    ,
+    freqWidth: Int = 0           // M7b: frequency-word width; 0 = dataWidth (the historic SF(16)
+                                 // word). Wider keeps the same MSB weight and buys fractional
+                                 // frequency resolution (32 bits: 1.83 Hz instead of 120 kHz) at
+                                 // +3 pipeline stages inside the freq x time product.
 ) {
   require(isPow2(batchSize), "batchSize must be a power of two")
   require(dataWidth >= 2 && timeWidth >= 3 && addrWidth >= 1 && durWidth >= 1)
+  require(freqWidth == 0 || freqWidth >= dataWidth, "freqWidth must be 0 (= dataWidth) or wider")
+  /** effective frequency-word width */
+  def fw: Int = if (freqWidth <= 0) dataWidth else freqWidth
 }
 
 /**
@@ -64,7 +72,7 @@ case class PulseGenerator(p: PulseGeneratorParams) extends Component {
     val time      = in port UInt(p.timeWidth bits)            // external SoC time, batch units
     val startTime = in port UInt(p.timeWidth bits)            // sampled at each param push
     val amp       = slave port Flow(SInt(w bits))
-    val freq      = slave port Flow(SInt(w bits))
+    val freq      = slave port Flow(SInt(p.fw bits))
     val phase     = slave port Flow(SInt(w bits))
     val addr      = slave port Flow(UInt(p.addrWidth bits))
     val dur       = slave port Flow(UInt(p.durWidth bits))    // batches; pulse window length
@@ -76,8 +84,8 @@ case class PulseGenerator(p: PulseGeneratorParams) extends Component {
   // prescaleAmp ⇒ run both CORDICs uncorrected (software prescales amp by 1/K): the gain
   // stage drops, cordic.latency shrinks by 1, and the lead times below re-derive automatically.
   val correctGain = !p.prescaleAmp
-  val phasorGen = PhasorBatchGenerator(N, w, correctGain, p.saturate, p.phasorMethod)
-  val carrierGen = CarrierBatchGenerator(N, w, p.timeWidth, correctGain, p.saturate)
+  val phasorGen = PhasorBatchGenerator(N, w, correctGain, p.saturate, p.phasorMethod, p.freqWidth)
+  val carrierGen = CarrierBatchGenerator(N, w, p.timeWidth, correctGain, p.saturate, p.freqWidth)
   val envReader = EnvelopeReader(EnvelopeReaderParams(N, w, p.addrWidth, p.memLatency))
   // resetValid = false: the envMul rsp.valid is unused — the output is gated by the
   // reset-bearing duration counter `active`, so the reset-free valid chain sheds the global reset.
@@ -92,8 +100,10 @@ case class PulseGenerator(p: PulseGeneratorParams) extends Component {
   val leadFreqP = phasorGen.regenCycles + carrierGen.phasorLatency + Lm + gateLatency
   val leadAddr  = envReader.latency + Lm + gateLatency
   val leadDur   = gateLatency + 1 // + the down-counter load register
-  /** time → pulse output latency (for the golden model's carrier time alignment). */
-  def timeToPulse: Int = carrierGen.timeLatency + Lm + gateLatency
+  /** time → pulse output latency (for the golden model's carrier time alignment). The carrier's
+   *  time input is pre-advanced by `timePhaseOffset` so a deeper product does NOT move the emitted
+   *  phase's time reference — hence the subtraction: the model's alignment is width-independent. */
+  def timeToPulse: Int = carrierGen.timeLatency - carrierGen.timePhaseOffset + Lm + gateLatency
 
   // ── six TimedQueues, each pushed from its io Flow with io.startTime ──
   def mkQueue[T <: Data](dt: HardType[T], lead: Int): TimedQueue[T] = {
@@ -104,8 +114,11 @@ case class PulseGenerator(p: PulseGeneratorParams) extends Component {
   }
   val ampQ   = mkQueue(SInt(w bits), leadAmp)
   val phaseQ = mkQueue(SInt(w bits), leadPhase)
-  val freqCQ = mkQueue(SInt(w bits), leadFreqC) // freq → carrier
-  val freqPQ = mkQueue(SInt(w bits), leadFreqP) // freq → phasor regen
+  val freqCQ = mkQueue(SInt(p.fw bits), leadFreqC) // freq → carrier
+  val freqPQ = mkQueue(SInt(p.fw bits), leadFreqP) // freq → phasor regen
+  // The two freq paths must stay ordered as the lead-time contract assumes: the phasor regen is the
+  // longer one (it must finish before the carrier consumes the new word).
+  require(leadFreqP >= leadFreqC, s"leadFreqP $leadFreqP must be >= leadFreqC $leadFreqC")
   val addrQ  = mkQueue(UInt(p.addrWidth bits), leadAddr)
   val durQ   = mkQueue(UInt(p.durWidth bits), leadDur)
 

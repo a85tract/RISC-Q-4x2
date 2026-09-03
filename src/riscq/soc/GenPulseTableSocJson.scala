@@ -82,6 +82,11 @@ object GenPulseTableSocJson extends App {
     // specs/dsp-fmax.md converter-edge lever (C2), default off — a confirmation build turns it on in
     // its JSON so the lever state is part of the recorded build geometry (soc-fmax R5).
     adcPipe           = intOr("adc_pipe", 3),
+    // M7b frequency-word width: 0/absent = the historic 16-bit word; 32 = SF(32) fractional words.
+    freqWidth     = intOr("freq_width", 0),
+    // FREQ_HZ tag on dspClk in vivado mode; every config carries dsp_freq_hz for the software stack,
+    // and the hardware tag must agree (500 MHz ZCU216, 491.52 MHz RFSoC 4x2).
+    dspFreqHz     = cfg.obj.get("dsp_freq_hz").map(_.num.toLong).getOrElse(500000000L),
     vivado        = vivadoMode)
 
   // vivado mode: LUT6 packing + the companion ClockInterface.v BUFG wrapper, matching GenPulseTableSocVivado.
