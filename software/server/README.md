@@ -26,6 +26,12 @@ are on DAC0); on `rfsoc4x2-2dac-fine` loop **DAC1 → ADC0** (the readout drive 
 drive on DAC0 is then not seen by the ADC). ADC0 is the core's readout ADC in both bundles
 (`adc_map [0]`); using ADC1 instead is a config change (`adc_map [1]`) and hence another bitstream.
 
+Quick cable test: `PYTHONPATH=software/client python software/examples/loopback_check.py --remote <board>
+--bundle <bundle> --ch <0|1>` plays one tone on a drive channel and reports whether it reaches the
+readout ADC (`TONE PRESENT` / `NO TONE`). Run it first after (re)cabling — a loose SMA looks exactly
+like a dead board from software (bench note 2026-09-03: every digital check passed while ADC0 saw
+only noise, until the connector was re-seated).
+
 Both are the "fine" configuration: 0.254 ns envelope grid on both drive channels, 16 384
 envelope lines, 32-bit frequency word, queue depth 8 (see `docs/hardware-contract.md`).
 

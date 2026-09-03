@@ -65,6 +65,8 @@ device db + run, and a point-by-point comparison of the captured waveform agains
 ## Verification status
 
 The scripted pass/fail run is `software/examples/artiq_rx_demo.py` (`RX_DEMO: PASS` in co-sim
-and on the board; final logs kept with the project notes). Host-pure test suite: 290 tests across `software/client/tests/` (55 of them cover the
+and on the board; final logs kept with the project notes). The bench smoke test is
+`software/examples/loopback_check.py`: one tone on a drive channel, pass/fail on whether it reaches
+the readout ADC — run it first after cabling. Host-pure test suite: 290 tests across `software/client/tests/` (55 of them cover the
 ARTIQ layers: `test_artiqapi.py` + `test_artiq_compat.py`). The design notes and root-cause records (ARTIQ_API_PLAN.md, the project journal) are
 kept with the maintainer's project notes, outside this repository.

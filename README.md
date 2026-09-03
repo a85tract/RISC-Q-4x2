@@ -41,7 +41,7 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
 | `docs/` | **start here**: [README](docs/README.md) quickstart, [the ARTIQ interface](docs/artiq-interface.md), [the explicit layer](docs/explicit-api.md), [the hardware contract](docs/hardware-contract.md) (grids, limits, every error) |
 | `software/client/` | the `riscq` Python package (runs on your PC / in the docker image) + `Dockerfile` |
 | `software/server/` | the board side: ready-made bitstream bundles in `bits/`, `board_setup.sh`, `start_server.sh` |
-| `software/examples/` | the live demo notebook, device-db examples (`configs/`), the verification script, the reference waveform generator |
+| `software/examples/` | the live demo notebook, device-db examples (`configs/`), the verification script, the loopback cable check (`loopback_check.py`), the reference waveform generator |
 | `sim/` | co-simulation (`riscq_sim`): the RTL under Verilator behind the same driver seam — everything runs without a board |
 | `gateware/` | the RISC-Q hardware: SpinalHDL sources, `configs/` (SoC parameters), Vivado flow for the 4x2 |
 
@@ -59,7 +59,7 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
 2. **You have an RFSoC 4x2**: flash the vendor PYNQ image, then from `software/server/`:
    `./board_setup.sh xilinx@<board-ip>` and `ssh -t xilinx@<board-ip> '~/riscq-4x2/start_server.sh'`
    (see [software/server/README.md](software/server/README.md)). Loop a DAC into ADC0 for the
-   receive-side demos. Build the `client` image (RISC-V toolchain + Python) and run your
+   receive-side demos and confirm the cable with `software/examples/loopback_check.py`. Build the `client` image (RISC-V toolchain + Python) and run your
    experiments with `device_db_board` / `device_db_2dac`.
 3. **You want to change the gateware**: `gateware/` — Vivado 2024.1+ and the
    `vivado-scripts/riscvsoc-bd` flow (`RISCQ_BOARD=rfsoc4x2`, default config
