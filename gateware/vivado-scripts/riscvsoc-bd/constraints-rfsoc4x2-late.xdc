@@ -43,6 +43,6 @@ set_property FORCE_MAX_FANOUT 4 [get_nets -of_objects [get_pins -of_objects \
 # -> pulseMemFiber_rams_0/.../ENARDEN: one address register enabling many cascaded RAMB36. Ask the
 # placer to replicate these per clock region as well (latency-neutral).
 set_property MAX_FANOUT_MODE CLOCK_REGION [get_nets -of_objects [get_pins -of_objects \
-  [get_cells -hier -filter {REF_NAME == FDRE && NAME =~ *envReader/addrReg_reg*}] -filter {REF_PIN_NAME == Q}]]
+  [get_cells -hier -filter {REF_NAME =~ FD* && NAME =~ *envReader/addrReg_reg*}] -filter {REF_PIN_NAME == Q}]]
 set_property FORCE_MAX_FANOUT 8 [get_nets -of_objects [get_pins -of_objects \
-  [get_cells -hier -filter {REF_NAME == FDRE && NAME =~ *envReader/addrReg_reg*}] -filter {REF_PIN_NAME == Q}]]
+  [get_cells -hier -filter {REF_NAME =~ FD* && NAME =~ *envReader/addrReg_reg*}] -filter {REF_PIN_NAME == Q}]]
