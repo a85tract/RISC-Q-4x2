@@ -103,6 +103,8 @@ def main():
     ap.add_argument("--loopback-src", type=int, default=0,
                     help="co-sim: which DAC the loopback model feeds into ADC0 (0 on the single-DAC "
                          "builds; 1 on rfsoc4x2-2dac-fine, where the readout drive is DAC1)")
+    ap.add_argument("--loopback-dst", type=int, default=0,
+                    help="co-sim: ADC port the loopback feeds (the bundle's adc_map entry; 1 for *-adcb)")
     ap.add_argument("--ref-trace", default=None,
                     help="npz whose 'trace' the part-A capture must equal byte for byte (co-sim)")
     ap.add_argument("--out", default="artiq_rx.npz")
@@ -112,7 +114,7 @@ def main():
         from riscq_sim import cosim
         drv = cosim.start(a.config, a.build)
         m = SocMap(SocParams.from_json(drv.sim.get_params()))
-        drv.sim.set_model({"kind": "loopback", "src": a.loopback_src, "dst": 0, "gain": 0.9,
+        drv.sim.set_model({"kind": "loopback", "src": a.loopback_src, "dst": a.loopback_dst, "gain": 0.9,
                            "delay": a.delay})
     elif a.remote:
         from riscq.driver.remote import RemoteDriver

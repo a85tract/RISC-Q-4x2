@@ -59,7 +59,8 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
 2. **You have an RFSoC 4x2**: flash the vendor PYNQ image, then from `software/server/`:
    `./board_setup.sh xilinx@<board-ip>` and `ssh -t xilinx@<board-ip> '~/riscq-4x2/start_server.sh'`
    (see [software/server/README.md](software/server/README.md)). Loop a DAC into ADC0 for the
-   receive-side demos and confirm the cable with `software/examples/loopback_check.py`. Build the `client` image (RISC-V toolchain + Python) and run your
+   receive-side demos (on the 4x2 the SoC's DAC0/ADC0 are the connectors printed DAC_B/ADC_B — see
+   [software/server/README.md](software/server/README.md)) and confirm the cable with `software/examples/loopback_check.py`. Build the `client` image (RISC-V toolchain + Python) and run your
    experiments with `device_db_board` / `device_db_2dac`.
 3. **You want to change the gateware**: `gateware/` — Vivado 2024.1+ and the
    `vivado-scripts/riscvsoc-bd` flow (`RISCQ_BOARD=rfsoc4x2`, default config
@@ -72,6 +73,7 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
 |---|---|---|
 | `rfsoc4x2-1q-fine` | gate + readout drives summed on DAC0, ADC0 readout | board- and co-sim-verified (the demo notebook) |
 | `rfsoc4x2-2dac-fine` | gate → DAC0, readout → DAC1, ADC0 readout | board- and co-sim-verified on both DACs (RX_DEMO PASS through DAC1, gate tone on DAC0), timing-clean (WNS +0.032 ns) — see its `PROVENANCE.md` |
+| `rfsoc4x2-2dac-adcb` | gate → DAC0, readout → DAC1, ADC1 readout | the 2-DAC design reading ADC1 (loop DAC1 → ADC1); board-verified (RX_DEMO PASS), timing-clean (WNS +0.015 ns) — see its `PROVENANCE.md` |
 
 ## Honest limits
 

@@ -38,5 +38,6 @@ the supported way to run it. `PYTHONPATH` needs both `software/client` and `sim`
 
 `set_model({"kind": "loopback", "src": <dac>, "dst": <adc>, "gain", "delay"})` wires one DAC
 into one ADC. On the single-DAC bundles both drive channels are on DAC0 (`src: 0`); on
-`rfsoc4x2-2dac-fine` the readout drive is on DAC1 (`src: 1`) — see
-`software/examples/configs/device_db_*.py` and `software/examples/artiq_rx_demo.py --loopback-src`.
+`rfsoc4x2-2dac-fine` the readout drive is on DAC1 (`src: 1`); on `rfsoc4x2-2dac-adcb` the readout
+ADC is ADC1 (`dst: 1`) — see `software/examples/configs/device_db_*.py` and
+`software/examples/artiq_rx_demo.py --loopback-src / --loopback-dst`.

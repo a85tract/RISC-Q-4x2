@@ -20,21 +20,26 @@ requirements-board.txt   what the board needs beyond PYNQ
 |---|---|---|
 | `rfsoc4x2-1q-fine` | gate (ch0) and readout (ch1) drives **summed onto DAC0**; ADC0 readout | co-sim + board: RX_DEMO PASS, waveform vs generator 0.4–0.5 % |
 | `rfsoc4x2-2dac-fine` | gate → **DAC0**, readout → **DAC1**, ADC0 readout | co-sim + board: RX_DEMO PASS on the DAC1 readout path, DAC0 gate tone verified; timing-clean (WNS +0.032 ns) — details in its PROVENANCE.md |
+| `rfsoc4x2-2dac-adcb` | gate → **DAC0**, readout → **DAC1**, **ADC1** readout (loop DAC1 → ADC1) | board: RX_DEMO PASS through DAC1 → ADC1; timing-clean (WNS +0.015 ns) — details in its PROVENANCE.md |
 
-Bench wiring for the receive-side checks: on `rfsoc4x2-1q-fine` loop **DAC0 → ADC0** (both drives
-are on DAC0); on `rfsoc4x2-2dac-fine` loop **DAC1 → ADC0** (the readout drive is on DAC1; the gate
-drive on DAC0 is then not seen by the ADC). ADC0 is the core's readout ADC in both bundles
-(`adc_map [0]`); using ADC1 instead is a config change (`adc_map [1]`) and hence another bitstream.
+**Connector labels (measured on the RFSoC 4x2, 2026-09-03):** the SoC's **DAC0** is RFDC tile 228 =
+the connector printed **DAC_B**; **DAC1** is tile 230 = **DAC_A**; **ADC0** is tile 226 block 0 = **ADC_B**;
+**ADC1** is block 1 = **ADC_A**. Bench wiring for the receive-side checks, in SoC numbering: on
+`rfsoc4x2-1q-fine` loop **DAC0 → ADC0** (connectors DAC_B → ADC_B; both drives are on DAC0); on
+`rfsoc4x2-2dac-fine` loop **DAC1 → ADC0** (DAC_A → ADC_B; the readout drive is on DAC1, the gate
+drive on DAC0 is then not seen by the ADC). ADC0 is the core's readout ADC in those two bundles
+(`adc_map [0]`); `rfsoc4x2-2dac-adcb` is the same 2-DAC design reading ADC1 instead (`adc_map [1]`),
+so its readout loop is **DAC1 → ADC1** (connectors DAC_A → ADC_A). Select a bundle with `"bundle": "<name>"` in the device db.
 
 Quick cable test: `PYTHONPATH=software/client python software/examples/loopback_check.py --remote <board>
 --bundle <bundle> --ch <0|1>` plays one tone on a drive channel and reports whether it reaches the
-readout ADC (`TONE PRESENT` / `NO TONE`). Run it first after (re)cabling — an RF-path fault looks
+readout ADC (`TONE PRESENT` / `NO TONE`). Run it first after (re)cabling: a wrong connector pair looks
 exactly like a dead board from software (bench note 2026-09-03: every digital check passed while the
-ADC saw only noise on every single-cable loopback; the cause was a broken SMA ground return on our
-board, and a second cable between the other DAC/ADC pair restored the loop). If a verified bundle
-shows NO TONE, suspect cables, connectors and grounds before software.
+ADC saw only noise for a whole day — the cable was on the A connectors while the bundle used the
+ports behind the B connectors). If a verified bundle shows NO TONE, check the connector mapping
+above, then cables and seating, before suspecting software.
 
-Both are the "fine" configuration: 0.254 ns envelope grid on both drive channels, 16 384
+All three are the "fine" configuration: 0.254 ns envelope grid on both drive channels, 16 384
 envelope lines, 32-bit frequency word, queue depth 8 (see `docs/hardware-contract.md`).
 
 ## Setup (once per board)

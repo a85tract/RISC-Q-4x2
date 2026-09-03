@@ -1,7 +1,7 @@
 """Play the ion-trap two-pulse waveform (Tests/waveform_generator.py) on the RISC-Q refactor
 PulseTableSoc and capture it in the robs trace — co-sim (verilator + LoopbackModel) or board.
 
-Sequence (all on DAC_A via dac_map [[0,0]]):
+Sequence (all on DAC0 = connector DAC_B via dac_map [[0,0]]):
   pulse 1 (100 us): tone A (82+1.765 MHz, phase 0)   on the GATE channel (ch0)
                   + tone B (82-1.765 MHz, phase -180) on the READOUT channel (ch1)
   gap 5 us, then pulse 2 (20 us): 82 MHz, phase +90, on the READOUT channel (ch1)
@@ -48,7 +48,7 @@ CODE_A, CODE_B, CODE_V = 698, 669, 683          # 83.76 / 80.28 / 81.96 MHz
 DUR1, GAP, DUR2 = 49152, 2458, 9830             # batches: 100 us / ~5 us / 20 us
 PH_A, PH_B = 0, 32768                           # 0 deg, -180 deg at the aligned t1
 PH_V = 16384                                    # +90 deg at pulse 2's OWN start (target)
-AMP = 0.4                                       # per tone; two tones sum on DAC_A
+AMP = 0.4                                       # per tone; two tones sum on DAC0
 # --exact (M7b, freq_width 32): the generator's TRUE tones instead of the 16-bit codes above.
 # compare_ms_waveform.py re-derives these from Tests/waveform_generator.py's own defaults.
 F_V_HZ, F_OMEGA_HZ = 82.0e6, 1.765e6

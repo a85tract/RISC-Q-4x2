@@ -1,0 +1,11 @@
+{
+  "lmk_freq": 245.76,
+  "lmx_freq": 491.52,
+  "adc_nyquist": 1,
+  "dac_nyquist": {
+    "default": 1
+  },
+  "dac_current": {},
+  "mts": null,
+  "fclk0_mhz": 96.968727
+}
