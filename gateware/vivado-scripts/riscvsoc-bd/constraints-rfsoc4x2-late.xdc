@@ -29,9 +29,11 @@ set_property IS_SOFT FALSE [get_pblocks p_demod0_ram]
 # The posted-link write staging registers (_zz_io_port0_write_reg / _zz_io_port0_wdata_reg) drive
 # the trace BRAM write ports across many clock regions; the 2-DAC placement lost ~120 ps there
 # (WNS -0.078 vs +0.045 on the 1q build). Latency-neutral physical replication (UG904):
-# set_property MAX_FANOUT_MODE CLOCK_REGION [get_nets -of_objects [get_pins -of_objects \
-#   [get_cells -hier -filter {REF_NAME == FDRE && (NAME =~ *_zz_io_port0_write_reg* || NAME =~ *_zz_io_port0_wdata_reg*)}] \
-#   -filter {REF_PIN_NAME == Q}]]
-# set_property FORCE_MAX_FANOUT 4 [get_nets -of_objects [get_pins -of_objects \
-#   [get_cells -hier -filter {REF_NAME == FDRE && (NAME =~ *_zz_io_port0_write_reg* || NAME =~ *_zz_io_port0_wdata_reg*)}] \
-#   -filter {REF_PIN_NAME == Q}]]
+# ENABLED 2026-09-03: attempt 2 (ExtraTimingOpt placer + post-route phys_opt) still failed at
+# WNS -0.127 ns on these very paths, so the placer is told to replicate them per clock region.
+set_property MAX_FANOUT_MODE CLOCK_REGION [get_nets -of_objects [get_pins -of_objects \
+  [get_cells -hier -filter {REF_NAME == FDRE && (NAME =~ *_zz_io_port0_write_reg* || NAME =~ *_zz_io_port0_wdata_reg*)}] \
+  -filter {REF_PIN_NAME == Q}]]
+set_property FORCE_MAX_FANOUT 4 [get_nets -of_objects [get_pins -of_objects \
+  [get_cells -hier -filter {REF_NAME == FDRE && (NAME =~ *_zz_io_port0_write_reg* || NAME =~ *_zz_io_port0_wdata_reg*)}] \
+  -filter {REF_PIN_NAME == Q}]]
