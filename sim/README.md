@@ -16,7 +16,8 @@ cosim.stop(drv)
 
 `cosim.start(config, build_dir)` regenerates the RTL only when the config JSON changed (sha
 stamp), verilates only when the RTL changed, then runs the bench as a subprocess and returns a
-`CosimDriver`. The first start of a new config takes a few minutes; later starts are seconds.
+`CosimDriver`. The first start of a new config takes a few minutes (and, in a fresh `full` image, mill downloads its
+Scala dependencies once — network needed); later starts are seconds.
 
 | what | where |
 |---|---|

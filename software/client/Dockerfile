@@ -80,6 +80,8 @@ COPY gateware gateware
 # generator (mill) would fail at first co-sim — fail the image build instead, loudly
 RUN test -f gateware/ext/SpinalHDL/build.mill -o -f gateware/ext/SpinalHDL/build.sc \
  || (echo "gateware/ext/SpinalHDL is empty: run 'git submodule update --init --recursive' before building 'full'" && exit 1)
-RUN verilator --version && mill --version 2>/dev/null | head -1 \
+# NOTE: no `mill --version` here — it would pull ~1.2 GB of JVM/Scala dependencies into the image.
+# The first co-sim run fetches them (one-time, needs network; cached under /root/.cache).
+RUN verilator --version && test -x /usr/local/bin/mill \
  && python -c "import cocotb, riscq_sim; print('full ok')"
 CMD ["bash"]

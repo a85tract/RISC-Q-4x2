@@ -56,7 +56,7 @@ jobs:
       - name: co-sim smoke (import-only + mill and RTL sources present)
         run: |
           docker run --rm -v "$PWD":/work/RISC-Q -w /work/RISC-Q riscq-4x2:full bash -c \
-            "python -c 'import riscq_sim.cosim, cocotb' && mill --version | head -1 && test -d gateware/ext/SpinalHDL/core && echo smoke ok"
+            "python -c 'import riscq_sim.cosim, cocotb' && test -x /usr/local/bin/mill && test -d gateware/ext/SpinalHDL/core && echo smoke ok"
 
       - name: login to GHCR
         if: vars.PUBLISH_IMAGES == 'true' && github.event_name != 'pull_request'
