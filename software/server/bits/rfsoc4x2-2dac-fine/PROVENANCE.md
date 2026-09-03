@@ -11,6 +11,17 @@ top.xsa sha256 b09c3de4e1400c160bb27a8d2c3c8df768dcfc74a15a72c7fcda99ed591938ce 
 board.json is the board-level clock/Nyquist config shared with rfsoc4x2-1q-fine (the PS clock is a
 board preset the flow asserts).
 
+Implementation history (Vivado 2026.1, all from the same synthesized netlist):
+- attempt 1 (flow default Performance_NetDelay_high, no extra constraints): write_bitstream refused —
+  DRC CASC-31 (the demod envelope RAM's 16-deep RAMB36 cascade placed across a clock-region row
+  break) and WNS -0.078 ns on the trace-RAM write staging -> RAMB36 paths.
+- attempt 2 (Performance_ExplorePostRoutePhysOpt + place ExtraTimingOpt + post-route phys_opt): a
+  bitstream was written but WNS -0.127 ns (97 endpoints; worst path envReader address -> envelope
+  RAM enable) — REJECTED, not shipped.
+- attempt 3 (back to Performance_NetDelay_high + constraints-rfsoc4x2-late.xdc: hard RAM-only pblock
+  pinning the demod RAM to CLOCKREGION_X1Y3, MAX_FANOUT_MODE CLOCK_REGION / FORCE_MAX_FANOUT on the
+  trace-write staging FFs and the envReader address FDCEs): WNS +0.032 ns, TNS 0, no DRC — this xsa.
+
 Verification:
 - co-simulation (Verilator, loopback DAC1 -> ADC0): `software/examples/artiq_rx_demo.py --cosim
   --config gateware/configs/rfsoc4x2-2dac-fine.json --loopback-src 1` -> RX_DEMO: PASS
