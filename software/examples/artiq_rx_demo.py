@@ -101,8 +101,8 @@ def main():
     ap.add_argument("--work", default=str(repo / "sim/build/artiq_rx_generated"))
     ap.add_argument("--delay", type=int, default=5)
     ap.add_argument("--loopback-src", type=int, default=0,
-                    help="co-sim: which DAC the loopback model feeds into ADC0 (0 on the single-DAC "
-                         "builds; 1 on rfsoc4x2-2dac-fine, where the readout drive is DAC1)")
+                    help="co-sim: which DAC the loopback model feeds into the --loopback-dst ADC (0 on the "
+                         "single-DAC builds; 1 on the 2-DAC builds, where the readout drive is DAC1)")
     ap.add_argument("--loopback-dst", type=int, default=0,
                     help="co-sim: ADC port the loopback feeds (the bundle's adc_map entry; 1 for *-adcb)")
     ap.add_argument("--ref-trace", default=None,

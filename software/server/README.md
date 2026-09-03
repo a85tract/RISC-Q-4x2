@@ -23,8 +23,8 @@ requirements-board.txt   what the board needs beyond PYNQ
 | `rfsoc4x2-2dac-adcb` | gate → **DAC0**, readout → **DAC1**, **ADC1** readout (loop DAC1 → ADC1) | board: RX_DEMO PASS through DAC1 → ADC1; timing-clean (WNS +0.015 ns) — details in its PROVENANCE.md |
 
 **Connector labels (measured on the RFSoC 4x2, 2026-09-03):** the SoC's **DAC0** is RFDC tile 228 =
-the connector printed **DAC_B**; **DAC1** is tile 230 = **DAC_A**; **ADC0** is tile 226 block 0 = **ADC_B**;
-**ADC1** is block 1 = **ADC_A**. Bench wiring for the receive-side checks, in SoC numbering: on
+the connector printed **DAC_B**; **DAC1** is tile 230 = **DAC_A**; **ADC0** is tile 226's first converter (xrfdc block 0, stream
+`m20_axis`) = **ADC_B**; **ADC1** is its second converter (xrfdc block 1, stream `m22_axis`) = **ADC_A**. Bench wiring for the receive-side checks, in SoC numbering: on
 `rfsoc4x2-1q-fine` loop **DAC0 → ADC0** (connectors DAC_B → ADC_B; both drives are on DAC0); on
 `rfsoc4x2-2dac-fine` loop **DAC1 → ADC0** (DAC_A → ADC_B; the readout drive is on DAC1, the gate
 drive on DAC0 is then not seen by the ADC). ADC0 is the core's readout ADC in those two bundles

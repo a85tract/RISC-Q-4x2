@@ -4,10 +4,12 @@
 # port: analog SMA loopback S8 PASS — linearity 2.00x/step, phase -90.06 deg for a 90 deg shift,
 # 983x off-tone rejection), including the staged parameter application and post-apply assertions.
 # Physical mapping (board-measured via the vendor base overlay):
-#     s00_axis -> DAC tile 228 slice 0 -> DAC_A SMA        (TOP DAC0_AXIS)
-#     s20_axis -> DAC tile 230 slice 0 -> DAC_B SMA        (TOP DAC1_AXIS)
-#     m20_axis <- ADC tile 226 slice 0 <- ADC_A SMA        (TOP ADC0_AXIS)
-#     m22_axis <- ADC tile 226 slice 2 <- ADC_B SMA        (TOP ADC1_AXIS)
+#     s00_axis -> DAC tile 228 slice 0 -> DAC_B SMA        (TOP DAC0_AXIS)
+#     s20_axis -> DAC tile 230 slice 0 -> DAC_A SMA        (TOP DAC1_AXIS)
+#     m20_axis <- ADC tile 226 slice 0 <- ADC_B SMA        (TOP ADC0_AXIS)
+#     m22_axis <- ADC tile 226 slice 2 <- ADC_A SMA        (TOP ADC1_AXIS)
+# (SMA letters measured 2026-09-03 with a single cable and the DAC0/ADC0 vs DAC1/ADC1 bundles;
+#  an earlier comment had A/B the other way round)
 # ADC_A/B are on tile 226, NOT 224; tile 224's factory-default slices must be explicitly disabled
 # or its clock pins dangle (BD 41-758). No CLK104: tile refs are 491.52 MHz from the on-board
 # LMX2594s (programmed at runtime via xrfclk — lmx_freq=491.52 is MANDATORY), each used tile runs

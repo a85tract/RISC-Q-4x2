@@ -57,7 +57,8 @@ connect_bd_intf_net [get_bd_intf_pins rf_data_converter/dac0_clk]  [get_bd_intf_
 connect_bd_intf_net [get_bd_intf_pins rf_data_converter/dac2_clk]  [get_bd_intf_ports dac2_clk]
 connect_bd_intf_net [get_bd_intf_pins rf_data_converter/adc2_clk]  [get_bd_intf_ports adc2_clk]
 
-# ---- converter streams (board-measured SMA map: DAC_A=228s0, DAC_B=230s0, ADC_A/B=226 s0/s2) ----
+# ---- converter streams (SMA map measured 2026-09-03 with a single cable: DAC_B=228s0, DAC_A=230s0,
+#      ADC_B=226 s0 (m20), ADC_A=226 s2 (m22) — the 4x2 letters run opposite to the tile order) ----
 connect_bd_intf_net [get_bd_intf_pins $TOP/DAC0_AXIS] [get_bd_intf_pins rf_data_converter/s00_axis]
 connect_bd_intf_net [get_bd_intf_pins $TOP/DAC1_AXIS] [get_bd_intf_pins rf_data_converter/s20_axis]
 connect_bd_intf_net [get_bd_intf_pins $TOP/ADC0_AXIS] [get_bd_intf_pins rf_data_converter/m20_axis]
