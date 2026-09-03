@@ -12,3 +12,26 @@
 set_clock_groups -asynchronous \
   -group [get_clocks clk_pl_0] \
   -group [get_clocks -quiet {RFDAC*_CLK RFADC*_CLK dac0_clk_clk_p dac2_clk_clk_p adc2_clk_clk_p}]
+
+# ---- demod envelope RAM: keep its cascaded RAMB36 chain inside ONE clock region ----------------
+# The 16 RAMB36E2 of riscqCores_0's demod envelope RAM (env_depth 16384 x 32) are depth-cascaded.
+# Left to the placer, the rfsoc4x2-2dac-fine build put the chain across a clock-region row break
+# and write_bitstream refused with DRC CASC-31 (2026-09-03). The board-verified rfsoc4x2-1q-fine
+# build had all 16 in CLOCKREGION_X1Y3 (22 RAMB36 sites there) — pin them there. RAM-only, hard
+# pblock: no LUT/FF is constrained, so the timing impact is the placement the good build already had.
+create_pblock p_demod0_ram
+add_cells_to_pblock [get_pblocks p_demod0_ram] \
+  [get_cells -hier -filter {REF_NAME == RAMB36E2 && NAME =~ *riscqArea_riscqCores_0_demodMemFiber_rams_0*}]
+resize_pblock [get_pblocks p_demod0_ram] -add {CLOCKREGION_X1Y3:CLOCKREGION_X1Y3}
+set_property IS_SOFT FALSE [get_pblocks p_demod0_ram]
+
+# ---- trace ("robs") RAM write fanout: enable if the DSP-clock WNS goes negative -----------------
+# The posted-link write staging registers (_zz_io_port0_write_reg / _zz_io_port0_wdata_reg) drive
+# the trace BRAM write ports across many clock regions; the 2-DAC placement lost ~120 ps there
+# (WNS -0.078 vs +0.045 on the 1q build). Latency-neutral physical replication (UG904):
+# set_property MAX_FANOUT_MODE CLOCK_REGION [get_nets -of_objects [get_pins -of_objects \
+#   [get_cells -hier -filter {REF_NAME == FDRE && (NAME =~ *_zz_io_port0_write_reg* || NAME =~ *_zz_io_port0_wdata_reg*)}] \
+#   -filter {REF_PIN_NAME == Q}]]
+# set_property FORCE_MAX_FANOUT 4 [get_nets -of_objects [get_pins -of_objects \
+#   [get_cells -hier -filter {REF_NAME == FDRE && (NAME =~ *_zz_io_port0_write_reg* || NAME =~ *_zz_io_port0_wdata_reg*)}] \
+#   -filter {REF_PIN_NAME == Q}]]
