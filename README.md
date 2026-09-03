@@ -71,7 +71,7 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
 | bundle | output mapping | status |
 |---|---|---|
 | `rfsoc4x2-1q-fine` | gate + readout drives summed on DAC0, ADC0 readout | board- and co-sim-verified (the demo notebook) |
-| `rfsoc4x2-2dac-fine` | gate → DAC0, readout → DAC1, ADC0 readout | co-sim verified (RX_DEMO PASS), bitstream built and timing-clean (WNS +0.032 ns); board test pending — see its `PROVENANCE.md` |
+| `rfsoc4x2-2dac-fine` | gate → DAC0, readout → DAC1, ADC0 readout | board- and co-sim-verified on both DACs (RX_DEMO PASS through DAC1, gate tone on DAC0), timing-clean (WNS +0.032 ns) — see its `PROVENANCE.md` |
 
 ## Honest limits
 

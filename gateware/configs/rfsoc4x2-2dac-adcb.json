@@ -1,0 +1,27 @@
+{
+    "name": "rfsoc4x2-2dac-adcb",
+    "qubit_num": 1,
+    "dac_num": 2,
+    "adc_num": 2,
+    "dac_map": [
+        [
+            0,
+            1
+        ]
+    ],
+    "adc_map": [
+        1
+    ],
+    "mem_depth": 4096,
+    "env_depth": 16384,
+    "rob_depth": 65536,
+    "gate_pulse_num": 8,
+    "gate_interp": 2,
+    "readout_interp": 2,
+    "demod_interp": 4,
+    "link_pipe": 4,
+    "queue_depth": 8,
+    "with_mul": true,
+    "dsp_freq_hz": 491520000.0,
+    "freq_width": 32
+}

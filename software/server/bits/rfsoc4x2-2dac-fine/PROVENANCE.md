@@ -27,7 +27,16 @@ Verification:
   --config gateware/configs/rfsoc4x2-2dac-fine.json --loopback-src 1` -> RX_DEMO: PASS
   (IQ ratio constant to 0.004 deg / 0.01 %, demod +90 -> +90.001 deg, tone +90 -> hw -89.999 /
   host -89.997 deg, res = sign(real); the capture shows the readout tone alone, as it should).
-- board, partial (2026-09-03, cable still DAC0 -> ADC0): the bundle loads (server reports the xsa
-  sha above), the SoC runs the ion-trap sequence, and the ADC0 capture shows the GATE channel alone
-  on DAC0 at half the single-DAC amplitude (6052 vs 11956 codes) — the DAC0 path of the new netlist
-  works. The readout path (DAC1) and the IQ oracle need the loopback cable on DAC1 -> ADC0: pending.
+- board (2026-09-03, bundle loaded by the server = xsa sha above), BOTH DACs:
+  - gate path ch0 -> DAC0 (DAC_A): 82 MHz tone at the ADC0 loopback, 6084 codes for amplitude 0.4
+    (`software/examples/loopback_check.py --bundle rfsoc4x2-2dac-fine --ch 0`, cable DAC_A -> ADC_A);
+    the full ion-trap sequence shows the gate tone alone on DAC_A at half the summed single-DAC
+    amplitude (6052 vs 11956 codes), as it must once the two drives are on separate DACs.
+  - readout path ch1 -> DAC1 (DAC_B): loopback 5867 codes at 82.00 MHz (cable DAC_B -> ADC_A), and
+    `artiq_rx_demo.py --remote --bundle rfsoc4x2-2dac-fine` -> RX_DEMO: PASS — IQ ratio constant to
+    0.01 % / 0.002 deg across the three cases, demod +90 deg -> hw +89.993 deg, tone +90 deg -> hw
+    -90.008 / host -90.007 deg, res = sign(real). Trace part A shows the readout tone alone (6268
+    codes), the gate on DAC_A being out of the recorded ADC0.
+  - bench note: our board has a broken SMA ground return, so every loopback needs a second cable
+    between the other DAC/ADC pair (here DAC_A -> ADC_B) — see software/server/README.md. That is
+    a property of this board, not of the bundle.
