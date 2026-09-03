@@ -22,7 +22,9 @@ requirements-board.txt   what the board needs beyond PYNQ
 | `rfsoc4x2-2dac-fine` | gate → **DAC0**, readout → **DAC1**, ADC0 readout | co-sim + board: RX_DEMO PASS on the DAC1 readout path, DAC0 gate tone verified; timing-clean (WNS +0.032 ns) — details in its PROVENANCE.md |
 | `rfsoc4x2-2dac-adcb` | gate → **DAC0**, readout → **DAC1**, **ADC1** readout (loop DAC1 → ADC1) | board: RX_DEMO PASS through DAC1 → ADC1; timing-clean (WNS +0.015 ns) — details in its PROVENANCE.md |
 
-**Connector labels (measured on the RFSoC 4x2, 2026-09-03):** the SoC's **DAC0** is RFDC tile 228 =
+**Connector labels** (RealDigital RFSoC 4x2 reference manual: "ADCA and ADCB … tile 226, ADCC and ADCD …
+tile 224; DACA in tile 230 and DACB in tile 228" — the letters run against the tile order; confirmed on
+our board 2026-09-03 with a single cable): the SoC's **DAC0** is RFDC tile 228 =
 the connector printed **DAC_B**; **DAC1** is tile 230 = **DAC_A**; **ADC0** is tile 226's first converter (xrfdc block 0, stream
 `m20_axis`) = **ADC_B**; **ADC1** is its second converter (xrfdc block 1, stream `m22_axis`) = **ADC_A**. Bench wiring for the receive-side checks, in SoC numbering: on
 `rfsoc4x2-1q-fine` loop **DAC0 → ADC0** (connectors DAC_B → ADC_B; both drives are on DAC0); on
