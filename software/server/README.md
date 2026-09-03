@@ -21,6 +21,11 @@ requirements-board.txt   what the board needs beyond PYNQ
 | `rfsoc4x2-1q-fine` | gate (ch0) and readout (ch1) drives **summed onto DAC0**; ADC0 readout | co-sim + board: RX_DEMO PASS, waveform vs generator 0.4–0.5 % |
 | `rfsoc4x2-2dac-fine` | gate → **DAC0**, readout → **DAC1**, ADC0 readout | see its PROVENANCE.md |
 
+Bench wiring for the receive-side checks: on `rfsoc4x2-1q-fine` loop **DAC0 → ADC0** (both drives
+are on DAC0); on `rfsoc4x2-2dac-fine` loop **DAC1 → ADC0** (the readout drive is on DAC1; the gate
+drive on DAC0 is then not seen by the ADC). ADC0 is the core's readout ADC in both bundles
+(`adc_map [0]`); using ADC1 instead is a config change (`adc_map [1]`) and hence another bitstream.
+
 Both are the "fine" configuration: 0.254 ns envelope grid on both drive channels, 16 384
 envelope lines, 32-bit frequency word, queue depth 8 (see `docs/hardware-contract.md`).
 
