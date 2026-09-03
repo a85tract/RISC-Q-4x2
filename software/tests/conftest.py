@@ -147,3 +147,18 @@ def cosim_2q1c(request):
     m = SocMap(SocParams.from_json(drv.sim.get_params()))
     yield drv, m
     server.stop(drv)
+
+
+@pytest.fixture(scope="session")
+def cosim_4x2(request):
+    """A running verilator co-sim of the rfsoc4x2-1q build (1 qubit core, 2 DAC / 2 ADC,
+    dac_map [[0,0]], adc_map [0], rob_depth 32768): (CosimDriver, SocMap)."""
+    if not request.config.getoption("--cosim"):
+        pytest.skip("needs --cosim")
+    from riscq.map import SocMap, SocParams
+    from riscq.sim import server
+
+    drv = server.start(CONFIGS / "rfsoc4x2-1q.json", SW_ROOT / "build" / "rfsoc4x2-1q")
+    m = SocMap(SocParams.from_json(drv.sim.get_params()))
+    yield drv, m
+    server.stop(drv)

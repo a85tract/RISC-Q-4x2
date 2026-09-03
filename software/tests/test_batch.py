@@ -105,7 +105,7 @@ def test_vna_argmax(sub):
     sh = max(0, (shots - 1).bit_length())
     drv.sim.set_model({"kind": "tone", "adc": m.adc_of(0),
                        "freq_hz": units.code_to_freq(1024, m.params), "amp": 20000.0})
-    prog = compile_kernel(kernels.k_vna, m, tables=dict(ro=ro, demod=demod),
+    prog = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(ro=ro, demod=demod),
                           out=Array(2 * npts), npts=npts, shots=shots, period=PERIOD, sh=sh, ddly=0,
                           mode=kernels.IQSUM, c0q=int(c0q), dcq=int(dcq))
     out = rq.run(drv, m, {0: prog},
@@ -126,7 +126,7 @@ def test_grid_invariance(sub):
     sh = max(0, (shots - 1).bit_length())
     drv.sim.set_model({"kind": "tone", "adc": m.adc_of(0),
                        "freq_hz": units.code_to_freq(1024, m.params), "amp": 20000.0})
-    prog = compile_kernel(kernels.k_vna, m, tables=dict(ro=ro, demod=demod),
+    prog = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(ro=ro, demod=demod),
                           out=Array(2 * npts), npts=npts, shots=shots, period=PERIOD, sh=sh, ddly=0,
                           mode=kernels.IQSUM, c0q=c0q, dcq=dcq)
     out = rq.run(drv, m, {0: prog},

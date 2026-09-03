@@ -63,6 +63,8 @@ _FIELDS = {
     "link_pipe": int,
     "with_mul": bool,
     "dsp_freq_hz": float,
+    "freq_width": int,
+    "queue_depth": int,
 }
 
 _FIXED = {
@@ -99,6 +101,14 @@ class SocParams:
     link_pipe: int
     with_mul: bool
     dsp_freq_hz: float
+    # M7b: DDS frequency-word width. 16 (default) = the historic SF(16) word (120 kHz steps at the
+    # 4x2's rates); 32 = SF(32) with the SAME MSB weight, so a seated 16-bit code shifted up by 16
+    # means the identical physical frequency and the low bits buy 1.83 Hz resolution.
+    freq_width: int = 16
+    # Per-parameter TimedQueue depth (scheduled-ahead plays per channel). The play push has NO
+    # backpressure (a Flow into the generator), so an overfull queue silently drops entries —
+    # the planner bounds queued plays per channel with this. Elaboration default is 4.
+    queue_depth: int = 4
     # Optional per-build converter maps (the same GenPulseTableSocJson reads to wire the elaboration; None
     # = the generic ZCU216 SocChannelMap layout). Software reads them too so the co-sim model drives/reads
     # the SAME converters the hardware wired: dac_map[core] = (gateDac, readoutDriveDac); adc_map[core] =
@@ -119,9 +129,16 @@ class SocParams:
         raw.setdefault("demod_interp", 4)   # optional (added with the envelope-shaped demod); default 4
         raw.setdefault("with_mul", True)    # optional; Zmmul multiply is on by default (RiscqParam.withMul)
         raw.setdefault("rob_depth", 1024)   # optional; readout-trace ROB depth default (PulseTableSoc)
+        # optional; M7b DDS frequency-word width. Absent or 0 means "the architectural data width"
+        # (16). Only 16 and 32 exist in hardware (PulseParamBuffer takes either the seated field or
+        # the whole 32-bit RfCmd word), so anything else is a config error, not a silent narrowing.
+        if not raw.get("freq_width"):
+            raw["freq_width"] = DATA_WIDTH
+        if raw["freq_width"] not in (16, 32):
+            raise ValueError(f"freq_width must be 16 or 32, got {raw['freq_width']}")
         dac_map = raw.pop("dac_map", None)  # optional converter maps: kept (the channel-role mapping — the
         adc_map = raw.pop("adc_map", None)  # co-sim model needs them), unlike the hardware-only knobs below
-        raw.pop("queue_depth", None)        # hardware-only TimedQueue depth; software uses slot count, not depth
+        raw.setdefault("queue_depth", 4)    # TimedQueue depth; the planner bounds queued plays with it
         unknown = set(raw) - set(_FIELDS)
         if unknown:
             raise ValueError(f"unknown SocParams fields: {sorted(unknown)}")

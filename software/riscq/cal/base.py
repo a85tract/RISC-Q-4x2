@@ -229,6 +229,12 @@ def sweep_q16(x0: int, x1: int, n: int, fold: bool = False) -> tuple[int, int, n
     stays UNFOLDED: it is the frequency ramp the caller asked for, and the frequency callers map it
     back to Hz as a delta from their own first point (so it never jumps a whole `fs` at the fold).
     What still fails loud is a scan wider than one full turn, which would alias onto itself."""
+    # M7b note: this Q16 accumulator is a 16-BIT-CODE sweep — the realized value is `q >> 16`, which
+    # is what the hardware reads at freq_width 16. A freq_width-32 build reads the WHOLE word, so a
+    # FREQUENCY sweep built here would land on the full-precision ramp instead of the rounded codes
+    # and the returned axis would no longer describe what played. Amplitude sweeps are unaffected
+    # (amp stays a 16-bit seated field at every width). Frequency callers must pass
+    # `freq_width_ok=False` until they are migrated; see `sweep_q16_freq_guard`.
     dxq = 0 if n <= 1 else round(((x1 - x0) << 16) / (n - 1))
     xs = (x0 * (1 << 16) + np.arange(n, dtype=np.int64) * dxq) >> 16
     if fold:
@@ -238,6 +244,18 @@ def sweep_q16(x0: int, x1: int, n: int, fold: bool = False) -> tuple[int, int, n
     else:
         assert np.all(np.abs(xs) < (1 << 15))
     return x0 << 16, dxq, xs.astype(int)
+
+
+def sweep_q16_freq_guard(m) -> None:
+    """Refuse a Q16 FREQUENCY sweep on a build whose frequency word is wider than the code the
+    sweep produces (M7b). Amplitude sweeps do not need this. Migrating a frequency sweep means
+    building the ramp in the build's own word width and converting the axis with
+    `units.word_to_freq`, not `units.code_to_freq`."""
+    if m.params.freq_width != 16:
+        raise NotImplementedError(
+            f"Q16 frequency sweeps are 16-bit-code sweeps; this build uses freq_width "
+            f"{m.params.freq_width}. Build the ramp in the build's word width (units.freq_word) "
+            f"and map the axis with units.word_to_freq.")
 
 
 def gate_sigma(m, pulse: Pulse, carrier_hz: float, amp_code: int) -> float:

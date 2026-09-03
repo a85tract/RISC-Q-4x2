@@ -96,6 +96,20 @@ class BoardServer:
     # ── server-side batch runner: the SAME riscq.run functions next to the MMIO window, one RPC
     # per batch (spec 08 §5). poll_done takes its hardware branch (no `.sim` here). ──
 
+    def _dsp_gate(self, m):
+        """Refuse any dsp-domain access while dspClk is dead: the first such transaction is never
+        answered and the whole host bus wedges until a power cycle (board-proven, three times).
+        The liveness counters (hostCtrl +0x100 dspAlive / +0x104 hostAlive) are host-clock
+        registers — always safe to read."""
+        import time as _time
+        drv = self._driver()
+        d0 = drv.read32(m.host_ctrl + 0x100)
+        _time.sleep(0.005)
+        d1 = drv.read32(m.host_ctrl + 0x100)
+        if d0 == d1:
+            raise RuntimeError(f"dspAlive counter frozen at {d0:#x} — dsp domain dead "
+                               "(tile PLL not locked?); refusing dsp-domain access")
+
     @_locked
     def remote_setup(self, params_json, progmap):
         from riscq import run as _run
@@ -108,12 +122,14 @@ class BoardServer:
                              f"({mine.name!r}) — wrong bundle loaded?")
         self._m = SocMap(mine)
         self._progs = {int(c): _run._prog_from_wire(w) for c, w in progmap.items()}
+        self._dsp_gate(self._m)
         _run.setup(self._driver(), self._m, self._progs)
         return None
 
     @_locked
     def remote_rerun(self, cores, params, arrays, results, timeout):
         from riscq import run as _run
+        self._dsp_gate(self._m)
         progs = {int(c): self._progs[int(c)] for c in cores}
         out = _run.rerun(self._driver(), self._m, progs,
                          params={int(c): v for c, v in dict(params).items()},

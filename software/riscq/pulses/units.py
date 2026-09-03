@@ -50,8 +50,68 @@ def _freq_code(f_hz: float, params: SocParams) -> int:
 
 
 def freq_to_code(f_hz: float, params: SocParams) -> int:
-    """The carrier frequency as a SEATED register word (spec 12): `set_freq(ch, freq_to_code(f))`."""
-    return pack16(_freq_code(f_hz, params))
+    """The carrier frequency as a SEATED register word (spec 12): `set_freq(ch, freq_to_code(f))`.
+    WIDTH-AWARE (M7b): at freq_width 16 this is the historic seated 16-bit code; at 32 it is the
+    SF(32) word. The contract — "the word to write" — is unchanged, so every caller follows the
+    build automatically."""
+    return freq_word(f_hz, params)
+
+
+# ── M7b: width-independent frequency-word conversions ────────────────────────────────────────────
+# THE law the hardware implements, at any `freq_width` fw: the 16-bit phase the CORDIC sees after
+# `n` converter samples is
+#       phase16(n) = ((word * n) mod 2^fw) >> (fw - 16)
+# i.e. the word's MSB weight is the SAME at every width — which is exactly why a legacy 16-bit code
+# shifted up (`code << 16`) is the identical physical frequency in a 32-bit build, and why the extra
+# low bits are pure added resolution (fw = 32: 1.83 Hz instead of 120 kHz at the 4x2's rates).
+# These helpers are defined from that law ALONE, so a golden/model/kernel that uses them cannot
+# share a conversion bug with the code under test.
+
+def _wrap_signed(code: int, bits: int) -> int:
+    half = 1 << (bits - 1)
+    return ((code + half) & ((1 << bits) - 1)) - half
+
+
+def freq_word(f_hz: float, params: SocParams) -> int:
+    """The SEATED carrier-frequency register word for THIS build's `freq_width` — what
+    `set_freq(ch, ...)` takes. At 16 bits this is `pack16(_freq_code(...))` (unchanged); at 32 it is
+    the SF(32) word with the same MSB weight, so it equals the 16-bit word plus fractional bits."""
+    fw = params.freq_width
+    if fw == 16:
+        return pack16(_freq_code(f_hz, params))
+    fs = sample_rate(params)
+    raw = round(f_hz / fs * (1 << fw))      # phase advance per sample, in 2^-fw turns
+    # Validate the ROUNDED word: a frequency within half an LSB of the sample rate would otherwise
+    # round to +-2^fw and wrap silently to DC.
+    if not -(1 << fw) < raw < (1 << fw):
+        raise ValueError(f"freq {f_hz} Hz -> word {raw} exceeds one full turn per sample "
+                         f"(rate {fs:g} Hz)")
+    return _wrap_signed(raw, fw)
+
+
+def demod_freq_word(f_hz: float, params: SocParams) -> int:
+    """The SEATED demod-LO word: the ADC sees BATCH_SIZE/ADC_BATCH (4x) the DAC's per-sample advance,
+    so the matched word is `4 * drive_word mod 2^fw` — exact at every width (at 16 bits this is the
+    historic `pack16(_demod_code(...))`)."""
+    fw = params.freq_width
+    if fw == 16:
+        return pack16(_demod_code(f_hz, params))
+    return _wrap_signed(freq_word(f_hz, params) * (BATCH_SIZE // ADC_BATCH), fw)
+
+
+def word_to_freq(word: int, params: SocParams) -> float:
+    """Hz from a seated carrier word (inverse of `freq_word`)."""
+    fw = params.freq_width
+    plain = (word >> 16) & 0xFFFF if fw == 16 else word & ((1 << fw) - 1)
+    return _wrap_signed(plain, fw if fw != 16 else 16) * sample_rate(params) / (1 << fw)
+
+
+def word_phase16(word: int, n_samples: int, params: SocParams) -> int:
+    """The 16-bit hardware phase after `n_samples` converter samples — the law above. Use this (not a
+    hand-written `% 2^16`) wherever a model predicts the carrier's phase."""
+    fw = params.freq_width
+    plain = (word >> 16) & 0xFFFF if fw == 16 else word & ((1 << fw) - 1)
+    return ((plain * int(n_samples)) % (1 << fw)) >> (fw - 16)
 
 
 def code_to_freq(code: int, params: SocParams) -> float:
@@ -74,8 +134,9 @@ def _demod_code(f_hz: float, params: SocParams) -> int:
 
 
 def demod_freq_to_code(f_hz: float, params: SocParams) -> int:
-    """The demod-LO frequency as a SEATED register word (spec 12): `set_freq(demod, demod_freq_to_code(f))`."""
-    return pack16(_demod_code(f_hz, params))
+    """The demod-LO frequency as a SEATED register word (spec 12): `set_freq(demod, ...)`.
+    WIDTH-AWARE (M7b) — the matched pair stays `4 x drive mod 2^fw` at every width."""
+    return demod_freq_word(f_hz, params)
 
 
 def demod_code_to_freq(code: int, params: SocParams) -> float:

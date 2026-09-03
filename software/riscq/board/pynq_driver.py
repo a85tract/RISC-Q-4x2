@@ -27,6 +27,7 @@ BOARD_DEFAULTS = {
     "dac_nyquist": {"default": 2},
     "dac_current": {},
     "mts": {"daclatency": 260, "adclatency": 60},   # QubiC's targets; re-pin at bring-up
+    "fclk0_mhz": None,                              # pin pynq Clocks.fclk0_mhz after download (RFSoC 4x2: 100)
 }
 
 _refclks_done = False    # LMK/LMX setup runs once per server process, not per load (spec 10 §3.2)
@@ -58,6 +59,11 @@ class PynqDriver:
             _refclks_done = True
         log.info(f"loading overlay: {xsa}")
         self.overlay = pynq.Overlay(str(xsa), download=download)
+        if cfg["fclk0_mhz"]:
+            # boards whose PS preset cannot hit the requested pl_clk0 exactly (RFSoC 4x2:
+            # 96968727 Hz achieved for a 100 MHz request) get re-pinned after download.
+            pynq.Clocks.fclk0_mhz = cfg["fclk0_mhz"]
+            log.info(f"pl_clk0 pinned to {pynq.Clocks.fclk0_mhz} MHz")
         self.rfdc = self.overlay.rf_data_converter
         self.mmio = pynq.MMIO(AXI_BASE, AXI_SIZE)
 
@@ -76,8 +82,11 @@ class PynqDriver:
         zones = cfg["dac_nyquist"]
         for tile in range(4):
             for block in range(4):
-                self.dac_nyquist_zone(tile, block,
-                                      zones.get(f"{tile},{block}", zones.get("default", 2)))
+                try:
+                    self.dac_nyquist_zone(tile, block,
+                                          zones.get(f"{tile},{block}", zones.get("default", 2)))
+                except Exception as e:  # absent tile/block on partial-converter boards (RFSoC 4x2)
+                    log.debug(f"dac nyquist skipped {tile},{block}: {e}")
         self.adc_nyquist_zone(cfg["adc_nyquist"])
         for tileblock, uA in cfg["dac_current"].items():
             tile, block = (int(x) for x in tileblock.split(","))
@@ -161,9 +170,12 @@ class PynqDriver:
                 [self.rfdc.mts_adc_config.Latency[i] for i in range(4)])
 
     def adc_nyquist_zone(self, n: int) -> None:
-        for tile in range(4):        # rfdc-config.tcl enables every slice: full 4x4
+        for tile in range(4):        # rfdc-config.tcl enables every slice on the ZCU216 (full 4x4)
             for block in range(4):
-                self.rfdc.adc_tiles[tile].blocks[block].NyquistZone = n
+                try:
+                    self.rfdc.adc_tiles[tile].blocks[block].NyquistZone = n
+                except Exception as e:  # absent tile/block on partial-converter boards (RFSoC 4x2)
+                    log.debug(f"adc nyquist skipped {tile},{block}: {e}")
 
     def dac_nyquist_zone(self, tile: int, block: int, n: int) -> None:
         self.rfdc.dac_tiles[tile].blocks[block].NyquistZone = n

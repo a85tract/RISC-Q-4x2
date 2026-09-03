@@ -22,6 +22,7 @@ from riscq import run as rq
 from riscq.cal import fits, kernels
 from riscq.cal.config import _amp_phase
 from riscq.cal.base import (GATE_CH, Result, batch_timeout, batches, ef_pulse, gate_pulse,
+                            sweep_q16_freq_guard,
                             grid_period, population, qubit_freq, readout_tables, relax_batches,
                             res_sign, seconds, socmap, sweep_q16, x90_vz)
 from riscq.lang import Array, ParamTable, compile_kernel
@@ -475,6 +476,7 @@ class CZSweep:
             f_cz = float(cfg[f"two_qubit/{pk}/CZ/freq"])
             lo = units._freq_code(f_cz - self.span if self.lo is None else self.lo, m.params)
             hi = units._freq_code(f_cz + self.span if self.hi is None else self.hi, m.params)
+            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
             x0, dx, xs = sweep_q16(lo, hi, self.points)
             xax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
             return kernels.FREQ, czd, int(x0), int(dx), xs, xax
@@ -682,6 +684,7 @@ class CZFrequency:
         f_cz = float(cfg[f"two_qubit/{pk}/CZ/freq"])
         lo = units._freq_code(f_cz - self.span, m.params)
         hi = units._freq_code(f_cz + self.span, m.params)
+        sweep_q16_freq_guard(m)       # M7b: a Q16 code sweep is 16-bit-only
         x0, dx, xs = sweep_q16(lo, hi, self.points)
         xax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
         R, P0 = _cz_cond_R(cfg, drv, m, pair, "freq", x0, dx, self.points, self.ngates, self.shots)
@@ -756,6 +759,7 @@ class CZAmpFreqSweep:
         f_cz = float(cfg[f"two_qubit/{pk}/CZ/freq"])
         lo = units._freq_code(f_cz - self.span, m.params)
         hi = units._freq_code(f_cz + self.span, m.params)
+        sweep_q16_freq_guard(m)       # M7b: a Q16 code sweep is 16-bit-only
         x0, dx, xs = sweep_q16(lo, hi, self.points)
         fax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
         progs, tables, signs, timeout = _cz_cond_progs(cfg, m, pair, "freq", x0, dx, self.points,

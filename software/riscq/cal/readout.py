@@ -45,6 +45,7 @@ import numpy as np
 from riscq import run as rq
 from riscq.cal import kernels
 from riscq.cal.base import (GATE_CH, SEP, Result, acquire_shots, batch_timeout, batches, ef_table,
+                            sweep_q16_freq_guard,
                             ef_vz, grid_period, herald_offset, heralding, prep, qubits_list,
                             readout_tables, relax_batches, rerun_counts, res_sign, seconds, socmap,
                             sweep_q16, train_step, x90_vz)
@@ -453,9 +454,10 @@ class Separation:
             table, pg, plen = prep(cfg, q, m, self.gate)
             c0 = units._freq_code(float(cfg[f"readout/{q}/freq"]), m.params)   # DAC-rate center code (plain)
             span = abs(units._freq_code(self.span, m.params))                  # the span as a code offset
+            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
             c0q, dcq, xs = sweep_q16(c0 - span, c0 + span, npts)               # on-core sweep
             period = grid_period(relax_batches(cfg, m), SEP + plen, dur, ddly)
-            progs[q] = compile_kernel(kernels.k_vna, m, tables=dict(gate=table, ro=ro, demod=demod),
+            progs[q] = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(gate=table, ro=ro, demod=demod),
                                       out=Array(2 * npts * s_run), npts=npts, shots=s_run, period=period,
                                       sh=0, ddly=ddly, mode=kernels.RAW, prep_gate=pg,
                                       c0q=int(c0q), dcq=int(dcq), **x90_vz(cfg, q))
@@ -555,10 +557,11 @@ class Resonator:
             # across Nyquist on the host, and the kernel's int32 wrap folds it into the register
             # the way the converter folds a tone (fold=True).
             c0 = units._freq_code(float(f[0]), m.params)
+            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
             c0q, dcq, xs = sweep_q16(c0, c0 + round((f[-1] - f[0]) * (1 << 16) / fs), npts,
                                      fold=True)
             period = grid_period(relax, 0, dur, ddly)
-            progs[q] = compile_kernel(kernels.k_vna, m, tables=dict(ro=ro, demod=demod),
+            progs[q] = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(ro=ro, demod=demod),
                                       out=Array(2 * npts), npts=npts, shots=shots, period=period,
                                       sh=sh, ddly=ddly, mode=kernels.IQSUM,
                                       c0q=int(c0q), dcq=int(dcq))
@@ -611,9 +614,10 @@ class Punchout:
             table, pg, plen = prep(cfg, q, m, "X90")
             c0 = units._freq_code(float(cfg[f"readout/{q}/freq"]), m.params)
             span = abs(units._freq_code(self.span, m.params))
+            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
             c0q, dcq, xs = sweep_q16(c0 - span, c0 + span, npts)
             period = grid_period(relax_batches(cfg, m), SEP + plen, dur, ddly)
-            progs[q] = compile_kernel(kernels.k_vna, m, tables=dict(gate=table, ro=ro, demod=demod),
+            progs[q] = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(gate=table, ro=ro, demod=demod),
                                       out=Array(2 * npts * shots), npts=npts, shots=shots,
                                       period=period, sh=0, ddly=ddly, mode=kernels.RAW, prep_gate=pg,
                                       c0q=int(c0q), dcq=int(dcq), **x90_vz(cfg, q))

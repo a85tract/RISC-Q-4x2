@@ -105,13 +105,22 @@ def cmul(ar: int, ai: int, br: int, bi: int) -> tuple[int, int]:
 
 
 @lru_cache(maxsize=None)
-def phasors(freq_code: int) -> tuple[tuple[int, int], ...]:
-    """The 16 static per-lane phasors: cordic_rotate(PHASOR_MAG, 0, wrap16(k*freq))."""
-    return tuple(cordic_rotate(PHASOR_MAG, 0, wrap16(k * freq_code)) for k in range(16))
+def phase16(freq_code: int, n: int, freq_width: int = 16) -> int:
+    """THE hardware phase law at any frequency-word width `fw` (M7b): the 16-bit angle the CORDIC
+    sees after `n` converter samples is `((freq_code * n) mod 2^fw) >> (fw - 16)`. At fw = 16 this
+    is the historic `wrap16(freq_code * n)`; a wider word keeps the same MSB weight, so a legacy
+    code shifted up by (fw - 16) yields the identical angle at every n."""
+    plain = freq_code & ((1 << freq_width) - 1)
+    return wrap16(((plain * int(n)) % (1 << freq_width)) >> (freq_width - 16))
+
+
+def phasors(freq_code: int, freq_width: int = 16) -> tuple[tuple[int, int], ...]:
+    """The 16 static per-lane phasors: cordic_rotate(PHASOR_MAG, 0, phase16(freq, k))."""
+    return tuple(cordic_rotate(PHASOR_MAG, 0, phase16(freq_code, k, freq_width)) for k in range(16))
 
 
 def pulse_window(lines: np.ndarray, amp_code: int, freq_code: int, phase_code: int,
-                 t_start: int, dur: int) -> np.ndarray:
+                 t_start: int, dur: int, freq_width: int = 16) -> np.ndarray:
     """The bit-exact DAC window [t_start, t_start+dur): shape (dur, 16) int16 real lanes.
 
     `lines` is the PACKED envelope RAM content the pulse plays, shape (n_lines, spl) uint32
@@ -129,11 +138,13 @@ def pulse_window(lines: np.ndarray, amp_code: int, freq_code: int, phase_code: i
     env_re = np.where(env_re >= 0x8000, env_re.astype(np.int64) - 0x10000, env_re).astype(np.int64)
     env_im = np.where(env_im >= 0x8000, env_im.astype(np.int64) - 0x10000, env_im).astype(np.int64)
 
-    ph = phasors(freq_code)
+    ph = phasors(freq_code, freq_width)
     out = np.zeros((dur, 16), dtype=np.int16)
     for i in range(dur):
         tau = t_start + i - TIME_TO_PULSE
-        g_phase = wrap16(wrap16(freq_code * wrap16((tau * 16))) + phase_code)
+        # The carrier's time reference is width-independent: the hardware pre-advances its time
+        # input by the extra product stages, so TIME_TO_PULSE does not move with `freq_width`.
+        g_phase = wrap16(phase16(freq_code, tau * 16, freq_width) + phase_code)
         cr, ci = cordic_rotate(amp_code, 0, g_phase)
         for k in range(16):
             car = cmul(cr, ci, *ph[k])

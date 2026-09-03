@@ -380,7 +380,7 @@ def k_t1(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts: 
 @kernel
 def k_vna(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts: int, shots: int,
           period: int, sh: int, ddly: int, mode: int, prep_gate: int, vz0: int, vzsum: int, c0q: int,
-          dcq: int, prep: int):
+          dcq: int, prep: int, fw32: int):
     """Batched VNA: retune the readout drive and demod as a MATCHED PAIR (`set_freq(ro, cq)` raw Q16 +
     `set_freq(demod, (4*c)<<16)`, the ADC code is 4× the DAC code seated into data[31:16] — spec 12)
     over an on-core Q16 frequency sweep (c0q/dcq; realized code c = cq >> 16). The retune is scheduled
@@ -406,7 +406,14 @@ def k_vna(gate: ParamTable, ro: ParamTable, demod: ParamTable, out: Array, npts:
     for i in range(npts):
         c = cq >> 16
         set_freq(ro, cq)  # noqa: F821          raw Q16 accumulator: DAC code in data[31:16] (spec 12)
-        set_freq(demod, (4 * c) << 16)  # noqa: F821  ADC code = 4x the rounded DAC code, seated (spec 12)
+        # The demod LO must MATCH the drive exactly. At freq_width 16 the hardware reads the drive's
+        # data[31:16], so the partner is 4x the ROUNDED code, seated. At 32 the hardware reads the
+        # WHOLE word, so the partner is 4x the whole word (mod 2^32) — rounding it to a code first
+        # would throw away precisely the fractional resolution the wide word exists for (M7b).
+        if fw32 == 1:
+            set_freq(demod, 4 * cq)  # noqa: F821     exact matched pair at the full width
+        else:
+            set_freq(demod, (4 * c) << 16)  # noqa: F821  ADC code = 4x the rounded DAC code, seated
         for s in range(shots):
             if mode == RAW:
                 if prep == 1:

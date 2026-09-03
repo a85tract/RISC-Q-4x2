@@ -29,8 +29,17 @@ class RamDriver:
 
     def __init__(self):
         self.mem = {}
+        self._alive = 0
 
     def read32(self, addr):
+        # The gateware's free-running liveness counters (hostCtrl +0x100 dspAlive / +0x104
+        # hostAlive) are what BoardServer's dsp gate checks before any dsp-domain access — a fake
+        # that returned a CONSTANT there would look like a dead dsp domain (correctly refused), so
+        # model them: an UNWRITTEN address ending in 0x100/0x104 reads as a free-running counter (a
+        # written one stays plain memory, so the ordinary read/write round-trips are untouched).
+        if addr not in self.mem and addr & 0xFFF in (0x100, 0x104):
+            self._alive += 1
+            return self._alive
         return self.mem.get(addr, 0)
 
     def write32(self, addr, value):

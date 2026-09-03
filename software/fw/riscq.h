@@ -30,6 +30,10 @@ extern volatile uint32_t __rq_magic;    /* 0x52515121 "RQQ!" */
 static inline uint32_t now(void) { return RQ_MMIO(RQ_CTRL_TIME); }
 static inline void wait_until(uint32_t t) {
     RQ_MMIO(RQ_CTRL_TIME_CMP) = t;
+    /* Hazard fix (board-proven on the dev line): waitTimeCmp is RegNext(time + 3 < timeCmp), so a
+     * read issued the cycle right after the store sees the STALE compare and can fall through
+     * early. One unrelated MMIO read spaces the store and the halting read apart. */
+    (void)RQ_MMIO(RQ_CTRL_TIME);
     (void)RQ_MMIO(RQ_CTRL_WAIT_TIME_CMP);   /* read HALTS until time + 3 >= timeCmp */
 }
 
