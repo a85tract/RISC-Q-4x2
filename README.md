@@ -49,6 +49,7 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
 
 1. **No hardware — try it in co-simulation** (bit-accurate RTL; images: `client` 1.3 GB, `full` 2.3 GB):
    ```bash
+   git submodule update --init --recursive      # SpinalHDL + rvls, needed to generate the RTL
    docker build -f software/client/Dockerfile --target full -t riscq-4x2:full .
    docker run -it --rm -v "$PWD":/work/RISC-Q -w /work/RISC-Q/software/examples riscq-4x2:full \
      python -m nbconvert --to notebook --execute --inplace artiq_api_demo.ipynb   # after switching its device_db to configs/device_db_cosim.py
@@ -56,12 +57,13 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
    or use `device_db_cosim` from any script. The first start of a config generates the RTL and
    verilates it (a few minutes); then it is seconds.
 2. **You have an RFSoC 4x2**: flash the vendor PYNQ image, then from `software/server/`:
-   `./board_setup.sh xilinx@<board-ip>` and `ssh xilinx@<board-ip> '~/riscq-4x2/start_server.sh'`
+   `./board_setup.sh xilinx@<board-ip>` and `ssh -t xilinx@<board-ip> '~/riscq-4x2/start_server.sh'`
    (see [software/server/README.md](software/server/README.md)). Loop a DAC into ADC0 for the
    receive-side demos. Build the `client` image (RISC-V toolchain + Python) and run your
    experiments with `device_db_board` / `device_db_2dac`.
 3. **You want to change the gateware**: `gateware/` — Vivado 2024.1+ and the
-   `vivado-scripts/riscvsoc-bd` flow (`RISCQ_BOARD=rfsoc4x2`), ~35 min a build; the co-sim
+   `vivado-scripts/riscvsoc-bd` flow (`RISCQ_BOARD=rfsoc4x2`, default config
+   `configs/rfsoc4x2-1q-fine.json`), ~35 min a build; the co-sim
    verifies a new config before you synthesize it.
 
 ## Bundles shipped
@@ -69,7 +71,7 @@ bit-accurate co-simulation (`software/examples/artiq_api_demo.ipynb`, run live).
 | bundle | output mapping | status |
 |---|---|---|
 | `rfsoc4x2-1q-fine` | gate + readout drives summed on DAC0, ADC0 readout | board- and co-sim-verified (the demo notebook) |
-| `rfsoc4x2-2dac-fine` | gate → DAC0, readout → DAC1, ADC0 readout | see `software/server/bits/rfsoc4x2-2dac-fine/PROVENANCE.md` |
+| `rfsoc4x2-2dac-fine` | gate → DAC0, readout → DAC1, ADC0 readout | co-sim verified; bitstream + board test: see `software/server/bits/rfsoc4x2-2dac-fine/PROVENANCE.md` for the current status |
 
 ## Honest limits
 

@@ -30,7 +30,7 @@ envelope lines, 32-bit frequency word, queue depth 8 (see `docs/hardware-contrac
 # your PC, from this directory; PYNQ default user/password xilinx/xilinx
 ssh-copy-id xilinx@192.168.3.1                # key access (optional but convenient)
 ./board_setup.sh xilinx@192.168.3.1           # copies everything, installs the wheels offline
-ssh xilinx@192.168.3.1 '~/riscq-4x2/start_server.sh'   # asks for the sudo password once
+ssh -t xilinx@192.168.3.1 '~/riscq-4x2/start_server.sh'   # -t: sudo asks for its password
 ```
 
 Then from the client: `device_db["core"] = {"type": "board", "host": "192.168.3.1",

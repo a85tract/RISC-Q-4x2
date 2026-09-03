@@ -53,10 +53,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: co-sim smoke (riscq_sim imports, RTL generator reachable)
+      - name: co-sim smoke (import-only + mill and RTL sources present)
         run: |
-          docker run --rm -v "$PWD":/work/RISC-Q -w /work/RISC-Q riscq-4x2:full \
-            python -c "import riscq_sim.cosim, cocotb; print('riscq_sim ok')"
+          docker run --rm -v "$PWD":/work/RISC-Q -w /work/RISC-Q riscq-4x2:full bash -c \
+            "python -c 'import riscq_sim.cosim, cocotb' && mill --version | head -1 && test -d gateware/ext/SpinalHDL/core && echo smoke ok"
 
       - name: login to GHCR
         if: vars.PUBLISH_IMAGES == 'true' && github.event_name != 'pull_request'

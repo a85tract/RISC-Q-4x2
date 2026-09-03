@@ -45,7 +45,7 @@ REPO_DIR="$(cd "$BD_DIR/../.." && pwd)"                  # <repo>/gateware
 VIVADO_BIN="${RISCQ_VIVADO_BIN:-$(dirname "$(command -v vivado)")}"
 BOARD="${RISCQ_BOARD:-zcu216}"
 if [ "$BOARD" = "rfsoc4x2" ]; then
-  CONFIG="${RISCQ_CONFIG:-$REPO_DIR/configs/rfsoc4x2-1q.json}"
+  CONFIG="${RISCQ_CONFIG:-$REPO_DIR/configs/rfsoc4x2-1q-fine.json}"
   PROJ="${RISCQ_PROJ_NAME:-riscvsoc-bd-4x2}"
 else
   CONFIG="${RISCQ_CONFIG:-$REPO_DIR/configs/zcu216-14q.json}"

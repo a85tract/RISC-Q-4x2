@@ -76,5 +76,10 @@ COPY sim/requirements.txt /tmp/sim-requirements.txt
 RUN uv pip install --python /opt/venv312 -r /tmp/sim-requirements.txt
 COPY sim sim
 COPY gateware gateware
-RUN verilator --version && python -c "import cocotb, riscq_sim; print('full ok')"
+# a fresh clone without `git submodule update --init --recursive` has empty gateware/ext/*: the RTL
+# generator (mill) would fail at first co-sim — fail the image build instead, loudly
+RUN test -f gateware/ext/SpinalHDL/build.mill -o -f gateware/ext/SpinalHDL/build.sc \
+ || (echo "gateware/ext/SpinalHDL is empty: run 'git submodule update --init --recursive' before building 'full'" && exit 1)
+RUN verilator --version && mill --version 2>/dev/null | head -1 \
+ && python -c "import cocotb, riscq_sim; print('full ok')"
 CMD ["bash"]

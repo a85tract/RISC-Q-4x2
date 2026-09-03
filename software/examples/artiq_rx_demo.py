@@ -12,8 +12,11 @@ B. IQ ORACLE — with no golden demod model, the oracle is the raw trace itself:
      (3) rotating the TONE phase by phi rotates hw_iq the same way as it rotates host_iq;
      (4) the hardware res bit is consistently the sign classifier of real.
 
-  co-sim:  PYTHONPATH=. python artiq_rx_demo.py --cosim --config <cfg> --build <dir>
-  board :  PYTHONPATH=. python artiq_rx_demo.py --remote 192.168.3.1 --bundle rfsoc4x2-1q-fine
+  from the repository root (or inside the docker image, where PYTHONPATH is preset):
+  co-sim:  PYTHONPATH=software/client:sim python software/examples/artiq_rx_demo.py --cosim
+  board :  PYTHONPATH=software/client     python software/examples/artiq_rx_demo.py --remote 192.168.3.1
+  (--config/--build default to this repo's gateware/configs and sim/build; --loopback-src 1 for
+  the 2-DAC bundle, whose readout drive is DAC1)
 """
 import argparse
 import json
@@ -92,9 +95,10 @@ def main():
     ap.add_argument("--cosim", action="store_true")
     ap.add_argument("--remote", default=None)
     ap.add_argument("--bundle", default="rfsoc4x2-1q-fine")
-    ap.add_argument("--config", default="/work/RISC-Q/gateware/configs/rfsoc4x2-1q-fine.json")
-    ap.add_argument("--build", default="/work/RISC-Q/sim/build/rfsoc4x2-1q-fine")
-    ap.add_argument("--work", default="/work/exp/artiq_rx_generated")
+    repo = Path(__file__).resolve().parents[2]
+    ap.add_argument("--config", default=str(repo / "gateware/configs/rfsoc4x2-1q-fine.json"))
+    ap.add_argument("--build", default=str(repo / "sim/build/rfsoc4x2-1q-fine"))
+    ap.add_argument("--work", default=str(repo / "sim/build/artiq_rx_generated"))
     ap.add_argument("--delay", type=int, default=5)
     ap.add_argument("--loopback-src", type=int, default=0,
                     help="co-sim: which DAC the loopback model feeds into ADC0 (0 on the single-DAC "
