@@ -43,9 +43,11 @@ set_property value $DSP_FREQ [ipx::get_bus_parameters FREQ_HZ \
 # bus<->clock associations
 ipx::associate_bus_interfaces -busif S_AXIS -clock hostClk [ipx::current_core]
 ipx::associate_bus_interfaces -busif S_AXIS -clock dspClk -remove [ipx::current_core]
-for {set i 0} {$i < 16} {incr i} {
+for {set i 0} {$i < $DAC_NUM} {incr i} {
   ipx::associate_bus_interfaces -busif DAC${i}_AXIS -clock dspClk [ipx::current_core]
   ipx::associate_bus_interfaces -busif DAC${i}_AXIS -clock hostClk -remove [ipx::current_core]
+}
+for {set i 0} {$i < $ADC_NUM} {incr i} {
   ipx::associate_bus_interfaces -busif ADC${i}_AXIS -clock dspClk [ipx::current_core]
   ipx::associate_bus_interfaces -busif ADC${i}_AXIS -clock hostClk -remove [ipx::current_core]
 }

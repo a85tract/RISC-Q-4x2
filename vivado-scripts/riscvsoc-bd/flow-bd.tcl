@@ -14,7 +14,7 @@ source $INC/config.tcl            ;# part / top / freqs / run-stage flags (env-o
 
 source $INC/create-project.tcl    ;# create_project, add top RTL + ROM .bin
 source $INC/package-ip.tcl        ;# package the top as a user IP, associate AXIS↔clocks
-source $INC/bd-build.tcl          ;# assemble the block design (PS + RFDC + SmartConnect + clocks + resets)
+if {$BOARD eq "rfsoc4x2"} { source $INC/bd-build-4x2.tcl } else { source $INC/bd-build.tcl }  ;# board-selected BD assembly
 source $INC/bd-finalize.tcl       ;# validate, wrapper, constraints, set top
 source $INC/run.tcl               ;# synth (+ optional impl / bitstream), gated by the run flags
 

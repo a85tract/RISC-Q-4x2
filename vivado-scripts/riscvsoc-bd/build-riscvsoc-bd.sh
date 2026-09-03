@@ -43,8 +43,15 @@ set -e
 BD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # vivado-scripts/riscvsoc-bd
 REPO_DIR="$(cd "$BD_DIR/../.." && pwd)"                  # agentic-rv-dev (repo root)
 VIVADO_BIN="${RISCQ_VIVADO_BIN:-$(dirname "$(command -v vivado)")}"
-CONFIG="${RISCQ_CONFIG:-$REPO_DIR/software/configs/zcu216-14q.json}"
-PROJ="${RISCQ_PROJ_NAME:-riscvsoc-bd}"
+BOARD="${RISCQ_BOARD:-zcu216}"
+if [ "$BOARD" = "rfsoc4x2" ]; then
+  CONFIG="${RISCQ_CONFIG:-$REPO_DIR/software/configs/rfsoc4x2-1q.json}"
+  PROJ="${RISCQ_PROJ_NAME:-riscvsoc-bd-4x2}"
+else
+  CONFIG="${RISCQ_CONFIG:-$REPO_DIR/software/configs/zcu216-14q.json}"
+  PROJ="${RISCQ_PROJ_NAME:-riscvsoc-bd}"
+fi
+export RISCQ_BOARD="$BOARD"
 BUILD="$REPO_DIR/build/$PROJ"
 mkdir -p "$BUILD"
 
@@ -61,9 +68,13 @@ fi
 #    just enables the pre-place hook (any value); RISCQ_PBLOCK_TCL is the actual floorplan file.
 export RISCQ_PROJ_NAME="$PROJ"
 export RISCQ_BUILD_DIR="$BUILD"
-export RISCQ_PBLOCK=1
-export RISCQ_PBLOCK_TCL="$BD_DIR/pblocks-bd.tcl"
-export RISCQ_IP_RETIMING=1
+if [ "$BOARD" != "rfsoc4x2" ]; then
+  # 14-core ZCU216 artifacts: the per-core floorplan and the OOC-IP retiming lever. The 1-core 4x2
+  # build starts with neither (plan M3.9) — add only if its timing sign-off demands it.
+  export RISCQ_PBLOCK=1
+  export RISCQ_PBLOCK_TCL="$BD_DIR/pblocks-bd.tcl"
+  export RISCQ_IP_RETIMING=1
+fi
 export RISCQ_PLACE_DIRECTIVE="${RISCQ_PLACE_DIRECTIVE:-ExtraNetDelay_high}"   # route stays AggressiveExplore (run.tcl)
 export RISCQ_RUN_IMPL=1
 export RISCQ_RUN_BITSTREAM="${RISCQ_RUN_BITSTREAM:-1}"   # bitstream + XSA (hardware handoff) by default; set 0 for impl-only

@@ -1,10 +1,27 @@
 # ---- riscvsoc-bd configuration (script-scope; override any of these from the environment) -----------
 
+set BOARD         zcu216          ;# zcu216 | rfsoc4x2 — selects bd-build variant + constraints
 set PART          xczu49dr-ffvf1760-2-e
 set TOP_MODULE    PulseTableSoc
 set BD_NAME       riscq_bd
 set DSP_FREQ      500000000
 set HOST_FREQ     100000000
+set DAC_NUM       16              ;# converter AXIS port count of the generated top (JSON dac_num)
+set ADC_NUM       16
+
+# Board presets (the env overrides below still win over these).
+if {[info exists ::env(RISCQ_BOARD)]} { set BOARD $::env(RISCQ_BOARD) }
+if {$BOARD eq "rfsoc4x2"} {
+  set PART     xczu48dr-ffvg1517-2-e
+  set DSP_FREQ 491520000
+  set DAC_NUM  2
+  set ADC_NUM  2
+  # pl_clk0's ACHIEVED frequency for a 100 MHz request on this PS preset (board-measured, twice).
+  # The packaged IP and the whole BD must carry the achieved number or validate_bd_design fails
+  # (BD 41-237/41-238). Runtime still pins the real clock to 100 MHz (Clocks.fclk0_mhz = 100);
+  # the ~3 % delta is a recorded, slack-covered discrepancy — see bd-build-4x2.tcl's assertion.
+  set HOST_FREQ 96968727
+}
 
 # Run stages. Synthesis is on by default; implementation / bitstream are long, so opt-in.
 set RUN_SYNTH     1
@@ -15,6 +32,8 @@ if {[info exists ::env(RISCQ_DEVICE)]}        { set PART          $::env(RISCQ_D
 if {[info exists ::env(RISCQ_TOP)]}           { set TOP_MODULE    $::env(RISCQ_TOP) }
 if {[info exists ::env(RISCQ_DSP_FREQ)]}      { set DSP_FREQ      $::env(RISCQ_DSP_FREQ) }
 if {[info exists ::env(RISCQ_HOST_FREQ)]}     { set HOST_FREQ     $::env(RISCQ_HOST_FREQ) }
+if {[info exists ::env(RISCQ_DAC_NUM)]}       { set DAC_NUM       $::env(RISCQ_DAC_NUM) }
+if {[info exists ::env(RISCQ_ADC_NUM)]}       { set ADC_NUM       $::env(RISCQ_ADC_NUM) }
 if {[info exists ::env(RISCQ_RUN_SYNTH)]}     { set RUN_SYNTH     $::env(RISCQ_RUN_SYNTH) }
 if {[info exists ::env(RISCQ_RUN_IMPL)]}      { set RUN_IMPL      $::env(RISCQ_RUN_IMPL) }
 if {[info exists ::env(RISCQ_RUN_BITSTREAM)]} { set RUN_BITSTREAM $::env(RISCQ_RUN_BITSTREAM) }
