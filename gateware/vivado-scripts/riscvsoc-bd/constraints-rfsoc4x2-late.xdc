@@ -37,3 +37,12 @@ set_property MAX_FANOUT_MODE CLOCK_REGION [get_nets -of_objects [get_pins -of_ob
 set_property FORCE_MAX_FANOUT 4 [get_nets -of_objects [get_pins -of_objects \
   [get_cells -hier -filter {REF_NAME == FDRE && (NAME =~ *_zz_io_port0_write_reg* || NAME =~ *_zz_io_port0_wdata_reg*)}] \
   -filter {REF_PIN_NAME == Q}]]
+
+# ---- envelope-reader address -> deep envelope RAM (16-deep RAMB36 cascades): same medicine -----
+# 2-DAC attempt 2's worst path was posted_gateChannel/pulseGenerator_3/envReader/addrReg_reg[12]
+# -> pulseMemFiber_rams_0/.../ENARDEN: one address register enabling many cascaded RAMB36. Ask the
+# placer to replicate these per clock region as well (latency-neutral).
+set_property MAX_FANOUT_MODE CLOCK_REGION [get_nets -of_objects [get_pins -of_objects \
+  [get_cells -hier -filter {REF_NAME == FDRE && NAME =~ *envReader/addrReg_reg*}] -filter {REF_PIN_NAME == Q}]]
+set_property FORCE_MAX_FANOUT 8 [get_nets -of_objects [get_pins -of_objects \
+  [get_cells -hier -filter {REF_NAME == FDRE && NAME =~ *envReader/addrReg_reg*}] -filter {REF_PIN_NAME == Q}]]
