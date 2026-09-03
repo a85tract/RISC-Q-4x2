@@ -16,4 +16,7 @@ Verification:
   --config gateware/configs/rfsoc4x2-2dac-fine.json --loopback-src 1` -> RX_DEMO: PASS
   (IQ ratio constant to 0.004 deg / 0.01 %, demod +90 -> +90.001 deg, tone +90 -> hw -89.999 /
   host -89.997 deg, res = sign(real); the capture shows the readout tone alone, as it should).
-- board: pending — needs the loopback cable on DAC1 -> ADC0 (this file is updated when done).
+- board, partial (2026-09-03, cable still DAC0 -> ADC0): the bundle loads (server reports the xsa
+  sha above), the SoC runs the ion-trap sequence, and the ADC0 capture shows the GATE channel alone
+  on DAC0 at half the single-DAC amplitude (6052 vs 11956 codes) — the DAC0 path of the new netlist
+  works. The readout path (DAC1) and the IQ oracle need the loopback cable on DAC1 -> ADC0: pending.
