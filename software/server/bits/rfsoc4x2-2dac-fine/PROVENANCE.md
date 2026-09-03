@@ -33,7 +33,7 @@ Verification:
     the full ion-trap sequence shows the gate tone alone on DAC_A at half the summed single-DAC
     amplitude (6052 vs 11956 codes), as it must once the two drives are on separate DACs.
   - readout path ch1 -> DAC1 (DAC_B): loopback 5867 codes at 82.00 MHz (cable DAC_B -> ADC_A), and
-    `artiq_rx_demo.py --remote --bundle rfsoc4x2-2dac-fine` -> RX_DEMO: PASS — IQ ratio constant to
+    `artiq_rx_demo.py --remote --bundle rfsoc4x2-2dac-fine` -> RX_DEMO: PASS — IQ ratio |r| = 0.9998, constant to
     0.01 % / 0.002 deg across the three cases, demod +90 deg -> hw +89.993 deg, tone +90 deg -> hw
     -90.008 / host -90.007 deg, res = sign(real). Trace part A shows the readout tone alone (6268
     codes), the gate on DAC_A being out of the recorded ADC0.

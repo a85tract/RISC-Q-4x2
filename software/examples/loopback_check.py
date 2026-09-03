@@ -57,12 +57,14 @@ def main() -> int:
     band = (f > f0 - 20e6) & (f < f0 + 20e6)
     k = int(np.argmax(np.where(band, spec, 0)))
     floor = float(np.median(spec[band]))
-    present = spec[k] > 100 and spec[k] > 20 * floor
+    on_freq = abs(f[k] - f0) <= 0.5e6                     # the peak must BE the commanded tone
+    present = on_freq and spec[k] > 100 and spec[k] > 20 * floor
     print(f"trace: {n} samples @ {fs / 1e6:.2f} MS/s, max|s| = {np.abs(tr).max():.0f}, rms = {tr.std():.1f}")
     print(f"strongest line within 20 MHz of {a.freq_mhz} MHz: {f[k] / 1e6:.2f} MHz, {spec[k]:.0f} codes "
           f"(band median {floor:.1f})")
     print("LOOPBACK:", "TONE PRESENT" if present
-          else "NO TONE - check the cable and SMA seating of this DAC -> ADC pair")
+          else ("STRONG LINE OFF FREQUENCY - not the commanded tone" if not on_freq and spec[k] > 100
+                else "NO TONE - check the cable and SMA seating of this DAC -> ADC pair"))
     if a.out:
         np.savez(a.out, trace=tr, fs=fs)
     return 0 if present else 1
