@@ -1,0 +1,13 @@
+.git
+.github
+**/__pycache__
+**/*.pyc
+build
+gateware/build
+gateware/out
+sim/build
+software/client/build
+software/server/bits/**/*.bit
+**/*_work
+**/.ipynb_checkpoints
+software/examples/reference/*.png

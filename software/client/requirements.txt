@@ -1,0 +1,13 @@
+# Client (your PC / the docker `client` image), Python 3.12. Pinned to the versions the
+# verification runs used. The board itself needs only requirements-board.txt (../server/).
+numpy==2.5.2
+scipy==1.18.1            # riscq.cal fits (the `cal` extra)
+Pyro5==5.17
+serpent==1.43
+PyYAML==6.0.3            # riscq.cal.config (qcal yaml adapter)
+matplotlib==3.11.1       # examples / notebook plots
+nbconvert==7.17.1        # run the example notebooks headless
+nbformat==5.11.1
+ipykernel==7.3.0
+jupyter_client==8.10.0
+pytest==9.1.1

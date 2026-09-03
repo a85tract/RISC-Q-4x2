@@ -9,6 +9,9 @@ out/
 *.bin
 simWorkspace
 /build/
+gateware/build/
+sim/build/
+software/client/build/
 /bench/
 .claude
 .codex
@@ -16,3 +19,7 @@ ext/VexiiRiscv
 BASIC_MISTAKES.md
 /src/scratch
 .Xil/
+# artiqapi / artiq_compat kernel work dirs, notebook checkpoints
+*_work/
+.ipynb_checkpoints/
+__pycache__/

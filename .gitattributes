@@ -1,0 +1,8 @@
+# LF everywhere (board-side shell scripts and the container break on CRLF)
+* text=auto eol=lf
+*.xsa binary
+*.bit binary
+*.npz binary
+*.png binary
+*.whl binary
+*.bin binary

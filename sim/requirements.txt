@@ -1,0 +1,3 @@
+# Co-simulation extras on top of ../software/client/requirements.txt (Python < 3.14: cocotb 1.9).
+# Plus the non-Python tools: Verilator (5.020+), g++/make, JDK 17 and mill 1.1.0 (RTL generation).
+cocotb==1.9.2

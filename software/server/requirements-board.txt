@@ -1,0 +1,4 @@
+# Board side (PYNQ on the RFSoC 4x2, Python 3.10): only the RPC layer on top of what PYNQ ships
+# (numpy, pynq, xrfclk/xrfdc). Installed OFFLINE from ../server/wheels by board_setup.sh.
+Pyro5==5.17
+serpent==1.43

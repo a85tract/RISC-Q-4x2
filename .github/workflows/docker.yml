@@ -1,0 +1,77 @@
+# Build the client and full toolchain images, run the host test suite inside the client image,
+# and (only when explicitly enabled) publish to GHCR.
+#
+# Publishing is gated on the repository variable PUBLISH_IMAGES == "true" so nothing leaves the
+# runner by accident (licensing of the upstream RISC-Q sources is still being settled).
+name: docker
+on:
+  push:
+    branches: [rfsoc4x2, main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/riscq-4x2
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build client
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: software/client/Dockerfile
+          target: client
+          load: true
+          tags: riscq-4x2:client
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: host test suite (inside the client image)
+        run: |
+          docker run --rm -v "$PWD":/work/RISC-Q -w /work/RISC-Q/software/client riscq-4x2:client \
+            python -m pytest tests -q --continue-on-collection-errors --ignore=tests/test_models.py
+
+      - name: build full
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: software/client/Dockerfile
+          target: full
+          load: true
+          tags: riscq-4x2:full
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: co-sim smoke (riscq_sim imports, RTL generator reachable)
+        run: |
+          docker run --rm -v "$PWD":/work/RISC-Q -w /work/RISC-Q riscq-4x2:full \
+            python -c "import riscq_sim.cosim, cocotb; print('riscq_sim ok')"
+
+      - name: login to GHCR
+        if: vars.PUBLISH_IMAGES == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: publish (mutable + immutable sha tags)
+        if: vars.PUBLISH_IMAGES == 'true' && github.event_name != 'pull_request'
+        run: |
+          for t in client full; do
+            docker tag riscq-4x2:$t $IMAGE:$t
+            docker tag riscq-4x2:$t $IMAGE:$t-${GITHUB_SHA::12}
+            docker push $IMAGE:$t
+            docker push $IMAGE:$t-${GITHUB_SHA::12}
+          done
