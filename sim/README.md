@@ -39,5 +39,18 @@ the supported way to run it. `PYTHONPATH` needs both `software/client` and `sim`
 `set_model({"kind": "loopback", "src": <dac>, "dst": <adc>, "gain", "delay"})` wires one DAC
 into one ADC. On the single-DAC bundles both drive channels are on DAC0 (`src: 0`); on
 `rfsoc4x2-2dac-fine` the readout drive is on DAC1 (`src: 1`); on `rfsoc4x2-2dac-adcb` the readout
-ADC is ADC1 (`dst: 1`) — see `software/examples/configs/device_db_*.py` and
-`software/examples/artiq_rx_demo.py --loopback-src / --loopback-dst`.
+ADC is ADC1 (`dst: 1`); the two-core `rfsoc4x2-2q-fine` needs both cables:
+`{"kind": "multi", "models": [{"kind": "loopback", "src": 1, "dst": 1, ...}, {"kind": "loopback",
+"src": 0, "dst": 0, ...}]}` (core 0 = DAC1/ADC1 = connectors DAC_A/ADC_A, core 1 = DAC0/ADC0) —
+see `software/examples/configs/device_db_*.py`.
+
+## Two-core acceptance suite
+
+`sim/cosim2q_check.py` drives the `rfsoc4x2-2q-fine` build (two loopbacks, DAC1 -> ADC1 and DAC0 -> ADC0)
+through `riscq.artiqapi` and prints PASS/FAIL per check: the ion-trap reference, per-core trace
+isolation (including the last batch of the window), distinct tones per core, full-scale sign, the whole
+trace depth, the shared origin with asymmetric kernels (same tone -> identical traces; half a turn ->
+inverted), phase modes with a hop, the 32-bit batch-clock wrap inside a run, and the 1-core build's trace
+within one 16-bit phase LSB. Run it inside the co-sim container (hours):
+
+    cd /work/RISC-Q && PYTHONPATH=software/client:sim python sim/cosim2q_check.py [out_dir]

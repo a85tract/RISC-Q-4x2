@@ -66,7 +66,9 @@ case class RiscqRfWithPulseTableFiber(
     demodPulseNum: Int = 1,
     linkPipe: Int = 4,
     queueDepth: Int = 4,          // per-parameter TimedQueue depth in every drive/demod PulseGenerator
-    withTestTap: Boolean = false
+    withTestTap: Boolean = false,
+    runOrigin: Option[UInt] = None,   // run_origin builds: the SoC's shared run-origin latch (CTRL 0x4010)
+    signedWait: Boolean = false       // run_origin builds: wrap-safe wait_until compare
 ) extends Area {
   val w        = dataWidth
   val envWidth = batchSize * 2 * w          // complex envelope line (512 for N=16, w=16)
@@ -80,8 +82,10 @@ case class RiscqRfWithPulseTableFiber(
   val riscvSoc = RiscvSoc(
     plugins = plugins, riscqCd = riscqCd,
     timeWidth = timeWidth, readoutAccWidth = readoutAccWidth, memDepth = memDepth, memWidth = memWidth,
-    memOutReg = memOutReg, rfAddrWidth = rfAddrWidth, withTestTap = withTestTap)
+    memOutReg = memOutReg, rfAddrWidth = rfAddrWidth, withTestTap = withTestTap,
+    runOrigin = runOrigin.isDefined, signedWait = signedWait)
   riscvSoc.time     := time
+  runOrigin.foreach(riscvSoc.origin := _)
 
   // re-expose the host program/data image-load entry as a fabric node (the toplevel connects host
   // masters / the AXI fabric here, exactly as before); a leaf slave node bridges it to RiscvSoc's

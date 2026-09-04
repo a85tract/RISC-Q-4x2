@@ -91,7 +91,20 @@ class BoardServer:
             riscq_version = "unknown"
         return {"bundle": self._bundle, "xsa_sha": self._xsa_sha,
                 "mts_result": getattr(self._drv, "mts_result", None),
+                "mts_latencies": getattr(self._drv, "mts_latencies", None),
+                "dsp_mhz": getattr(self, "_dsp_mhz", None),
                 "versions": {"python": sys.version.split()[0], "riscq": riscq_version}}
+
+    def _measure_dsp_mhz(self, m, dt: float = 0.2) -> float:
+        """dspAlive (hostCtrl +0x100) counts every dsp cycle: its rate over `dt` IS the dsp clock.
+        Read at load, so a wrong MMCM multiplier, an unlocked PL clock or a dead tile clock is
+        visible in info() before any dsp-domain access."""
+        import time as _time
+        drv = self._driver()
+        d0, t0 = drv.read32(m.host_ctrl + 0x100), _time.perf_counter()
+        _time.sleep(dt)
+        d1, t1 = drv.read32(m.host_ctrl + 0x100), _time.perf_counter()
+        return round(((d1 - d0) & 0xFFFFFFFF) / (t1 - t0) / 1e6, 2)
 
     # ── server-side batch runner: the SAME riscq.run functions next to the MMIO window, one RPC
     # per batch (spec 08 §5). poll_done takes its hardware branch (no `.sim` here). ──
@@ -219,11 +232,17 @@ class BoardServer:
         board = json.loads(board_file.read_text()) if board_file.exists() else None
 
         from riscq.board.pynq_driver import PynqDriver   # lazy: only importable on the board
+        # the bitstream is programmed inside PynqDriver(): if it raises afterwards (MTS required and
+        # missed, tiles not started) nothing of the PREVIOUS bundle may stay usable against the new fabric
+        self._drv, self._bundle, self._xsa_sha, self._params, self._dsp_mhz = None, None, None, None, None
+        self._m, self._progs = None, {}
         self._drv = PynqDriver(str(xsa), str(params), board=board, download=bool(download))
         self._params = params.read_text()
         self._bundle = str(bundle)
         self._xsa_sha = hashlib.sha256(xsa.read_bytes()).hexdigest()
         self._m, self._progs = None, {}
+        from riscq.map import SocMap, SocParams
+        self._dsp_mhz = self._measure_dsp_mhz(SocMap(SocParams.from_json(self._params)))
         return self.info()
 
 

@@ -84,13 +84,21 @@ object RobSim extends App {
     waitUntil(dut.riscqArea.time.toBigInt.toInt >= startTime + dur + 60)  // past the window ⇒ rob writes done
     hostCd.waitSampling(10)
 
-    // ── read rob row 0 back over AXI (lane k at byte offset k*4) and check == the per-lane ADC sum ──
-    val robBase = BigInt(dut.map.readoutBufBase)
-    val got     = (0 until adcN).map(k => leToBig(axi.read(robBase + k * 4, 4)))
+    // ── read rob rows back over AXI (row r at byte offset r*rowBytes, lane k at k*4) ──
+    // Every row of the `dur`-batch window must hold the per-lane ADC sum — the LAST one included (the
+    // recorder used to write rows 0..dur-2 only: the write enable lagged the address by a stage,
+    // fixed 2026-09-04) — and the row after the window must be untouched (0 in simulation).
+    val robBase  = BigInt(dut.map.readoutBufBase)
+    val rowBytes = adcN * 4
+    def row(r: Int) = (0 until adcN).map(k => leToBig(axi.read(robBase + r * rowBytes + k * 4, 4)))
+    for (r <- Seq(0, dur / 2, dur - 1); k <- 0 until adcN) {
+      val v = row(r)(k)
+      assert(v == BigInt(expected(k)), s"[rob] row $r lane $k: got $v != expected ${expected(k)}")
+    }
     for (k <- 0 until adcN)
-      assert(got(k) == BigInt(expected(k)), s"[rob] lane $k: got ${got(k)} != expected ${expected(k)}")
-    println(s"[RobSim] PASS: robs captured mapped-ADC sum per lane = ${got.mkString(",")} " +
-      s"(ADC12 ${adc12.mkString(",")} + ADC13 ${adc13.mkString(",")}) on readout-pulse fire.")
+      assert(row(dur)(k) == 0, s"[rob] row $dur (past the window) lane $k: got ${row(dur)(k)}, must be untouched")
+    println(s"[RobSim] PASS: rows 0..${dur - 1} hold the mapped-ADC sum per lane = ${row(0).mkString(",")} " +
+      s"(ADC12 ${adc12.mkString(",")} + ADC13 ${adc13.mkString(",")}), row $dur untouched.")
     simSuccess()
   }
 }

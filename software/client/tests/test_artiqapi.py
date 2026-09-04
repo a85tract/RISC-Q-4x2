@@ -504,13 +504,17 @@ def test_two_reserved_patterns_do_not_leak_into_each_other():
 
 def test_dds_channel_index_is_validated():
     """An out-of-range index fails at construction with the channel count; the demod carrier
-    channel (2) is refused as a DDS — driving it would corrupt the readout decoder's bank."""
+    (the old local channel 2) is never a DDS — driving it would corrupt the readout decoder's bank."""
     m = _map()
     c = A.Core(m)
-    with pytest.raises(ValueError, match="have 3 channels"):
+    with pytest.raises(ValueError, match="has 2 dds channels"):
         A.DDSChannel(c, 5)
-    with pytest.raises(ValueError, match="use DemodChannel"):
+    with pytest.raises(ValueError, match="DemodChannel"):
         A.DDSChannel(c, 2)
+    with pytest.raises(ValueError, match="traces 0..0"):
+        A.ADCChannel(c, 1)
+    with pytest.raises(ValueError, match="readouts 0..0"):
+        A.DemodChannel(c, 1)
 
 
 def test_play_starts_one_batch_apart_raise():
@@ -576,7 +580,8 @@ def test_fetch_iq_restarts_on_a_new_run_result():
     m = _map()
     c = A.Core(m)
     dm = A.DemodChannel(c)
-    mk = lambda v: types.SimpleNamespace(res=[v], real=[v * 10], imag=[v * 100], iq=[complex(v)])
+    mk = lambda v: types.SimpleNamespace(cores={0: types.SimpleNamespace(
+        res=[v], real=[v * 10], imag=[v * 100], iq=[complex(v)])})
     c.last_result = mk(1)
     assert dm.fetch_iq().res == 1
     c.last_result = mk(2)                                      # a NEW run's result object
@@ -625,7 +630,7 @@ def test_adc_gate_pure_listen_and_rules():
     c2 = A.Core(m)                                      # a second gate is refused
     adc2 = A.ADCChannel(c2)
     adc2.gate(1 * A.us); A.delay(c2, 1 * A.us); adc2.gate(1 * A.us)
-    with pytest.raises(RuntimeError, match="one gate per run"):
+    with pytest.raises(RuntimeError, match="one gate per trace per run"):
         A.plan(c2)
 
     c3 = A.Core(m)                                      # ch1 AFTER the gate is refused (it would
@@ -713,3 +718,172 @@ def test_readout_guard_blocks_tight_followers():
     r.set(82e6); r.sw.pulse(1 * A.us)                   # starts right at the window end
     with pytest.raises(RuntimeError, match="read_res halts"):
         A.plan(c)
+
+
+# ── two hardware cores on one timeline (rfsoc4x2-2q-fine) ────────────────────────────────────────
+
+def _ion_trap(c, gate, ro, adc):
+    """The verified ion-trap sequence on the given channels."""
+    with A.parallel(c):
+        with A.branch(c):
+            with A.parallel(c):
+                with A.branch(c):
+                    gate.set(83.765e6, phase=0.0, amplitude=0.4); gate.sw.pulse(100 * A.us)
+                with A.branch(c):
+                    ro.set(80.235e6, phase=0.5, amplitude=0.4); ro.sw.pulse(100 * A.us)
+            A.delay(c, 5 * A.us)
+            ro.set(82.0e6, phase=0.25, amplitude=0.4, phase_mode=A.PHASE_MODE_ABSOLUTE)
+            ro.sw.pulse(20 * A.us)
+        with A.branch(c):
+            adc.gate(125 * A.us)
+
+
+def test_two_core_channel_ids_and_labels():
+    """dds 2k/2k+1 are core k's gate/readout drives (flat ids 3k/3k+1), adc/demod k its trace and
+    IQ readout; the report and the errors speak the user's names."""
+    m = _map("rfsoc4x2-2q-fine")
+    c = A.Core(m)
+    chans = [A.DDSChannel(c, i) for i in range(4)]
+    assert [ch.flat for ch in chans] == [0, 1, 3, 4]
+    assert [ch.core_index for ch in chans] == [0, 0, 1, 1]
+    assert (A.ADCChannel(c, 1).core_index, A.DemodChannel(c, 1).flat) == (1, 5)
+    assert [A._label(f, m) for f in (0, 1, 2, 3, 4, 5)] == ["ch0", "ch1", "demod0", "ch2", "ch3", "demod1"]
+    with pytest.raises(ValueError, match="has 4 dds channels"):
+        A.DDSChannel(c, 4)
+    chans[3].set(82e6, amplitude=0.4); chans[3].sw.pulse(2 * A.us)
+    assert "ch3" in A.plan(c).report().splitlines()[1]
+
+
+def test_two_core_core0_plan_equals_the_single_core_plan():
+    """Core 0 of the 2-core build must land on exactly the words, lines, batches and envelope images
+    the board-verified 1-core build lands on for the same timeline (the DAC combine depth is the
+    same: two channels summed on one DAC in both)."""
+    one, two = A.Core(_map("rfsoc4x2-1q-fine")), A.Core(_map("rfsoc4x2-2q-fine"))
+    for c in (one, two):
+        _ion_trap(c, A.DDSChannel(c, 0), A.DDSChannel(c, 1), A.ADCChannel(c, 0))
+    s1, s2 = A.plan(one), A.plan(two)
+    key = lambda e: (e.channel, e.batch, e.dur_batches, e.lead_zeros, e.freq_word, e.phase_const,
+                     e.amp_code, e.env_line, e.is_demod)
+    assert [key(e) for e in s1.events] == [key(e) for e in s2.events]
+    assert s1.chunks == s2.chunks and s1.env_lines == s2.env_lines and s1.first_line == s2.first_line
+    i1, i2 = A.envelope_images(s1), A.envelope_images(s2)
+    assert i1.keys() == i2.keys() and all(np.array_equal(i1[k], i2[k]) for k in i1)
+    assert two.trace_gates[0].core_index == 0
+    assert two.m.dac_pipe(1) == one.m.dac_pipe(0) == 4
+
+
+def test_two_core_kernels_split_per_core_with_shared_origin():
+    """One kernel per hardware core: each carries only its own channels under their local names,
+    takes the shared origin `t_origin` as a runtime parameter and reports its boot-time clock."""
+    m = _map("rfsoc4x2-2q-fine")
+    c = A.Core(m)
+    ch = [A.DDSChannel(c, i) for i in range(4)]
+    dm = [A.DemodChannel(c, k) for k in range(2)]
+    adc = [A.ADCChannel(c, k) for k in range(2)]
+    with A.parallel(c):
+        for k in range(2):
+            with A.branch(c):
+                ch[2 * k].set(83.765e6, amplitude=0.4); ch[2 * k].sw.pulse(10 * A.us)
+            with A.branch(c):
+                ch[2 * k + 1].set(80.235e6, phase=0.5, amplitude=0.4); ch[2 * k + 1].sw.pulse(10 * A.us)
+            with A.branch(c):
+                adc[k].gate(12 * A.us)
+        with A.branch(c):
+            A.delay(c, 20 * A.us)
+            dm[1].set(82e6); dm[1].gate(2 * A.us)
+            A.delay(c, 1 * A.us)
+            dm[1].set(82e6); dm[1].gate(2 * A.us)
+    sch = A.plan(c)
+    assert {e.channel for e in sch.events} == {0, 1, 3, 4, 5}
+    src = [A.generate_kernel_source(sch, core_index=k, origin="run_origin()") for k in range(2)]
+    for s in src:
+        compile(s, "<generated>", "exec")
+        assert "t1 = run_origin()" in s and ", tele: Array" in s
+        i_entry, i_init, i_t1, i_armed, i_play = (s.index(x) for x in (
+            "tele[1] = now()", "init_pulse_params(", "tele[0] = t1", "tele[2] = now()", "play("))
+        assert i_entry < i_init < i_t1 < i_armed < i_play      # entry, init, origin, armed, first play
+        assert s.count("tele[2] = now()") == 1
+        assert "ch2" not in s and "ch3" not in s and "demod1" not in s   # local names only
+    assert "out: Array" not in src[0] and "demod" not in src[0] and "tele[3]" not in src[0]
+    assert "out: Array" in src[1] and "out[3] = read_res()" in src[1]   # core 1's own 2 results
+    assert src[1].index("read_imag()") < src[1].index("tele[3] = now()") < src[1].index("tele[4] = now()")
+    n_plays = lambda s: s.count("play(")
+    assert n_plays(src[0]) + n_plays(src[1]) == sum(len(v) for v in sch.chunks.values())
+    # the single-core form is unchanged: own clock read, no origin, no telemetry
+    s0 = A.generate_kernel_source(sch, core_index=0)
+    assert "t1 = now() + 8192" in s0 and "run_origin" not in s0 and "tele" not in s0
+
+
+def test_telemetry_checks_catch_a_late_or_disagreeing_core():
+    m = _map("rfsoc4x2-2q-fine")
+    c = A.Core(m)
+    ch1, ch3, dm1 = A.DDSChannel(c, 1), A.DDSChannel(c, 3), A.DemodChannel(c, 1)
+    with A.parallel(c):
+        with A.branch(c):
+            A.delay(c, 2 * A.us); ch1.set(82e6, amplitude=0.4); ch1.sw.pulse(2 * A.us)
+        with A.branch(c):
+            A.delay(c, 2 * A.us); ch3.set(82e6, amplitude=0.4); ch3.sw.pulse(2 * A.us)
+            dm1.set(82e6); dm1.gate(2 * A.us)
+            A.delay(c, 1 * A.us)
+            ch3.set(82e6, amplitude=0.4); ch3.sw.pulse(1 * A.us)
+    sch = A.plan(c)
+    t1, first = 5_000_000, min(e.batch for e in sch.events)
+    good = [t1, t1 - 8192, t1 - 8192 + 600]                     # armed 7.6k batches before the first play
+    origins = {}
+    A._check_telemetry(sch, 0, good, origins)
+    reads = [e for e in sch.events if e.is_demod and e.channel // 3 == 1]
+    nxt = min(e.batch for e in sch.events if e.channel // 3 == 1 and e.batch > reads[0].batch)
+    A._check_telemetry(sch, 1, good + [t1 + nxt - A.LEAD], origins)           # exactly the lead left
+    with pytest.raises(RuntimeError, match="disagree on the run origin"):
+        A._check_telemetry(sch, 1, [t1 + 1, t1 - 8192, t1 - 8000, t1], dict(origins))
+    with pytest.raises(RuntimeError, match="pushed only"):
+        A._check_telemetry(sch, 0, [t1, t1 - 100, t1 + first - 10], {})       # armed too late
+    with pytest.raises(RuntimeError, match="lead left"):
+        A._check_telemetry(sch, 1, good + [t1 + nxt - A.LEAD + 1], {})
+    # the wrap: the same numbers just below 2^32 pass (signed differences, not magnitudes)
+    w = (1 << 32) - 3000
+    A._check_telemetry(sch, 0, [w, w - 8192, w - 8192 + 600], {})
+
+
+def test_two_core_gates_and_readout_guard_are_per_core():
+    m = _map("rfsoc4x2-2q-fine")
+    c = A.Core(m)
+    ro0, ro1 = A.DDSChannel(c, 1), A.DDSChannel(c, 3)
+    adc0, adc1 = A.ADCChannel(c, 0), A.ADCChannel(c, 1)
+    with A.parallel(c):
+        with A.branch(c):
+            adc0.gate(4 * A.us)
+        with A.branch(c):
+            A.delay(c, 1 * A.us); adc1.gate(2 * A.us)
+        with A.branch(c):
+            A.delay(c, 1.5 * A.us); ro1.set(82e6, amplitude=0.4); ro1.sw.pulse(1 * A.us)
+    sch = A.plan(c)
+    fill = {f: [e for e in sch.events if e.channel == f and e.amp_code == 0] for f in (1, 4)}
+    assert len(fill[1]) == 1 and len(fill[4]) == 2              # pure listening / lead-in + tail
+    assert all(e.channel in (1, 4) for e in sch.events)
+    assert sorted(tg.core_index for tg in c.trace_gates) == [0, 1]
+
+    c2 = A.Core(m)                                              # a second gate on the SAME trace
+    a1 = A.ADCChannel(c2, 1)
+    a1.gate(1 * A.us); A.delay(c2, 1 * A.us); a1.gate(1 * A.us)
+    with pytest.raises(RuntimeError, match="2 gates on adc1"):
+        A.plan(c2)
+
+    c3 = A.Core(m)                                              # read_res halts only ITS core
+    dm0, r0, r1 = A.DemodChannel(c3, 0), A.DDSChannel(c3, 1), A.DDSChannel(c3, 3)
+    dm0.set(82e6); dm0.gate(2 * A.us)
+    r1.set(82e6, amplitude=0.4); r1.sw.pulse(1 * A.us)          # core 1 right after core 0's window
+    A.plan(c3)
+    r0.set(82e6, amplitude=0.4)
+    c3.at_mu(dm0.core.events[0].start_mu + dm0.core.events[0].dur_mu)
+    r0.sw.pulse(1 * A.us)                                       # core 0 itself: refused
+    with pytest.raises(RuntimeError, match="read_res halts"):
+        A.plan(c3)
+
+
+def test_shared_trace_multicore_build_refuses_a_per_channel_adc():
+    m = _map("sim-2q")                                          # 2 cores, upstream shared trace
+    c = A.Core(m)
+    with pytest.raises(ValueError, match="ONE shared trace"):
+        A.ADCChannel(c, 0)
+    assert A.DDSChannel(c, 3).flat == 4                          # the drives are still addressable

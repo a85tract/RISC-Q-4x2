@@ -199,7 +199,7 @@ def test_device_db_is_validated_eagerly():
             pass
 
     bad = dict(DB); bad["x"] = {"type": "dds", "channel": 7}
-    with pytest.raises(ValueError, match="have 3 channels"):
+    with pytest.raises(ValueError, match="has 2 dds channels"):
         C.record_experiment(UsesBadChannel, bad, A.Core(m))
 
 
@@ -281,6 +281,48 @@ def test_open_driver_releases_on_partial_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="handshake died"):
         C._open_driver({"type": "cosim", "config": "c", "build": "b"})
     assert released == ["board", "cosim"]
+
+
+def test_multicore_device_db_channels():
+    """On a 2-core build `adc`/`demod` take `channel` = the hardware core (default 0) and dds
+    channels run 0..3; the same keys are refused on a 1-core build at device construction."""
+    m2 = _map("rfsoc4x2-2q-fine")
+    db = {
+        "core":  {"type": "board", "host": "192.168.3.1", "bundle": "rfsoc4x2-2q-fine"},
+        "dds_a": {"type": "dds", "channel": 1},
+        "dds_b": {"type": "dds", "channel": 3},
+        "adc_a": {"type": "adc"},
+        "adc_b": {"type": "adc", "channel": 1},
+        "dm_b":  {"type": "demod", "channel": 1},
+    }
+
+    class Both(EnvExperiment):
+        def build(self):
+            for n in ("core", "dds_a", "dds_b", "adc_a", "adc_b", "dm_b"):
+                self.setattr_device(n)
+
+        @kernel
+        def run(self):
+            with parallel:
+                with sequential:
+                    self.dds_a.set(82*MHz, amplitude=0.4); self.dds_a.sw.pulse(2*us)
+                with sequential:
+                    self.dds_b.set(82*MHz, amplitude=0.4); self.dds_b.sw.pulse(2*us)
+                with sequential:
+                    self.adc_a.gate(3*us)
+                with sequential:
+                    self.adc_b.gate(3*us)
+
+    core = A.Core(m2)
+    exp = C.record_experiment(Both, db, core)
+    assert exp.adc_b._adc.core_index == 1 and exp.dm_b._dm.core_index == 1
+    assert exp.adc_a._adc.core_index == 0
+    assert {e.channel for e in core.events} == {1, 4}            # flat ids: core 0 / core 1 readout
+    assert sorted(tg.core_index for tg in core.trace_gates) == [0, 1]
+
+    one = dict(DB); one["adc_b"] = {"type": "adc", "channel": 1}
+    with pytest.raises(ValueError, match="traces 0..0"):
+        C.record_experiment(Both, one, A.Core(_map()))
 
 
 def test_alias_to_core_shares_the_core_device():

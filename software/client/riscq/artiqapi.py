@@ -19,6 +19,13 @@ layout with its sub-batch leading/trailing zeros, the reserved-line allocation, 
 chunking that keeps a reserved line out of a wrapping traversal, the TIME_TO_PULSE = 36 pipeline
 convention and the phase-register arithmetic.
 
+MULTI-CORE BUILDS (qubit_num > 1): still ONE timeline. DDS channel 2k is hardware core k's gate
+drive and 2k+1 its readout drive (their DAC is the build's dac_map); ADCChannel(core, k) is core k's
+raw trace (it records while dds 2k+1 fires, from the ADC in adc_map[k]) and DemodChannel(core, k) its
+IQ readout. run() compiles one kernel per hardware core from the same plan. Internally every event
+carries the flat channel id 3*k + local (local 0 gate, 1 readout, 2 demod), which is the plain
+0/1/2 of the single-core builds.
+
 THE CONTRACT — what is exact, what is snapped (stated the way `units.freq_word` states its own):
   * `mu` is the timeline's ARITHMETIC QUANTUM: one DAC sample (127.157 ps on a 491.52 MHz, 16-lane
     build). `seconds_to_mu` rounds to nearest. It is NOT the finest realizable pulse edge.
@@ -97,6 +104,26 @@ _READOUT_MAX_WIN_LOG2 = 14                  # RTL no-overflow contract: window <
 def _i32(v: int) -> int:
     """Seated words go out as int32 (32768 << 16 is -2^31, not +2^31)."""
     return (int(v) + (1 << 31)) % _M32 - (1 << 31)
+
+
+# ── channel ids: user-facing dds index 2k/2k+1 <-> internal flat id 3k + local (0 gate, 1 readout,
+#    2 demod) of hardware core k; on a single-core build the flat id IS the local one ──
+def _dds_flat(m: SocMap, index: int) -> int:
+    n = 2 * m.params.qubit_num
+    if not 0 <= int(index) < n:
+        raise ValueError(
+            f"dds channel {index} does not exist: a {m.params.qubit_num}-core build has {n} dds "
+            f"channels (2k = core k's gate drive, 2k+1 = core k's readout drive); IQ readout is "
+            "DemodChannel, not a dds")
+    return 3 * (int(index) // 2) + int(index) % 2
+
+
+def _label(f: int, m: SocMap) -> str:
+    """Human name of a flat channel id: ch<dds index> or demod<core>."""
+    k, local = divmod(int(f), 3)
+    if local == 2:
+        return "demod" if m.params.qubit_num == 1 else f"demod{k}"
+    return f"ch{2 * k + local}"
 
 
 # ── the timeline ─────────────────────────────────────────────────────────────────────────────────
@@ -230,7 +257,7 @@ class ToneSet:
 
     CONTINUOUS chains through these, not through the pulses — `set(TRACKING); set(CONTINUOUS);
     pulse()` must see the first set as its predecessor even though it played nothing."""
-    channel: int
+    channel: int                  # flat id 3*core + local (see the module docstring)
     set_mu: int
     set_s: float                  # un-rounded: the phase is anchored here, not on the mu grid
     frequency: float
@@ -246,7 +273,7 @@ class ToneSet:
 @dataclass
 class PulseEvent:
     """One scheduled pulse, in both the user's units and the hardware's."""
-    channel: int
+    channel: int                  # flat id 3*core + local (see the module docstring)
     set_index: int                # which ToneSet this pulse plays
     set_mu: int                   # the `set()` instant (ARTIQ's t' for ABSOLUTE / CONTINUOUS)
     set_s: float                  # the same instant UN-ROUNDED — what the phase is anchored to
@@ -301,17 +328,19 @@ class _Switch:
 
 
 class DDSChannel:
-    """One RF channel, shaped like `artiq.coredevice.ad9910.AD9910`."""
+    """One RF drive channel, shaped like `artiq.coredevice.ad9910.AD9910`.
+
+    `index` counts drive channels across the build's cores: 2k is hardware core k's gate drive,
+    2k+1 its readout drive (on a 1-core build simply 0 and 1). The physical DAC of each is the
+    build's dac_map; the demod carrier is never a dds — see DemodChannel."""
 
     def __init__(self, core: Core, index: int, name: str | None = None):
         self.core = core
         self.index = int(index)
         self.name = name or f"ch{index}"
-        info = core.m.channel(self.index)   # raises on an out-of-range index
-        if self.index == 2:
-            raise ValueError(
-                "channel 2 is the demod carrier, not a drive channel — driving it would "
-                "overwrite the readout decoder's carrier bank; use DemodChannel for IQ readout")
+        self.flat = _dds_flat(core.m, self.index)       # raises on an out-of-range index
+        self.core_index = self.flat // 3
+        info = core.m.channel(self.flat % 3)
         self.samples_per_line = info.samples_per_line
         self.step = 16 // self.samples_per_line     # DAC samples per stored envelope sample
         self.sw = _Switch(self)
@@ -334,7 +363,7 @@ class DDSChannel:
         if not 0.0 <= amplitude <= 1.0:
             raise ValueError(f"amplitude {amplitude} outside [0, 1]")
         self.core.sets.append(ToneSet(
-            channel=self.index, set_mu=self.core.now_mu(), set_s=self.core._cursor_s,
+            channel=self.flat, set_mu=self.core.now_mu(), set_s=self.core._cursor_s,
             frequency=float(frequency), phase_turns=float(phase), amplitude=float(amplitude),
             phase_mode=mode))
         self._tone = len(self.core.sets) - 1
@@ -352,7 +381,7 @@ class DDSChannel:
             raise RuntimeError(f"{self.name}.pulse() before {self.name}.set()")
         t = self.core.sets[self._tone]
         self.core.events.append(PulseEvent(
-            channel=self.index, set_index=self._tone, set_mu=t.set_mu, set_s=t.set_s,
+            channel=self.flat, set_index=self._tone, set_mu=t.set_mu, set_s=t.set_s,
             start_mu=self.core.now_mu(), dur_mu=int(dur_mu),
             requested_start_s=self.core._cursor_s, requested_dur_s=dur_s,
             frequency=t.frequency, phase_turns=t.phase_turns, amplitude=t.amplitude,
@@ -369,6 +398,7 @@ class TraceGate:
     dur_mu: int
     requested_start_s: float
     requested_dur_s: float
+    core_index: int = 0           # the hardware core whose trace (and readout drive) this is
     batch0: int = 0               # filled in by plan(): first recorded batch
     batches: int = 0
 
@@ -380,18 +410,32 @@ class ADCChannel:
     `TTLInOut.gate_rising` semantics — put it in a `with parallel(core): with branch(core):` to
     record concurrently with the pulses, as one gates a counter in ARTIQ), returning the end mu.
 
-    What the hardware really does (owned here, invisible to the user): the trace BRAM records only
-    while the readout-drive channel (ch1) fires, and its write address RESETS whenever it stops —
-    so the planner makes ch1 fire CONTIGUOUSLY across the gate by inserting amplitude-0 fillers,
-    refuses ch1 pulses OUTSIDE the gate (they would restart the trace), allows at most ONE gate per
-    run, snaps the gate outward to whole batches, and checks it fits rob_depth. After `run()`,
-    `fetch_trace()` returns the samples (int32, fs = ADC_BATCH x dsp clock). The trace BRAM is
-    GLOBAL and stores, per lane, the SUM over the mapped physical ADCs (one ADC on this build) —
-    it is not a per-core buffer."""
+    `index` is the hardware core whose trace this is: it records the ADC in the build's adc_map[k]
+    while that core's readout drive (dds 2k+1) fires. On a 1-core build there is only index 0.
 
-    def __init__(self, core: Core, name: str = "adc"):
+    What the hardware really does (owned here, invisible to the user): the trace BRAM records only
+    while the core's readout-drive channel fires, and its write address RESETS whenever it stops —
+    so the planner makes that channel fire CONTIGUOUSLY across the gate by inserting amplitude-0
+    fillers, refuses its pulses OUTSIDE the gate (they would restart the trace), allows at most ONE
+    gate per trace per run, snaps the gate outward to whole batches, and checks it fits rob_depth.
+    After `run()`, `fetch_trace()` returns the samples (int32, fs = ADC_BATCH x dsp clock). On a
+    build without per-core traces (rob_per_core off) the ONE trace stores, per lane, the SUM over
+    the mapped physical ADCs and records on ANY core's readout fire — so it is offered only as
+    index 0 of a 1-core build there."""
+
+    def __init__(self, core: Core, index: int = 0, name: str = "adc"):
         self.core = core
         self.name = name
+        self.index = int(index)
+        p = core.m.params
+        if not 0 <= self.index < p.qubit_num:
+            raise ValueError(f"adc {index} does not exist: a {p.qubit_num}-core build has traces "
+                             f"0..{p.qubit_num - 1}")
+        if p.qubit_num > 1 and not p.rob_per_core:
+            raise ValueError(
+                "this multi-core build has ONE shared trace (rob_per_core off): it sums every mapped "
+                "ADC and records on any core's readout fire, so it is not a per-channel adc")
+        self.core_index = self.index
 
     def gate(self, duration: float) -> int:
         return self.gate_mu(self.core.seconds_to_mu(duration))
@@ -400,16 +444,18 @@ class ADCChannel:
         self.core.trace_gates.append(TraceGate(
             start_mu=self.core.now_mu(), dur_mu=int(duration_mu),
             requested_start_s=self.core._cursor_s,
-            requested_dur_s=int(duration_mu) / self.core.f_dac))
+            requested_dur_s=int(duration_mu) / self.core.f_dac, core_index=self.core_index))
         self.core.delay_mu(int(duration_mu))
         return self.core.now_mu()
 
     def fetch_trace(self):
         """The last run's trace (EdgeCounter's fetch_count naming)."""
         r = self.core.last_result
-        if r is None or r.trace is None:
-            raise RuntimeError("no trace: run() the sequence first (with an adc.gate window)")
-        return r.trace
+        cr = None if r is None else r.cores.get(self.core_index)
+        if cr is None or cr.trace is None:
+            raise RuntimeError(f"no trace for {self.name}: run() the sequence first (with an "
+                               f"{self.name}.gate window)")
+        return cr.trace
 
 
 class DemodChannel:
@@ -433,9 +479,15 @@ class DemodChannel:
     settles, so the planner refuses any event that starts within READOUT_LEAD + LEAD batches after
     an IQ gate's end — space the schedule out, as the cal kernels' `period` grid does."""
 
-    def __init__(self, core: Core, name: str = "demod"):
+    def __init__(self, core: Core, index: int = 0, name: str = "demod"):
         self.core = core
-        self.index = 2
+        self.index = int(index)                 # the hardware core whose readout this is
+        p = core.m.params
+        if not 0 <= self.index < p.qubit_num:
+            raise ValueError(f"demod {index} does not exist: a {p.qubit_num}-core build has readouts "
+                             f"0..{p.qubit_num - 1}")
+        self.core_index = self.index
+        self.flat = 3 * self.index + 2          # the core's demod carrier channel
         self.name = name
         self._phase_mode = PHASE_MODE_TRACKING
         self._tone = None
@@ -453,7 +505,7 @@ class DemodChannel:
         if not 0.0 <= amplitude <= 1.0:
             raise ValueError(f"amplitude {amplitude} outside [0, 1]")
         self.core.sets.append(ToneSet(
-            channel=self.index, set_mu=self.core.now_mu(), set_s=self.core._cursor_s,
+            channel=self.flat, set_mu=self.core.now_mu(), set_s=self.core._cursor_s,
             frequency=float(frequency), phase_turns=float(phase), amplitude=float(amplitude),
             phase_mode=mode, is_demod=True))
         self._tone = len(self.core.sets) - 1
@@ -470,9 +522,9 @@ class DemodChannel:
                 f"integration window of {-(-int(duration_mu) // 16)} batches exceeds the "
                 f"accumulator's no-overflow contract (2^{_READOUT_MAX_WIN_LOG2} = "
                 f"{1 << _READOUT_MAX_WIN_LOG2} batches ~ 33 us)")
-        slot = sum(1 for e in self.core.events if e.is_demod)
+        slot = sum(1 for e in self.core.events if e.is_demod and e.channel == self.flat)
         self.core.events.append(PulseEvent(
-            channel=self.index, set_index=self._tone, set_mu=t.set_mu, set_s=t.set_s,
+            channel=self.flat, set_index=self._tone, set_mu=t.set_mu, set_s=t.set_s,
             start_mu=self.core.now_mu(), dur_mu=int(duration_mu),
             requested_start_s=self.core._cursor_s,
             requested_dur_s=int(duration_mu) / self.core.f_dac,
@@ -485,25 +537,30 @@ class DemodChannel:
         """The next queued readout, in gate order: a record with .res (hardware sign bit),
         .real/.imag (32-bit integrals) and .iq (complex)."""
         r = self.core.last_result
-        if r is None or not len(r.res):
-            raise RuntimeError("no readout results: run() a sequence with demod gates first")
+        cr = None if r is None else r.cores.get(self.core_index)
+        if cr is None or not len(cr.res):
+            raise RuntimeError(f"no readout results for {self.name}: run() a sequence with "
+                               f"{self.name}.gate windows first")
         if getattr(self, "_fetch_result", None) is not r:   # a NEW run: start from its first result
             self._fetch_result, self._fetch_cursor = r, 0
         k = self._fetch_cursor
-        if k >= len(r.res):
-            raise RuntimeError(f"all {len(r.res)} queued results already fetched")
+        if k >= len(cr.res):
+            raise RuntimeError(f"all {len(cr.res)} queued results already fetched")
         self._fetch_cursor = k + 1
         import types
-        return types.SimpleNamespace(res=int(r.res[k]), real=int(r.real[k]),
-                                     imag=int(r.imag[k]), iq=complex(r.iq[k]))
+        return types.SimpleNamespace(res=int(cr.res[k]), real=int(cr.real[k]),
+                                     imag=int(cr.imag[k]), iq=complex(cr.iq[k]))
 
 
 def _fill_trace_window(core: Core, gate: TraceGate) -> int:
-    """Make ch1 fire contiguously over the gate window (batch-granular), inserting amplitude-0
-    fillers for the lead-in, the holes, and the tail. Returns the number of fillers added."""
+    """Make the gate's core's readout drive fire contiguously over the gate window (batch-granular),
+    inserting amplitude-0 fillers for the lead-in, the holes, and the tail. Returns the number of
+    fillers added."""
+    ro = 3 * gate.core_index + 1                      # that core's readout-drive channel
+    name = _label(ro, core.m)
     b0 = gate.start_mu // 16
     b1 = -(-(gate.start_mu + gate.dur_mu) // 16)
-    evs = sorted((e for e in core.events if e.channel == 1), key=lambda e: e.start_mu)
+    evs = sorted((e for e in core.events if e.channel == ro), key=lambda e: e.start_mu)
     step = 16 // core.m.channel(1).samples_per_line
 
     def batches_of(e):
@@ -521,8 +578,8 @@ def _fill_trace_window(core: Core, gate: TraceGate) -> int:
             inside.append(e)
             continue
         raise RuntimeError(
-            f"ch1 pulse at batches [{eb0}, {eb1}) overlaps the adc gate [{b0}, {b1}) boundary or "
-            "follows it: firing there would merge with or restart the recording — keep ch1 "
+            f"{name} pulse at batches [{eb0}, {eb1}) overlaps the adc gate [{b0}, {b1}) boundary or "
+            f"follows it: firing there would merge with or restart the recording — keep {name} "
             "pulses fully inside the gate, or ended at least one batch before it")
     evs = inside
 
@@ -539,10 +596,10 @@ def _fill_trace_window(core: Core, gate: TraceGate) -> int:
     for lo, hi in spans:
         start_mu, dur_mu = lo * 16, (hi - lo) * 16
         core.sets.append(ToneSet(
-            channel=1, set_mu=start_mu, set_s=start_mu / core.f_dac, frequency=freq,
+            channel=ro, set_mu=start_mu, set_s=start_mu / core.f_dac, frequency=freq,
             phase_turns=0.0, amplitude=0.0, phase_mode=PHASE_MODE_TRACKING, is_filler=True))
         core.events.append(PulseEvent(
-            channel=1, set_index=len(core.sets) - 1, set_mu=start_mu,
+            channel=ro, set_index=len(core.sets) - 1, set_mu=start_mu,
             set_s=start_mu / core.f_dac, start_mu=start_mu, dur_mu=dur_mu,
             requested_start_s=start_mu / core.f_dac, requested_dur_s=dur_mu / core.f_dac,
             frequency=freq, phase_turns=0.0, amplitude=0.0, phase_mode=PHASE_MODE_TRACKING))
@@ -564,18 +621,18 @@ class Schedule:
 
     def report(self) -> str:
         c = self.core
-        out = [f"{'ch':>3} {'start asked':>13} {'start got':>13} {'err':>8} "
+        out = [f"{'ch':>6} {'start asked':>13} {'start got':>13} {'err':>8} "
                f"{'dur asked':>12} {'dur got':>12} {'end err':>8} "
                f"{'freq':>13} {'phase':>7} {'mode':>10}"]
         for e in self.events:
             out.append(
-                f"{e.channel:>3} {e.requested_start_s*1e9:>12.4f}n {e.realized_start_ns(c):>12.4f}n "
+                f"{_label(e.channel, c.m):>6} {e.requested_start_s*1e9:>12.4f}n {e.realized_start_ns(c):>12.4f}n "
                 f"{e.start_error_ps(c):>+7.1f}p {e.requested_dur_s*1e9:>11.4f}n "
                 f"{e.realized_dur_ns(c):>11.4f}n {e.end_error_ps(c):>+7.1f}p "
                 f"{units.word_to_freq(e.freq_word, c.m.params)/(4 if e.is_demod else 1)/1e6:>12.6f}M "
                 f"{e.phase_turns:>7.4f} {_MODE_NAME[e.phase_mode]:>10}")
         for tg in self.core.trace_gates:
-            out.append(f"adc gate: requested [{tg.requested_start_s*1e9:.4f}, "
+            out.append(f"adc{tg.core_index} gate: requested [{tg.requested_start_s*1e9:.4f}, "
                        f"{(tg.requested_start_s + tg.requested_dur_s)*1e9:.4f}) ns -> recorded "
                        f"batches [{tg.batch0}, {tg.batch0 + tg.batches}) "
                        f"({tg.batches} batches, {tg.batches*16/self.core.f_dac*1e6:.4f} us)")
@@ -591,10 +648,12 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
     back-to-back plays that never wrap.
     """
     m = core.m
-    if len(core.trace_gates) > 1:
-        raise RuntimeError(
-            f"{len(core.trace_gates)} adc gates in one run: the trace address resets on every "
-            "refire, so a second window would overwrite the first — one gate per run")
+    for k in {tg.core_index for tg in core.trace_gates}:
+        n = sum(1 for tg in core.trace_gates if tg.core_index == k)
+        if n > 1:
+            raise RuntimeError(
+                f"{n} gates on adc{k} in one run: the trace address resets on every refire, so a "
+                "second window would overwrite the first — one gate per trace per run")
     for tg in core.trace_gates:
         # the gate snaps OUTWARD to whole batches, so check the snapped size, not ceil(dur)
         gb = -(-(tg.start_mu + tg.dur_mu) // 16) - tg.start_mu // 16
@@ -608,7 +667,7 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
 
     # pass 1: edges, words, and the partial-line inventory
     for e in sch.events:
-        info = m.channel(e.channel)
+        info = m.channel(e.channel % 3)          # the core-local channel (gate / readout / demod)
         step = 16 // info.samples_per_line
 
         # -- the LEADING edge snaps to this channel's envelope grid (sub-batch, the
@@ -670,7 +729,7 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
                 a.dur_batches = a.end_dac // 16 - a.batch
                 if a.dur_batches < 1:
                     raise RuntimeError(
-                        f"ch{ch}: pulse at batch {a.batch} is squeezed to nothing by the next "
+                        f"{_label(ch, m)}: pulse at batch {a.batch} is squeezed to nothing by the next "
                         f"pulse at batch {b.batch} — the timeline packs sub-batch pulses tighter "
                         "than the envelope grid allows")
 
@@ -704,7 +763,7 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
         for (pa, ia), (pb, ib) in zip(plays, plays[1:]):
             if pb - pa < 3:
                 raise RuntimeError(
-                    f"ch{ch}: queued plays at batches {pa} (event {ia}) and {pb} (event {ib}) "
+                    f"{_label(ch, m)}: queued plays at batches {pa} (event {ia}) and {pb} (event {ib}) "
                     "start closer than 3 batches apart — the parameter queue pops one entry per "
                     "3 batches (SrlShadow II=3), so the later play lands a batch late and the "
                     "channel (and the trace recording) glitches low for a batch; space the "
@@ -712,17 +771,18 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
         depth = sch.core.m.params.queue_depth
         if len(plays) > depth:
             raise RuntimeError(
-                f"ch{ch}: {len(plays)} queued plays exceed the hardware queue depth {depth} — "
+                f"{_label(ch, m)}: {len(plays)} queued plays exceed the hardware queue depth {depth} — "
                 "the play push has no backpressure, so an overfull queue silently drops "
                 "entries; split the sequence into shorter kernels or merge/space its events")
 
-    # the read of an IQ result halts the core until the integral settles (window end), and later
-    # MMIO pushes need their LEAD margin — refuse anything scheduled too close after a readout
+    # the read of an IQ result halts ITS core until the integral settles (window end), and that
+    # core's later MMIO pushes need their LEAD margin — refuse anything on the same core scheduled
+    # too close after a readout (other cores run their own kernels and are not halted)
     guard = RESULT_TAIL + LEAD
     for d in (e for e in sch.events if e.is_demod):
         d_end = d.batch + d.dur_batches
         for e in sch.events:
-            if e is d or e.batch <= d.batch:
+            if e is d or e.batch <= d.batch or e.channel // 3 != d.channel // 3:
                 continue
             if e.batch < d_end + guard:
                 raise RuntimeError(
@@ -731,13 +791,20 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
                     f"pulses need >= READOUT_LEAD + LEAD = {guard} batches of slack (space the "
                     "schedule out, as the cal kernels' period grid does)")
 
+    # the batch clock is 32 bits and every due test is a signed difference: keep the whole schedule
+    # well inside half its range (2^31 batches = 4.37 s) — 2^30 leaves the same margin again
+    horizon = max((e.batch + e.dur_batches for e in sch.events), default=0)
+    if horizon >= (1 << 30):
+        raise RuntimeError(f"schedule horizon of {horizon} batches ({horizon * 16 / core.f_dac:.3f} s) "
+                           "exceeds the 32-bit batch clock's safe range (2^30 batches, 2.18 s)")
+
     # overlap check: two pulses on one channel may not overlap in time
     for ch in {e.channel for e in sch.events}:
         evs = sorted((e for e in sch.events if e.channel == ch), key=lambda e: e.start_dac)
         for a, b in zip(evs, evs[1:]):
             if b.start_dac < a.end_dac:
                 raise RuntimeError(
-                    f"ch{ch}: pulses overlap — one ends at DAC sample {a.end_dac}, the next starts "
+                    f"{_label(ch, m)}: pulses overlap — one ends at DAC sample {a.end_dac}, the next starts "
                     f"at {b.start_dac}; a channel plays one pulse at a time")
     return sch
 
@@ -750,12 +817,14 @@ def fill_gaps(core: Core, channel: int, amplitude: float = 0.0) -> int:
     with a silent gap therefore comes back as two traces overlaid at address 0 unless the gap is
     played as a zero-amplitude pulse (the DAC output is genuinely zero either way).
 
-    Call it after building the sequence and before `plan()`. Returns the number of fillers added.
+    Call it after building the sequence and before `plan()`. `channel` is the dds index. Returns
+    the number of fillers added.
     """
+    channel = _dds_flat(core.m, channel)
     evs = sorted((e for e in core.events if e.channel == channel), key=lambda e: e.start_mu)
     if not evs:
         return 0
-    step = 16 // core.m.channel(channel).samples_per_line
+    step = 16 // core.m.channel(channel % 3).samples_per_line
     added = 0
     for prev, nxt in zip(evs, evs[1:]):
         end_dac = int(round((prev.start_mu + prev.dur_mu) / step) * step)
@@ -806,7 +875,7 @@ def _plan_phase_chain(core: Core) -> None:
             prev = state.get(t.channel)
             if prev is None:
                 raise RuntimeError(
-                    f"ch{t.channel}: PHASE_MODE_CONTINUOUS continues a phase that does not exist "
+                    f"{_label(t.channel, core.m)}: PHASE_MODE_CONTINUOUS continues a phase that does not exist "
                     "yet — the first set() on a channel must be TRACKING or ABSOLUTE")
             W1, c1 = prev
             c_const = c1 + anchor(W1) - anchor(W) + p32
@@ -871,18 +940,19 @@ def envelope_images(sch: Schedule) -> dict[int, np.ndarray]:
     """
     m = sch.core.m
     images = {}
-    for ch, keys in sch.env_lines.items():
-        spl = m.channel(ch).samples_per_line
+    for ch, keys in sch.env_lines.items():           # keyed by the flat channel id
+        local = ch % 3
+        spl = m.channel(local).samples_per_line
         step = 16 // spl
         # PACKED lines (uint32 per stored sample), the format riscq.run.write_envelope expects
-        full = Pulse(envelopes.square(spl), amp=1.0).packed_lines(m, ch)
+        full = Pulse(envelopes.square(spl), amp=1.0).packed_lines(m, local)
         img = np.tile(full, (m.params.env_depth, 1))
         for (lead, trail), line in keys.items():
             row = envelopes.square(spl).copy()
             row[: lead // step] = 0
             if trail:
                 row[spl - (trail + 1) // step:] = 0
-            img[line] = Pulse(row, amp=1.0).packed_lines(m, ch)[0]
+            img[line] = Pulse(row, amp=1.0).packed_lines(m, local)[0]
         images[ch] = img
     return images
 
@@ -896,18 +966,26 @@ from riscq.lang import Array, ParamTable, kernel
 @kernel
 def k_sequence({params}):
     """{doc}"""
-{inits}
-    t1 = now() + {lead}  # noqa: F821      the sequence origin: a runtime value
-'''
+{pre}{inits}
+    t1 = {origin}  # noqa: F821      the sequence origin: a runtime value
+{post}'''
 
 
-def generate_kernel_source(sch: Schedule, lead: int = 8192, doc: str = "") -> str:
-    """Straight-line kernel source for this schedule — one `set_*`/`play` group per event."""
-    chans = sorted({e.channel for e in sch.events})
-    nm = {c: ("demod" if c == 2 else f"ch{c}") for c in chans}
-    n_iq = sum(1 for e in sch.events if e.is_demod)
+def generate_kernel_source(sch: Schedule, lead: int = 8192, doc: str = "", core_index: int = 0,
+                           origin: str | None = None) -> str:
+    """Straight-line kernel source for hardware core `core_index` — one `set_*`/`play` group per
+    event of that core (on a 1-core build: every event). `origin` is the kernel expression of the
+    sequence origin t1: the default `now() + lead` anchors a single core on its own clock read; a
+    multi-core run passes `run_origin()` (the SoC's reset-release latch, identical on every core)
+    and the kernel then also fills a `tele` array — [t1, now at entry, now just before its first
+    play, now after each blocking readout] — that run() checks against the schedule."""
+    events = [(idx, e) for idx, e in enumerate(sch.events) if e.channel // 3 == core_index]
+    chans = sorted({e.channel for _, e in events})
+    nm = {c: ("demod" if c % 3 == 2 else f"ch{c % 3}") for c in chans}
+    n_iq = sum(1 for _, e in events if e.is_demod)
     body: list[str] = []
-    for idx, e in enumerate(sch.events):
+    n_reads = 0
+    for idx, e in events:
         n, W = nm[e.channel], _i32(e.freq_word)
         body.append(
             f"    # event {idx}: {e.frequency/1e6:.6f} MHz, phase {e.phase_turns:g} turns, "
@@ -927,6 +1005,8 @@ def generate_kernel_source(sch: Schedule, lead: int = 8192, doc: str = "") -> st
         for line, nb in sch.chunks[idx]:
             body.append(f"    set_env({n}, {n}[\"p\"], {_i32(line << 16)})  # noqa: F821")
             body.append(f"    set_dur({n}, {n}[\"p\"], {_i32(nb << 16)})  # noqa: F821")
+            if origin is not None and not any("play(" in b for b in body):
+                body.append("    tele[2] = now()  # noqa: F821   armed: about to push the first play")
             body.append(f"    play({n}, {n}[\"p\"], t1 + {at})  # noqa: F821")
             at += nb
         if e.is_demod:
@@ -935,23 +1015,34 @@ def generate_kernel_source(sch: Schedule, lead: int = 8192, doc: str = "") -> st
             body.append(f"    out[{k}] = read_res()  # noqa: F821   HALTS until the integral settles")
             body.append(f"    out[{k + 1}] = read_real()  # noqa: F821")
             body.append(f"    out[{k + 2}] = read_imag()  # noqa: F821")
-    end = max((e.batch + e.dur_batches for e in sch.events), default=0)
+            if origin is not None:
+                body.append(f"    tele[{3 + n_reads}] = now()  # noqa: F821   back from the halting read")
+                n_reads += 1
+    end = max((e.batch + e.dur_batches for _, e in events), default=0)
     body.append(f"    wait_until(t1 + {end + 64})  # noqa: F821")
     params = ", ".join(f"{nm[c]}: ParamTable" for c in chans)
     if n_iq:
         params += ", out: Array"
+    pre = post = ""
+    if origin is not None:
+        params += ", tele: Array"
+        pre = "    tele[1] = now()  # noqa: F821   entry: before the pulse-table init\n"
+        post = "    tele[0] = t1  # noqa: F821\n"
     head = _KERNEL_HEAD.format(
-        params=params,
+        params=params, pre=pre, post=post,
         inits="\n".join(f"    init_pulse_params({nm[c]}.pulses)  # noqa: F821" for c in chans),
-        doc=doc or "generated sequence", lead=lead)
+        doc=doc or "generated sequence", origin=origin if origin is not None else f"now() + {lead}")
     return head + "\n".join(body) + "\n"
 
 
-def compile_schedule(sch: Schedule, out_dir, lead: int = 8192, doc: str = ""):
-    """Generate the kernel, import it, and hand it to RISC-Q's own `compile_kernel`.
+def compile_schedule(sch: Schedule, out_dir, lead: int = 8192, doc: str = "", core_index: int = 0,
+                     origin: str | None = None):
+    """Generate hardware core `core_index`'s kernel, import it, and hand it to RISC-Q's own
+    `compile_kernel`.
 
-    Returns `(program, tables, envelope_images, source_path)`. The source is written to a real file
-    so the kernel front end can read it with `inspect.getsource` — and so a human can read it too.
+    Returns `(program, tables, envelope_images, source_path)` — the envelope images are the whole
+    schedule's, keyed by flat channel id. The source is written to a real file so the kernel front
+    end can read it with `inspect.getsource` — and so a human can read it too.
     """
     import importlib.util
     import sys
@@ -961,26 +1052,32 @@ def compile_schedule(sch: Schedule, out_dir, lead: int = 8192, doc: str = ""):
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "generated_sequence.py"
-    path.write_text(generate_kernel_source(sch, lead=lead, doc=doc), encoding="utf-8")
+    stem = "generated_sequence" if core_index == 0 else f"generated_sequence_core{core_index}"
+    path = out_dir / f"{stem}.py"
+    path.write_text(generate_kernel_source(sch, lead=lead, doc=doc, core_index=core_index,
+                                           origin=origin), encoding="utf-8")
 
-    spec = importlib.util.spec_from_file_location("riscq_generated_sequence", path)
+    spec = importlib.util.spec_from_file_location(f"riscq_{stem}", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
 
     m = sch.core.m
+    events = [e for e in sch.events if e.channel // 3 == core_index]
     tables = {}
-    for ch in sorted({e.channel for e in sch.events}):
-        spl = m.channel(ch).samples_per_line
-        first = next(e for e in sch.events if e.channel == ch)
+    for ch in sorted({e.channel for e in events}):
+        local = ch % 3
+        spl = m.channel(local).samples_per_line
+        first = next(e for e in events if e.channel == ch)
         # the table should DESCRIBE the pulse: carry the real amplitude, not a placeholder, so the
         # value `init_pulse_params` loads is already the right one
-        name = "demod" if ch == 2 else f"ch{ch}"
-        tables[name] = ParamTable(ch, first.frequency,
+        name = "demod" if local == 2 else f"ch{local}"
+        tables[name] = ParamTable(local, first.frequency,
                                   {"p": Pulse(envelopes.square(spl), amp=first.amplitude)})
-    n_iq = sum(1 for e in sch.events if e.is_demod)
+    n_iq = sum(1 for e in events if e.is_demod)
     bindings = {"out": KArray(3 * n_iq)} if n_iq else {}
+    if origin is not None:
+        bindings["tele"] = KArray(3 + n_iq)
     return (compile_kernel(mod.k_sequence, m, tables=tables, **bindings), tables,
             envelope_images(sch), path)
 
@@ -988,39 +1085,123 @@ def compile_schedule(sch: Schedule, out_dir, lead: int = 8192, doc: str = ""):
 # ── the host runner: build -> compile -> upload -> run -> results ────────────────────────────────
 
 @dataclass
-class RunResult:
-    """Everything one run produced, in physical units where possible."""
-    schedule: Schedule
-    fs: float
+class CoreResult:
+    """What one hardware core produced: its raw trace (when it had an adc gate) and its IQ results."""
     trace: np.ndarray | None = None       # int32 ADC samples over the gate window (None: no gate)
     t: np.ndarray | None = None           # seconds, relative to the gate start
     gate_start_mu: int = 0
     res: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int32))   # hardware sign bits
     real: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))  # integrals
     imag: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    tele: np.ndarray | None = None        # multi-core runs: [t1, now entry, now armed, now after reads]
 
     @property
     def iq(self) -> np.ndarray:
         return self.real.astype(np.float64) + 1j * self.imag.astype(np.float64)
 
 
+@dataclass
+class RunResult:
+    """Everything one run produced, per hardware core (`cores[k]`), in physical units where possible.
+    `origin` is the batch-time origin t1 a multi-core run's kernels shared; `trace`/`t`/
+    `gate_start_mu`/`res`/`real`/`imag`/`iq` are core 0's (the whole result on a single-core build)."""
+    schedule: Schedule
+    fs: float
+    cores: dict[int, CoreResult] = field(default_factory=dict)
+    origin: int | None = None             # the shared t1 of a multi-core run (from the cores' telemetry)
+
+    def _core0(self) -> CoreResult:
+        return self.cores.get(0) or CoreResult()
+
+    @property
+    def trace(self): return self._core0().trace
+    @property
+    def t(self): return self._core0().t
+    @property
+    def gate_start_mu(self): return self._core0().gate_start_mu
+    @property
+    def res(self): return self._core0().res
+    @property
+    def real(self): return self._core0().real
+    @property
+    def imag(self): return self._core0().imag
+    @property
+    def iq(self): return self._core0().iq
+
+
+def _sdelta(a: int, b: int) -> int:
+    """a - b on the 32-bit batch clock, as the signed difference the hardware's due tests use."""
+    return (int(a) - int(b) + (1 << 31)) % _M32 - (1 << 31)
+
+
+def _check_telemetry(sch: Schedule, k: int, tele, origins: dict[int, int]) -> None:
+    """The loud checks on one core's `tele` (see generate_kernel_source): the origin it used is the
+    one every other core used, its first play was pushed >= LEAD batches before it was due, and every
+    play pushed after a halting readout still had its lead."""
+    tele = [int(v) & 0xFFFFFFFF for v in tele]
+    t1, now_entry, now_armed = tele[:3]
+    origins[k] = t1
+    if len(set(origins.values())) > 1:
+        raise RuntimeError(f"cores disagree on the run origin: {origins} — the run_origin latch is "
+                           "not shared, the run is invalid")
+    events = [e for e in sch.events if e.channel // 3 == k]
+    if not events:
+        return
+    first = min(e.batch for e in events)
+    slack = _sdelta(t1 + first, now_armed)
+    if not LEAD <= slack < (1 << 31):
+        raise RuntimeError(
+            f"core {k}: its first play (batch {first}) was pushed only {slack} batches before it was "
+            f"due (>= {LEAD} needed) — the reset-release lead does not cover this kernel's boot + "
+            "setup; the run is invalid")
+    if _sdelta(now_armed, now_entry) < 0:
+        raise RuntimeError(f"core {k}: telemetry out of order (entry {now_entry}, armed {now_armed})")
+    reads = [e for e in events if e.is_demod]
+    for j, d in enumerate(reads):
+        later = [e.batch for e in events if e.batch > d.batch]
+        if later:
+            slack = _sdelta(t1 + min(later), tele[3 + j])
+            if slack < LEAD:
+                raise RuntimeError(
+                    f"core {k}: after the readout at batch {d.batch} the next play (batch "
+                    f"{min(later)}) had only {slack} batches of lead left (>= {LEAD} needed)")
+
+
 def run(drv, core: Core, work_dir, doc: str = "", max_run: int | None = None) -> RunResult:
     """Plan, compile, upload and execute the recorded timeline; fetch what it measured.
 
     Replaces the hand-written experiment plumbing: rq.setup, the envelope images (including the
-    demod matched filter), the liveness gate on hardware, rerun with the results array, and the
-    robs trace read when an adc gate exists."""
+    demod matched filter), the liveness gate on hardware, rerun with the results arrays, and the
+    trace reads where adc gates exist. One kernel per hardware core. A multi-core run anchors every
+    core on the SoC's shared run origin (`run_origin()`: the batch time latched at the reset release
+    plus a fixed lead — the cores' own `now()` reads are up to ~2 batches apart, tens of degrees of
+    relative carrier phase) and checks each core's telemetry afterwards (same origin everywhere,
+    every play pushed with its lead)."""
     from riscq import run as rq
     from riscq.map import ADC_BATCH
 
     m = core.m
     sch = plan(core, max_run=max_run)
-    prog, tables, env_images, src = compile_schedule(sch, work_dir, doc=doc)
+    env_images = envelope_images(sch)
+    hw_cores = sorted({e.channel // 3 for e in sch.events} | {tg.core_index for tg in core.trace_gates})
+    if not hw_cores:
+        raise RuntimeError("nothing to run: the timeline has no pulses and no gates")
+    shared = len(hw_cores) > 1
+    if shared and not m.params.run_origin:
+        raise RuntimeError(
+            f"this timeline spans hardware cores {hw_cores} but the build has no shared run origin "
+            "(run_origin is off): the cores' own clock reads would skew the timeline — build with "
+            '"run_origin": true')
+    origin = "run_origin()" if shared else None
+    progs = {}
+    for k in hw_cores:
+        progs[k], _tables, _imgs, _src = compile_schedule(sch, work_dir, doc=doc, core_index=k,
+                                                          origin=origin)
     total = max((e.batch + e.dur_batches) for e in sch.events) if sch.events else 0
 
-    rq.setup(drv, m, {0: prog})
+    rq.setup(drv, m, progs)
     for ch, img in env_images.items():
-        rq.write_envelope(drv, m, 0, ch, 0, img)
+        rq.write_envelope(drv, m, ch // 3, ch % 3, 0, img)
 
     if not hasattr(drv, "sim"):           # hardware only: never touch a dead dsp domain
         import time
@@ -1031,22 +1212,27 @@ def run(drv, core: Core, work_dir, doc: str = "", max_run: int | None = None) ->
             raise RuntimeError(f"liveness gate FAILED (hostAlive {h0:#x}->{h1:#x}, "
                                f"dspAlive {d0:#x}->{d1:#x}) — not touching the dsp domain")
 
-    n_iq = sum(1 for e in sch.events if e.is_demod)
-    results = rq.rerun(drv, m, {0: prog}, results=(["out"] if n_iq else None),
-                       timeout=(total + 20000) * 4 + 20_000_000)
+    results = rq.rerun(drv, m, progs, timeout=(total + 20000) * 4 + 20_000_000)
 
     out = RunResult(schedule=sch, fs=ADC_BATCH * m.params.dsp_freq_hz)
-    if n_iq:
-        raw = np.asarray(results[0]["out"], dtype=np.int64)
-        out.res, out.real, out.imag = (raw[0::3].astype(np.int32), raw[1::3], raw[2::3])
+    origins: dict[int, int] = {}
+    for k in hw_cores:
+        cr = out.cores[k] = CoreResult()
+        if shared:
+            cr.tele = np.asarray(results[k]["tele"], dtype=np.int64) & 0xFFFFFFFF
+            _check_telemetry(sch, k, cr.tele, origins)
+            out.origin = origins[k]
+        if "out" in results[k]:
+            raw = np.asarray(results[k]["out"], dtype=np.int64)
+            cr.res, cr.real, cr.imag = (raw[0::3].astype(np.int32), raw[1::3], raw[2::3])
 
-    if core.trace_gates:
-        tg = core.trace_gates[0]
-        nbytes, chunk, parts = 16 * tg.batches, 128 * 1024, []
+    for tg in core.trace_gates:
+        cr = out.cores[tg.core_index]
+        nbytes, chunk, parts = (m.rob_width // 8) * tg.batches, 128 * 1024, []
         for off in range(0, nbytes, chunk):
-            parts.append(drv.read_block(m.robs() + off, min(chunk, nbytes - off)))
-        out.trace = np.frombuffer(b"".join(parts), dtype="<i4").astype(np.int32)
-        out.t = np.arange(out.trace.size) / out.fs
-        out.gate_start_mu = tg.batch0 * 16
+            parts.append(drv.read_block(m.robs(tg.core_index) + off, min(chunk, nbytes - off)))
+        cr.trace = np.frombuffer(b"".join(parts), dtype=m.rob_dtype).astype(np.int32)
+        cr.t = np.arange(cr.trace.size) / out.fs
+        cr.gate_start_mu = tg.batch0 * 16
     core.last_result = out
     return out

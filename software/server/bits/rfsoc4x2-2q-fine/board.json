@@ -1,0 +1,18 @@
+{
+  "lmk_freq": 245.76,
+  "lmx_freq": 491.52,
+  "adc_nyquist": 1,
+  "dac_nyquist": {
+    "default": 1
+  },
+  "dac_current": {},
+  "mts": {
+    "daclatency": 260,
+    "adclatency": 88,
+    "dac_tiles": 5,
+    "adc_tiles": 4,
+    "ref_tile": 2,
+    "required": true
+  },
+  "fclk0_mhz": 96.968727
+}

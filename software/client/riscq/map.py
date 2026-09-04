@@ -115,6 +115,16 @@ class SocParams:
     # the core's demod ADC. Held as tuples (a frozen dataclass must stay hashable).
     dac_map: tuple | None = None
     adc_map: tuple | None = None
+    # Raw-ADC trace layout (PulseTableSoc.robPerCore). False = the upstream ONE shared trace: it records
+    # while ANY core's readout drive fires and stores the 32-bit per-lane SUM of every mapped ADC. True =
+    # one trace PER CORE (that core's readout-drive fire, that core's mapped ADC, 16-bit lanes), each at
+    # robs(core). Software derives the lane width and the per-core windows from this.
+    rob_per_core: bool = False
+    # Shared run origin (PulseTableSoc.runOrigin): at every reset release the SoC latches
+    # time + RUN_ORIGIN_LEAD into a register every core reads at CTRL_RUN_ORIGIN, so a multi-core kernel
+    # set shares ONE exact t1 (the cores' own now() reads differ by their boot skew); the same builds
+    # make the core's wait_until compare wrap-safe (signed difference).
+    run_origin: bool = False
 
     @classmethod
     def load(cls, json_path: str | Path) -> "SocParams":
@@ -138,6 +148,8 @@ class SocParams:
             raise ValueError(f"freq_width must be 16 or 32, got {raw['freq_width']}")
         dac_map = raw.pop("dac_map", None)  # optional converter maps: kept (the channel-role mapping — the
         adc_map = raw.pop("adc_map", None)  # co-sim model needs them), unlike the hardware-only knobs below
+        rob_per_core = bool(raw.pop("rob_per_core", False))
+        run_origin = bool(raw.pop("run_origin", False))
         raw.setdefault("queue_depth", 4)    # TimedQueue depth; the planner bounds queued plays with it
         unknown = set(raw) - set(_FIELDS)
         if unknown:
@@ -150,6 +162,8 @@ class SocParams:
             kwargs["dac_map"] = tuple(tuple(int(x) for x in row) for row in dac_map)
         if adc_map is not None:
             kwargs["adc_map"] = tuple(int(x) for x in adc_map)
+        kwargs["rob_per_core"] = rob_per_core
+        kwargs["run_origin"] = run_origin
         return cls(**kwargs)
 
     def to_json(self) -> str:
@@ -158,6 +172,10 @@ class SocParams:
             out["dac_map"] = [list(row) for row in self.dac_map]
         if self.adc_map is not None:
             out["adc_map"] = list(self.adc_map)
+        if self.rob_per_core:
+            out["rob_per_core"] = True
+        if self.run_origin:
+            out["run_origin"] = True
         return json.dumps(out, indent=4)
 
 
@@ -166,7 +184,8 @@ class MapEntry:
     """One host-AXI window, for the generated contract test. kind:
     ram_rw (core RAM, host R/W), env_gate (via 512/gate_interp-bit WidthAdapter, R/W),
     env_ro (direct 32-bit, R/W), env_demod (demod-carrier bank, direct 32-bit at interp 4, R/W),
-    robs_ro (shared trace BRAM, read-only for software), ctrl_wo (host control block, write-only)."""
+    robs_ro (a trace BRAM — the shared one, or one per core on a rob_per_core build — read-only for
+    software), ctrl_wo (host control block, write-only)."""
 
     name: str
     host_addr: int
@@ -200,6 +219,8 @@ class SocMap:
     CTRL_FROM_HOST = 0x2000
     CTRL_TIME_CMP = 0x4000
     CTRL_WAIT_TIME_CMP = 0x4008     # read HALTS until time + 3 >= timeCmp
+    CTRL_RUN_ORIGIN = 0x4010        # run_origin builds: the batch time latched at the reset release +
+    #                                 RUN_ORIGIN_LEAD, identical on every core (a multi-core run's t1)
     CTRL_RES = 0x4200               # read HALTS until the armed readout completes
     CTRL_REAL = 0x4204
     CTRL_IMAG = 0x4208
@@ -236,7 +257,11 @@ class SocMap:
         self.gate_env_width = env_width // p.gate_interp   # bits per stored gate-envelope line
         self.ro_env_width = env_width // p.readout_interp  # bits per stored readout-envelope line
         self.demod_env_width = demod_full // p.demod_interp  # bits per stored demod-carrier line (32 at 4)
-        self.rob_width = ADC_BATCH * 32
+        # trace line: 4 lanes of the ADC's 16-bit samples (per-core trace, one ADC) or of the 32-bit
+        # per-lane sum over the mapped ADCs (the shared trace); read back as rob_dtype
+        self.rob_lane_bits = DATA_WIDTH if p.rob_per_core else 32
+        self.rob_dtype = "<i2" if p.rob_per_core else "<i4"
+        self.rob_width = ADC_BATCH * self.rob_lane_bits
 
         # envelope grid: stored samples per RAM line (= per batch), each held x interp at the converter
         self.gate_samples_per_line = BATCH_SIZE // p.gate_interp     # 4 at gateInterp 4
@@ -288,8 +313,13 @@ class SocMap:
     def demod_env(self, core: int) -> int:
         return self.demod_env_base + self._core(core) * self.demod_env_stride
 
-    def robs(self) -> int:
-        """The ONE shared readout trace BRAM (not per-core)."""
+    def robs(self, core: int = 0) -> int:
+        """Host base of the raw-ADC trace BRAM: `core`'s own on a rob_per_core build (rob_bytes each,
+        rob_stride apart), else the ONE shared trace at the region base (`core` must be 0)."""
+        if self.params.rob_per_core:
+            return self.rob_base + self._core(core) * self.rob_stride
+        if core != 0:
+            raise ValueError(f"this build has ONE shared trace (rob_per_core is off), not a trace for core {core}")
         return self.rob_base
 
     # ── per-core logical RF channel table (spec 02 §3.2) ──
@@ -373,7 +403,11 @@ class SocMap:
             out.append(MapEntry(f"core{c}_gate_env", self.gate_env(c), self.gate_env_bytes, "env_gate"))
             out.append(MapEntry(f"core{c}_ro_env", self.ro_env(c), self.ro_env_bytes, "env_ro"))
             out.append(MapEntry(f"core{c}_demod_env", self.demod_env(c), self.demod_env_bytes, "env_demod"))
-        out.append(MapEntry("robs", self.robs(), self.rob_bytes, "robs_ro"))
+        if self.params.rob_per_core:
+            for c in range(self.params.qubit_num):
+                out.append(MapEntry(f"core{c}_robs", self.robs(c), self.rob_bytes, "robs_ro"))
+        else:
+            out.append(MapEntry("robs", self.robs(), self.rob_bytes, "robs_ro"))
         out.append(MapEntry("host_ctrl", self.host_ctrl, 0x48, "ctrl_wo"))
         return out
 
@@ -386,6 +420,7 @@ class SocMap:
             ("RQ_CTRL_FROM_HOST", self.CTRL_FROM_HOST),
             ("RQ_CTRL_TIME_CMP", self.CTRL_TIME_CMP),
             ("RQ_CTRL_WAIT_TIME_CMP", self.CTRL_WAIT_TIME_CMP),
+            ("RQ_CTRL_RUN_ORIGIN", self.CTRL_RUN_ORIGIN),
             ("RQ_CTRL_RES", self.CTRL_RES), ("RQ_CTRL_REAL", self.CTRL_REAL),
             ("RQ_CTRL_IMAG", self.CTRL_IMAG), ("RQ_CTRL_TIME", self.CTRL_TIME),
             ("RQ_GATE", self.RF_GATE), ("RQ_READOUT", self.RF_READOUT),

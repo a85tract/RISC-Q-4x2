@@ -81,6 +81,17 @@ case class PulseTableSoc(
                                         // stages and +2 DSP48E2 per carrier.
     adcPipe: Int = 3,                   // C2: register stages on the ADC nets off the RFDC edge
     dspFreqHz: Long = 500000000L,       // FREQ_HZ tag on dspClk in vivado mode (491.52 MHz on the 4x2)
+    // Raw-ADC trace layout. false (upstream): ONE shared trace that records while ANY core's readout
+    // drive fires and stores the 32-bit per-lane SUM of every mapped ADC. true: one trace PER CORE at
+    // SocMemoryMap.readoutBufOffset(core), recording that core's own mapped ADC while that core's
+    // readout drive fires, lanes stored as the ADC's 16-bit samples (exact for one ADC; half the BRAM).
+    robPerCore: Boolean = false,
+    // Shared run origin: at every reset release latch time + runOriginLead into one register every core
+    // reads at CTRL 0x4010 (TimeMemMap), and make the cores' wait_until compare wrap-safe. A multi-core
+    // kernel set anchors on it instead of on each core's own now() (boot skew <= ~2 batches = 60 deg of
+    // relative carrier phase at 82 MHz). Off = the upstream RTL, byte for byte.
+    runOrigin: Boolean = false,
+    runOriginLead: Int = 8192,
 ) extends Zcu216Top(dacNum = dacNum, adcNum = adcNum, dacBatch = 16, adcBatch = 4, dataWidth = 16, vivado = vivado,
     dspFreqHz = dspFreqHz) {
   val N        = 16    // DAC drive batch
@@ -91,7 +102,8 @@ case class PulseTableSoc(
   val readoutEnvWidth = envWidth / readoutInterp  // interpolated readout-drive envelope line (32 at 16)
   val gateEnvWidth    = envWidth / gateInterp     // interpolated gate-drive envelope line (128 at 4)
   val demodEnvWidth   = demodEnvFull / demodInterp // interpolated demod-carrier envelope line (32 at 4)
-  val robWidth = adcBatch * 32       // 4 readout lanes × 32-bit (no overflow summing ≤16 ADCs)
+  val robLaneBits = if (robPerCore) w else 32   // per-core trace: one ADC, its 16-bit samples as they are
+  val robWidth = adcBatch * robLaneBits         // shared trace: 4 lanes × 32-bit (no overflow summing ≤16 ADCs)
 
   // ── host AXI → Tilelink ── blockSize ≥ the widest full-word transfer (the robs WidthAdapter's
   // 128-bit / 16-byte line); each fiber's decoder restricts the size down to what it supports. The
@@ -141,11 +153,18 @@ case class PulseTableSoc(
   val robBanks = if (robDepth > robBankDepth) robDepth / robBankDepth else 1
   require(robDepth % robBanks == 0 && (robBanks == 1 || robDepth / robBanks == robBankDepth),
     s"robDepth $robDepth must be a multiple of $robBankDepth when deeper than one bank")
-  val robs = BramFiber(robBanks, robWidth, robDepth / robBanks, hostCd, dspCd, withOutReg = true)
+  // One trace per core (`robPerCore`) at SocMemoryMap.readoutBufOffset(core), or the ONE shared trace at
+  // the region base (the upstream layout, unchanged: `robs` keeps its name and its whole-region window).
+  val robs = List.tabulate(if (robPerCore) qubitNum else 1) { i =>
+    BramFiber(robBanks, robWidth, robDepth / robBanks, hostCd, dspCd, withOutReg = true)
+      .setName(if (robPerCore) s"robs_$i" else "robs")
+  }
   val robAdapter = WidthAdapter()
   robAdapter.up at SizeMapping(map.readoutBufBase, map.regionSize) of hostBus
-  robs.up at SizeMapping(0, map.regionSize) of robAdapter.down
-  robs.up.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
+  for ((rb, i) <- robs.zipWithIndex) {
+    rb.up at SizeMapping(i * map.readoutStride, if (robPerCore) map.readoutStride else map.regionSize) of robAdapter.down
+    rb.up.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
+  }
 
   // ── reset/control crossing into the dsp/riscq domain ──
   val riscqReset = Bool()
@@ -179,6 +198,14 @@ case class PulseTableSoc(
       t
     }
 
+    // the shared run origin (see `runOrigin`): latched on the reset RELEASE edge the cores boot from
+    val runOriginReg = runOrigin generate new Area {
+      val resetLast = RegNext(riscqReset) init True
+      val value     = Reg(UInt(32 bits)) init 0
+      when(resetLast && !riscqReset) { value := time + runOriginLead }
+      value.addAttribute("MAX_FANOUT", 16)
+    }
+
     val cp = coreParam.copy(
       fetchPcWidth = Some(log2Up(memDepth) + 2),
       fetchLatency = 4)
@@ -192,7 +219,8 @@ case class PulseTableSoc(
         // so all existing builds are bit-identical.
         readoutInterp = readoutInterp, gateInterp = gateInterp, demodInterp = demodInterp,
         linkPipe = linkPipe, withTestTap = withTest, memDepth = memDepth, gatePulseNum = gatePulseNum,
-        queueDepth = queueDepth))
+        queueDepth = queueDepth,
+        runOrigin = if (runOrigin) Some(runOriginReg.value) else None, signedWait = runOrigin))
 
     // floorplan: keep each core's RiscvSoc a hard synth boundary so opt can't merge logic across the
     // identical cores into a MUXF7/F8 macro that straddles two per-core pblocks. The shared host AXI fans
@@ -279,37 +307,57 @@ case class PulseTableSoc(
       (riscqCores(coreId).adc zip adcBufs(adcId)).foreach { case (o, i) => o.re := i; o.im := 0 }
     }
 
-    // ── readout trace into robs on any drive-pulse fire ──
-    val anyPulseValid = riscqCores.map(_.readoutPulse.valid).reduceBalancedTree(_ | _, (s, _) => RegNext(s))
-    val fire   = RegNext(anyPulseValid)
-    val rbAddr = Reg(UInt(log2Up(robDepth) bits))
-    when(fire)(rbAddr := rbAddr + 1).otherwise(rbAddr := 0)
+    // ── readout trace(s) into robs on readout-drive fires ──
+    // The ONE shared trace (upstream layout, robPerCore = false): any core's fire, the 32-bit per-lane
+    // sum of every mapped ADC (a postfix-less Composite keeps the upstream signal names; the one Verilog
+    // change against upstream is the write-enable stage fixed below). Per-core traces (robPerCore):
+    // trace i records core i's mapped ADC while core i's readout drive fires, lanes stored as the ADC's
+    // 16-bit samples. Fire and data are registered once in both layouts (a single ADC needs no adder
+    // tree), so a trace sample sits at the same offset from its pulse as in the 1-core builds.
+    for ((rb, i) <- robs.zipWithIndex) new Composite(this, if (robPerCore) s"trace$i" else null) {
+      val cores  = if (robPerCore) List(i) else riscqCores.indices.toList
+      val adcIds = if (robPerCore) List(adcMap(i)) else mappedAdcIds
+      val anyPulseValid = cores.map(riscqCores(_).readoutPulse.valid).reduceBalancedTree(_ | _, (s, _) => RegNext(s))
+      val fire   = RegNext(anyPulseValid)
+      val rbAddr = Reg(UInt(log2Up(robDepth) bits))
+      when(fire)(rbAddr := rbAddr + 1).otherwise(rbAddr := 0)
 
-    // robs: per-lane sum of the MAPPED ADC inputs (a 32-bit-per-lane integrated trace).
-    val adcSum = Vec.tabulate(adcBatch)(k => RegNext(AdderTree(mappedAdcIds.map(id => adcBufs(id)(k)), 32)))
-    if (robBanks == 1) {
-      val rb0 = robs.rams(0).fastPort
-      rb0.enable := True; rb0.mask.setAllTo(True)
-      rb0.address := RegNext(rbAddr); rb0.write := fire
-      rb0.wdata   := Vec(adcSum).asBits
-    } else {
-      // Banked write (see `robBanks` above). The bank select, the in-bank address, the data and the
-      // write enable all take ONE extra register stage TOGETHER, so their pairing is unchanged and
-      // only the write instant shifts by a cycle. Registering the one-hot decode (rather than
-      // driving `robBanks` write-enable cones off a combinational compare at 491.52 MHz) is the
-      // topology the dev-line split-bank capture closed timing with.
-      val addrQ = RegNext(rbAddr)
-      val lowW  = log2Up(robDepth / robBanks)
-      val wrLow  = RegNext(addrQ(0, lowW bits))
-      val wrOh   = RegNext(UIntToOh(addrQ(lowW, log2Up(robBanks) bits)))
-      val wrEn   = RegNext(fire)
-      val wrData = RegNext(Vec(adcSum).asBits)
-      for ((ram, i) <- robs.rams.zipWithIndex) {
-        val p = ram.fastPort
-        p.enable := True; p.mask.setAllTo(True)
-        p.address := wrLow
-        p.write   := wrEn && wrOh(i)
-        p.wdata   := wrData
+      // robs: per-lane sum of the MAPPED ADC inputs (a 32-bit-per-lane integrated trace), or the one
+      // mapped ADC's own 16-bit lanes (per-core trace).
+      val adcSum = Vec.tabulate(adcBatch)(k =>
+        if (robPerCore) RegNext(adcBufs(adcIds.head)(k))
+        else RegNext(AdderTree(adcIds.map(id => adcBufs(id)(k)), 32)))
+      // Write enable vs address: `rbAddr` is a register that starts counting one cycle AFTER `fire`
+      // rises (it shows k on the k-th fired batch only from the next cycle on), so the enable needs one
+      // register stage MORE than the address to pair address k with the k-th fired batch. Upstream's
+      // `write := fire` next to `address := RegNext(rbAddr)` wrote addresses 0, 0, 1, ..., N-2 for an
+      // N-batch fire and never the last one (found 2026-09-04 in co-sim: the final batch of every gate
+      // read back as the PREVIOUS run's sample). The data (adcSum = RegNext(adc)) keeps its pairing
+      // with the address, so the trace's sample-to-pulse offset is unchanged — only the last batch is
+      // now written too.
+      if (robBanks == 1) {
+        val rb0 = rb.rams(0).fastPort
+        rb0.enable := True; rb0.mask.setAllTo(True)
+        rb0.address := RegNext(rbAddr); rb0.write := RegNext(fire)
+        rb0.wdata   := Vec(adcSum).asBits
+      } else {
+        // Banked write (see `robBanks` above): the bank select, the in-bank address and the data take
+        // one extra register stage together, the write enable two (see above). Registering the one-hot
+        // decode (rather than driving `robBanks` write-enable cones off a combinational compare at
+        // 491.52 MHz) is the topology the dev-line split-bank capture closed timing with.
+        val addrQ = RegNext(rbAddr)
+        val lowW  = log2Up(robDepth / robBanks)
+        val wrLow  = RegNext(addrQ(0, lowW bits))
+        val wrOh   = RegNext(UIntToOh(addrQ(lowW, log2Up(robBanks) bits)))
+        val wrEn   = RegNext(RegNext(fire))
+        val wrData = RegNext(Vec(adcSum).asBits)
+        for ((ram, b) <- rb.rams.zipWithIndex) {
+          val p = ram.fastPort
+          p.enable := True; p.mask.setAllTo(True)
+          p.address := wrLow
+          p.write   := wrEn && wrOh(b)
+          p.wdata   := wrData
+        }
       }
     }
   }

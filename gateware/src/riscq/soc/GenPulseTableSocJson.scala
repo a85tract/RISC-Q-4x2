@@ -69,6 +69,11 @@ object GenPulseTableSocJson extends App {
     memDepth      = int("mem_depth"),
     envDepth      = int("env_depth"),
     robDepth      = intOr("rob_depth", 1024),
+    // one raw-ADC trace PER CORE (each core records its own mapped ADC while its readout drive fires,
+    // 16-bit lanes) instead of the upstream ONE shared trace (any core's fire, 32-bit per-lane ADC sum).
+    robPerCore    = boolOr("rob_per_core", false),
+    // shared run origin + wrap-safe wait_until (a multi-core timeline needs one exact t1 across cores)
+    runOrigin     = boolOr("run_origin", false),
     gatePulseNum  = int("gate_pulse_num"),
     // per-parameter TimedQueue depth (scheduled-ahead pulses per channel param); default 4. Hardware-only —
     // software addresses channels by slot count, not queue depth, so `riscq.map.SocParams` ignores it.

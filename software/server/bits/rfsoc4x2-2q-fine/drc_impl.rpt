@@ -1,0 +1,206 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+---------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2026.1 (win64) Build 6511674 Tue Jun 16 11:02:23 MDT 2026
+| Date         : Fri Sep  4 05:06:10 2026
+| Host         : DESKTOP-3LTHSS6 running 64-bit major release  (build 9200)
+| Command      : report_drc -file C:/riscq4x2/build/drc_t_impl_3.rpt
+| Design       : riscq_bd_wrapper
+| Device       : xczu48dr-ffvg1517-2-e
+| Speed File   : -2
+| Design State : Fully Routed
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+Report DRC
+
+Table of Contents
+-----------------
+1. REPORT SUMMARY
+2. REPORT DETAILS
+
+1. REPORT SUMMARY
+-----------------
+            Netlist: netlist
+          Floorplan: impl_3
+      Design limits: <entire design considered>
+           Ruledeck: default
+             Max checks: <unlimited>
+             Checks found: 30
++-----------+----------+------------------------------+--------+
+| Rule      | Severity | Description                  | Checks |
++-----------+----------+------------------------------+--------+
+| DPIP-2    | Warning  | Input pipelining             | 15     |
+| DPOP-3    | Warning  | PREG Output pipelining       | 11     |
+| DPOP-4    | Warning  | MREG Output pipelining       | 1      |
+| RTSTAT-10 | Warning  | No routable loads            | 1      |
+| REQP-1679 | Advisory | enum_MREG_0_connects_CEM_GND | 1      |
+| REQP-1680 | Advisory | enum_PREG_0_connects_CEP_GND | 1      |
++-----------+----------+------------------------------+--------+
+
+2. REPORT DETAILS
+-----------------
+DPIP-2#1 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg/A[29:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#2 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#3 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg/A[29:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#4 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#5 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg/A[29:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#6 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2 input riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2/A[29:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#7 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2 input riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#8 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_demodChannel/pg/carrierGen/_zz_timePhase_1_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_demodChannel/pg/carrierGen/_zz_timePhase_1_reg/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#9 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_gateChannel/pulseGenerator_6/carrierGen/_zz_timePhase_1_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_gateChannel/pulseGenerator_6/carrierGen/_zz_timePhase_1_reg/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#10 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg/A[29:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#11 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#12 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg/A[29:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#13 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg input riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLH_reg/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#14 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2 input riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2/A[29:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPIP-2#15 Warning
+Input pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2 input riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/_zz_MulPlugin_logic_mul_sum17_2/B[17:0] is not pipelined. Pipelining DSP48 input will improve performance.
+Related violations: <none>
+
+DPOP-3#1 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_demodChannel/pg/carrierGen/_zz_timePhase_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_demodChannel/pg/carrierGen/_zz_timePhase_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#2 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_gateChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_gateChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#3 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_gateChannel/pulseGenerator_6/envMuls_1/sre5_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_gateChannel/pulseGenerator_6/envMuls_1/sre5_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#4 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_roChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_roChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#5 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_roChannel/pulseGenerator_6/envMuls_4/sre5_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_0_posted_roChannel/pulseGenerator_6/envMuls_4/sre5_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#6 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#7 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#8 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_demodChannel/pg/carrierGen/_zz_timePhase_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_demodChannel/pg/carrierGen/_zz_timePhase_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#9 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_gateChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_gateChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#10 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_roChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_1_posted_roChannel/pulseGenerator_6/carrierGen/_zz_timePhase_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-3#11 Warning
+PREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg output riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppHH_reg/P[47:0] is not pipelined (PREG=0). Pipelining the DSP48 output will improve performance and often saves power so it is suggested whenever possible to fully pipeline this function.  If this DSP48 function was inferred, it is suggested to describe an additional register stage after this function.  If the DSP48 was instantiated in the design, it is suggested to set the PREG attribute to 1.
+Related violations: <none>
+
+DPOP-4#1 Warning
+MREG Output pipelining  
+DSP riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg multiplier stage riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg/P[47:0] is not pipelined (MREG=0). Pipelining the multiplier function will improve performance and will save significant power so it is suggested whenever possible to fully pipeline this function.  If this multiplier was inferred, it is suggested to describe an additional register stage after this function.  If there is no registered adder/accumulator following the multiply function, two pipeline stages are suggested to allow both the MREG and PREG registers to be used.  If the DSP48 was instantiated in the design, it is suggested to set both the MREG and PREG attributes to 1 when performing multiply functions.
+Related violations: <none>
+
+RTSTAT-10#1 Warning
+No routable loads  
+30 net(s) have no routable loads. The problem bus(es) and/or net(s) are riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC0[13],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC0[1],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC0[4],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC0[5],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC0[6],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC0[7],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC2[13],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC2[1],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC2[4],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC2[5],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC2[6],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/STATUS_ADC2[7],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/rx1_u_adc_0[13],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/rx1_u_adc_0[1],
+riscq_bd_i/rf_data_converter/inst/riscq_bd_rf_data_converter_0_rf_wrapper_i/rx1_u_adc_0[4]
+ (the first 15 of 30 listed).
+Related violations: <none>
+
+REQP-1679#1 Advisory
+enum_MREG_0_connects_CEM_GND  
+riscq_bd_i/top/inst/riscqArea_riscqCores_1_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg: When the DSP48E2 MREG attribute is set to 0, the CEM input pin should be tied to GND to save power.
+Related violations: <none>
+
+REQP-1680#1 Advisory
+enum_PREG_0_connects_CEP_GND  
+riscq_bd_i/top/inst/riscqArea_riscqCores_0_riscvSoc/riscqFiber_riscq/MulPlugin_logic_mul_ppLL_reg: When the DSP48E2 PREG attribute is set to 0, the CEP input pin should be tied to GND to save power.
+Related violations: <none>
+
+

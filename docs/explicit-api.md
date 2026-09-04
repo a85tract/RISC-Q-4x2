@@ -52,13 +52,20 @@ so wrap arms deliberately.
 * `A.DDSChannel(core, index, name=None)` — drive channel. `set(frequency, phase=0.0,
   amplitude=1.0, phase_mode=None)`, `set_phase_mode(phase_mode)`,
   `sw.pulse(duration)` / `sw.pulse_mu(duration_mu)`.
-  Index is validated (0 = gate, 1 = readout on this build); index 2 (the demod carrier) is
-  refused — use `DemodChannel`.
-* `A.ADCChannel(core, name="adc")` — `gate(duration)` / `gate_mu(duration_mu)` (records the
-  window, advances the cursor, returns the cursor), `fetch_trace()`.
-* `A.DemodChannel(core, name="demod")` — `set(frequency, phase=0.0, amplitude=1.0,
-  phase_mode=None)`, `set_phase_mode(phase_mode)`, `gate(duration)` / `gate_mu(duration_mu)`
-  (the integration window IS the readout; both return the cursor), `fetch_iq()`.
+  Index 2k = hardware core k's gate drive, 2k+1 its readout drive (0/1 on a one-core build);
+  the demod carrier is never a dds — use `DemodChannel`. `.core_index` is the hardware core.
+* `A.ADCChannel(core, index=0, name="adc")` — hardware core `index`'s raw trace (records while
+  dds 2·index+1 fires). `gate(duration)` / `gate_mu(duration_mu)` (records the window, advances
+  the cursor, returns the cursor), `fetch_trace()`. Refused on a multi-core build without
+  per-core traces (`rob_per_core` off).
+* `A.DemodChannel(core, index=0, name="demod")` — hardware core `index`'s IQ readout.
+  `set(frequency, phase=0.0, amplitude=1.0, phase_mode=None)`, `set_phase_mode(phase_mode)`,
+  `gate(duration)` / `gate_mu(duration_mu)` (the integration window IS the readout; both return
+  the cursor), `fetch_iq()`.
+
+Internally every event carries the flat id `3·core + local` (local 0 gate, 1 readout, 2 demod)
+— the plain 0/1/2 on a one-core build; `Schedule.events[i].channel` and the keys of
+`envelope_images()` use it.
 
 All limits and semantics are the same as through `artiq_compat` — see
 [hardware-contract.md](hardware-contract.md).
@@ -88,31 +95,44 @@ use), `env_lines` / `first_line` (envelope RAM layout).
 res = A.run(drv, core, work_dir, doc="", max_run=None)   # -> RunResult
 ```
 
-Plans, generates + compiles the kernel (into `work_dir`), writes the envelope images, executes,
-and reads everything back. `drv` is a co-sim driver (`riscq_sim.cosim.start(config, build)`)
-or a board driver (`riscq.driver.remote.RemoteDriver(host)` after `drv.board.load(bundle)`).
+Plans, generates + compiles one kernel per hardware core the timeline touches (into
+`work_dir`: `generated_sequence.py`, `generated_sequence_core1.py`, …), writes the envelope
+images, executes, and reads everything back. `drv` is a co-sim driver
+(`riscq_sim.cosim.start(config, build)`) or a board driver
+(`riscq.driver.remote.RemoteDriver(host)` after `drv.board.load(bundle)`). A timeline spanning
+several cores needs a `run_origin` build: the kernels then take their common origin t1 from the
+SoC's reset-release latch (`run_origin()`), report telemetry (`tele` = [t1, clock at entry, clock
+before the first play, clock after each halting readout]) and `run()` raises if the cores' origins
+differ or any play was pushed with less than `LEAD` batches to spare.
 `max_run` forces a smaller envelope-chunk size (diagnostics only; it applies to channels
 with mid-batch pulses — a channel without mid-batch pulses uses free-running chunks of up to
 65 535 batches regardless).
 
 ```python
 @dataclass
-class RunResult:
-    schedule: Schedule
-    fs: float                        # trace sample rate (1.96608 GS/s here)
-    trace: np.ndarray | None = None  # int32 ADC samples over the gate window (None: no gate)
+class CoreResult:                    # what one hardware core produced
+    trace: np.ndarray | None = None  # int32 ADC samples over its gate window (None: no gate)
     t: np.ndarray | None = None      # seconds, relative to the gate start
     gate_start_mu: int = 0
     res: np.ndarray = <empty>        # per demod gate, in order: hardware sign bits
     real: np.ndarray = <empty>       # 32-bit integrals
     imag: np.ndarray = <empty>
+    tele: np.ndarray | None = None   # multi-core runs: the telemetry words (see above)
     # .iq is a @property: real + 1j*imag
+
+@dataclass
+class RunResult:
+    schedule: Schedule
+    fs: float                        # trace sample rate (1.96608 GS/s here)
+    cores: dict[int, CoreResult]     # per hardware core
+    origin: int | None               # the shared t1 of a multi-core run (batches)
+    # trace / t / gate_start_mu / res / real / imag / iq: properties = cores[0]'s
 ```
 
 ## Legacy helper
 
-`A.fill_gaps(core, channel, amplitude=0.0) -> int` — manually make a channel fire
-continuously by filling the gaps BETWEEN its existing pulses with amplitude-0 pulses; returns
-how many it inserted. Superseded for capture purposes: `adc.gate()` inserts its fillers
+`A.fill_gaps(core, channel, amplitude=0.0) -> int` — manually make a dds channel (by its
+index) fire continuously by filling the gaps BETWEEN its existing pulses with amplitude-0
+pulses; returns how many it inserted. Superseded for capture purposes: `adc.gate()` inserts its fillers
 (including lead-in and tail) automatically; you only need `fill_gaps` if you manage recording
 without a gate.

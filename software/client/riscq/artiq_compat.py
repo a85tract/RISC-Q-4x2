@@ -46,6 +46,8 @@ WHAT IS AND IS NOT ARTIQ HERE (the honest contract):
     instead of silently serializing.
   * the device db is a RISC-Q device DB (types `board`/`cosim`/`dds`/`adc`/`demod`, plus
     string aliases), validated eagerly — not ARTIQ's `type=local/module/class` schema.
+    `dds` needs `channel` (2k = core k's gate drive, 2k+1 its readout drive); `adc` and `demod`
+    take an optional `channel` = the hardware core whose trace / IQ readout they are (default 0).
 """
 
 from __future__ import annotations
@@ -363,10 +365,10 @@ def _build_devices(db: dict, core: "_A.Core") -> dict:
                 devs[tn] = CoreDevice(core)
             elif entry["type"] == "dds":
                 devs[tn] = DDSDevice(_A.DDSChannel(core, int(entry["channel"]), tn))
-            elif entry["type"] == "adc":
-                devs[tn] = ADCDevice(_A.ADCChannel(core))
-            else:
-                devs[tn] = DemodDevice(_A.DemodChannel(core))
+            elif entry["type"] == "adc":     # "channel" = the hardware core whose trace this is
+                devs[tn] = ADCDevice(_A.ADCChannel(core, int(entry.get("channel", 0)), tn))
+            else:                            # "channel" = the hardware core whose IQ readout this is
+                devs[tn] = DemodDevice(_A.DemodChannel(core, int(entry.get("channel", 0)), tn))
         devs[name] = devs[tn]
     return devs
 
@@ -395,13 +397,17 @@ def record_experiment(exp_cls, device_db: dict, core: "_A.Core"):
 def run_experiment(exp_cls, device_db: dict, workdir: str | Path = "artiq_compat_work",
                    doc: str = ""):
     """The `artiq_run` role: record the experiment, execute it, then analyze. Returns the
-    experiment instance (RunResult at .last_result); analyze() runs only after a successful
-    hardware run."""
+    experiment instance (RunResult at .last_result; the board's bundle report — multi-tile sync
+    result and latencies, measured dsp clock, xsa hash — at .board_info, None in co-sim);
+    analyze() runs only after a successful hardware run."""
     db = _validate_db(device_db)
     drv, params_text, closer = _open_driver(db["core"])
     try:
         core = _A.Core(SocMap(SocParams.from_json(params_text)))
         exp = record_experiment(exp_cls, device_db, core)
+        # what the board reports about the loaded bundle (multi-tile sync result and per-tile
+        # latencies, the measured dsp clock, the xsa hash) — None in co-simulation
+        exp.board_info = drv.board.info() if hasattr(drv, "board") else None
         exp.last_result = _A.run(drv, core, workdir, doc=doc or exp_cls.__name__)
         exp.analyze()
         return exp

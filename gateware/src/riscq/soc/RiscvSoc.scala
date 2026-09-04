@@ -52,6 +52,10 @@ case class RiscvSoc(
     rfAddrWidth: Int = 18,
     // test harness: add a second master into the CPU data-bus decode (a sim drives it directly).
     withTestTap: Boolean = false,
+    // run_origin builds: an `origin` input (the SoC's reset-release time latch) read at CTRL 0x4010, and
+    // the wrap-safe signed wait_until compare. Off = the upstream Component, byte for byte.
+    runOrigin: Boolean = false,
+    signedWait: Boolean = false,
     // host-load master params (the BRAM slow-port image load). Must match what the parent's host fabric
     // presents to `iLoad` (source-id width included), so keep it a single shared definition.
     hostLoadM2s: tilelink.M2sParameters = RiscvSoc.defaultHostLoadM2s,
@@ -61,6 +65,7 @@ case class RiscvSoc(
 
   // ── IO boundary ──
   val time     = in  port UInt(timeWidth bits)        // shared batch-time broadcast
+  val origin   = runOrigin generate (in port UInt(timeWidth bits))   // shared run origin (run_origin builds)
   val cmd      = master port Flow(RfCmd(rfAddrWidth)) // posted RF writes (RfLinkBridge) → DSP
   val resultIn = slave  port Flow(ReadoutResult(readoutAccWidth)) // readout result ← DSP → sink
 
@@ -133,7 +138,9 @@ case class RiscvSoc(
   // ── control block: time (+ the core-local readout-result sink, added after the bridge) ──
   val memMapFiber = riscqCd(MemMapFiber(addressWidth = 22, dataWidth = 32))
   val ctrlTime    = riscqCd(getPipe(time, 1))
-  val timeMemMap  = TimeMemMap(ctrlTime); memMapFiber.addMapping(timeMemMap.mapping)
+  val timeMemMap  = TimeMemMap(ctrlTime, runOrigin = if (runOrigin) Some(riscqCd(getPipe(origin, 1))) else None,
+    signedWait = signedWait)
+  memMapFiber.addMapping(timeMemMap.mapping)
 
   // ── posted-link bridge + core-local readout-result sink (riscqCd) ──
   val posted = riscqCd { new Composite(this, "posted") {

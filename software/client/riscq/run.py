@@ -286,7 +286,8 @@ def write_envelope(drv, m: SocMap, core: int, channel: int, line0: int, lines) -
     drv.write_block(base + line0 * line_bytes, lines.tobytes())
 
 
-def read_robs(drv, m: SocMap, nbytes: int | None = None) -> np.ndarray:
-    """Diagnostic fetch of the shared readout trace BRAM (int32 lanes)."""
+def read_robs(drv, m: SocMap, nbytes: int | None = None, core: int = 0) -> np.ndarray:
+    """Diagnostic fetch of a raw-ADC trace BRAM as its lanes (int16 on a rob_per_core build — `core`'s
+    own trace — else the shared int32-lane trace)."""
     nbytes = m.rob_bytes if nbytes is None else nbytes
-    return np.frombuffer(drv.read_block(m.robs(), nbytes), dtype="<i4").copy()
+    return np.frombuffer(drv.read_block(m.robs(core), nbytes), dtype=m.rob_dtype).copy()

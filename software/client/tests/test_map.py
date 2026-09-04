@@ -189,3 +189,33 @@ def test_fixed_constants_rejected():
     raw["batch_size"] = 8
     with pytest.raises(ValueError, match="fixed by architecture"):
         SocParams.from_json(json.dumps(raw))
+
+
+def test_rob_per_core_layout():
+    """rfsoc4x2-2q-fine: one 16-bit-lane trace per core, rob_stride apart, mirroring PulseTableSoc's
+    robPerCore (robWidth = 4 x 16, BramFiber i at readoutBufOffset(i)); a shared-trace build keeps the
+    32-bit lanes and refuses a per-core address."""
+    import pytest
+
+    m = _map("rfsoc4x2-2q-fine")
+    assert m.params.rob_per_core and m.params.qubit_num == 2
+    assert (m.rob_lane_bits, m.rob_dtype, m.rob_width) == (16, "<i2", 64)
+    assert m.rob_bytes == 65536 * 8                              # 512 KiB per trace
+    assert m.rob_stride == 0x100000                              # pow2ceil(2 x 512 KiB)
+    assert m.region_size == 0x200000                             # pow2ceil(1 MiB x 2 cores)
+    assert m.robs(0) == m.rob_base and m.robs(1) == m.rob_base + m.rob_stride
+    entries = {e.name: e for e in m.entries()}
+    assert {n for n in entries if entries[n].kind == "robs_ro"} == {"core0_robs", "core1_robs"}
+    assert entries["core1_robs"].host_addr == m.robs(1) and entries["core1_robs"].nbytes == m.rob_bytes
+    assert m.params.run_origin and m.CTRL_RUN_ORIGIN == 0x4010
+    assert "#define RQ_CTRL_RUN_ORIGIN 0x4010" in m.gen_header()
+    assert SocParams.from_json(m.params.to_json()) == m.params   # both flags survive the round trip
+
+    one = _map("rfsoc4x2-1q-fine")
+    assert not one.params.rob_per_core and not one.params.run_origin
+    assert (one.rob_lane_bits, one.rob_dtype, one.rob_width) == (32, "<i4", 128)
+    assert one.robs() == one.robs(0) == one.rob_base
+    with pytest.raises(ValueError, match="ONE shared trace"):
+        one.robs(1)
+    assert "rob_per_core" not in one.params.to_json() and "run_origin" not in one.params.to_json()
+    assert not _map("sim-2q").params.rob_per_core

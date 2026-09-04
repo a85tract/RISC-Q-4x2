@@ -28,6 +28,10 @@ extern volatile uint32_t __rq_magic;    /* 0x52515121 "RQQ!" */
 
 /* ── time ── */
 static inline uint32_t now(void) { return RQ_MMIO(RQ_CTRL_TIME); }
+/* run_origin builds only: the batch time the SoC latched at the reset release, plus RQ_RUN_ORIGIN_LEAD
+ * batches — the SAME value on every core, so a multi-core kernel set anchors its schedule on it instead
+ * of on each core's own (boot-skewed) now(). */
+static inline uint32_t run_origin(void) { return RQ_MMIO(RQ_CTRL_RUN_ORIGIN); }
 static inline void wait_until(uint32_t t) {
     RQ_MMIO(RQ_CTRL_TIME_CMP) = t;
     /* Hazard fix (board-proven on the dev line): waitTimeCmp is RegNext(time + 3 < timeCmp), so a

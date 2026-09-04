@@ -62,7 +62,7 @@ The driver selects the floorplan + core retiming through two `inc/run.tcl` hooks
 ## Env knobs
 
 Handled by `build-riscvsoc-bd.sh`: `RISCQ_VIVADO_BIN`, `RISCQ_QUBITS` (14), `RISCQ_SKIP_GEN`,
-`RISCQ_PROJ_NAME` (`riscvsoc-bd`), `RISCQ_PLACE_DIRECTIVE` (`ExtraNetDelay_high`).
+`RISCQ_PROJ_NAME` (`riscvsoc-bd`), `RISCQ_PLACE_DIRECTIVE` (`ExtraNetDelay_high`). RFSoC 4x2 only: `RISCQ_DSPCLK` (`tile` = the MTS source tile's clk_dac2, the default; `mmcm` = LMK PL clock x4 through an MMCM, the RFSoC-MTS reference structure).
 
 Read by `pblocks-bd.tcl`: `RISCQ_ROW` (3), `RISCQ_PERROW` (3), `RISCQ_CONFINE`
 (`global`|`region`|`none`, default `global`), `RISCQ_BD_BASE` (`riscq_bd_i/top/inst`).

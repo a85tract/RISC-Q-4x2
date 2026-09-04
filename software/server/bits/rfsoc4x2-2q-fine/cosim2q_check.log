@@ -1,0 +1,26 @@
+[rfsoc4x2-2q-fine] co-sim up in 0 s; rob_per_core=True run_origin=True
+[2q_ionA] run 980 s; origin=None; tele={0: None}
+PASS A: core-0 ion-trap trace: 245760 samples, max |s| = 23586
+[2q_iso_ch1] run 973 s; origin=7989754; tele={0: [7989754, 7981635, 7981797], 1: [7989754, 7981635, 7981786]}
+PASS ISO: ch1 alone -> trace0 max |s| 11794 (one tone, no stale batch), trace1 max |s| 0 (silent DAC, must be 0 incl. the last batch)
+[2q_iso_ch3] run 992 s; origin=11678191; tele={0: [11678191, 11670072, 11670223], 1: [11678191, 11670072, 11670234]}
+PASS ISO: ch3 alone -> trace1 max |s| 11794 (one tone, no stale batch), trace0 max |s| 0 (silent DAC, must be 0 incl. the last batch)
+[2q_iso_tones] run 926 s; origin=15367378; tele={0: [15367378, 15359259, 15359421], 1: [15367378, 15359259, 15359414]}
+PASS ISO-3: distinct tones per trace: trace0 peak 81.999 MHz amp 11794, trace1 peak 80.221 MHz amp 5897 (ratio 0.500, want 0.5), trace1 onset 7.02 us (want 7)
+[2q_ext] run 462 s; origin=None; tele={0: None}
+PASS EXT: full-scale tone spans [-29484, 29484] codes (int16 lanes, both signs)
+[2q_depth] run 971 s; origin=None; tele={0: None}
+PASS DEP: 262144 samples (= 65536 batches x 4), sinusoid fit incl. the last batch: max residual 5 of amplitude 11793, last 4 samples [-11792, -11426, -10280, -8432]
+[2q_syncB] run 1796 s; origin=25962154; tele={0: [25962154, 25954035, 25954196], 1: [25962154, 25954055, 25954392, 25975979]}
+PASS B: same tone on ch1/ch3 (asymmetric kernels): tone windows identical, max diff 0 codes, max |s| 11794; origin 25962154
+[2q_syncB2] run 1626 s; origin=31685321; tele={0: [31685321, 31677202, 31677363], 1: [31685321, 31677222, 31677559, 31699146]}
+PASS B': half a turn on ch3 inverts its trace: max |t0 + t1| = 2 codes
+[2q_modes] run 972 s; origin=35636958; tele={0: [35636958, 35628839, 35629000], 1: [35636958, 35628839, 35629000]}
+PASS PM: ABSOLUTE hop + TRACKING->CONTINUOUS chain on both cores: identical, max diff 0; segment peaks 82.003 / 80.253 / 82.003 / 80.337 MHz (want 82 / 80.235 / 82 / 80.235)
+[2q_wrap0] run 1590 s; origin=41229564; tele={0: [41229564, 41221445, 41221606], 1: [41229564, 41221465, 41221802, 41243389]}
+[2q_wrap] run 1597 s; origin=4294959716; tele={0: [4294959716, 4294951597, 4294951758], 1: [4294959716, 4294951617, 4294951954, 6245]}
+PASS WRAP: origin 4294959716 (target 4294959296), horizon 14746 -> wrap CROSSED inside the run; traces identical, max diff 0; core-1 telemetry [4294959716, 4294951617, 4294951954, 6245]
+[rfsoc4x2-1q-fine] co-sim up in 1 s; rob_per_core=False run_origin=False
+[1q_ionA] run 886 s; origin=None; tele={0: None}
+PASS 1Q: 2q core-0 trace == 1q-fine trace within one 16-bit phase LSB: lengths 245760/245760, max diff 3 codes (<= 3), differing samples 57953
+COSIM2Q: PASS (11/11)

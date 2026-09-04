@@ -43,9 +43,12 @@ device_db = {
 exp = run_experiment(Rabi, device_db)              # compile, execute on the board, analyze
 ```
 
-The live end-to-end example is `../software/examples/artiq_api_demo.ipynb` (4 cells: the experiment class, the
-device db + run, and a point-by-point comparison of the captured waveform against
-`software/examples/reference/waveform_generator.py` — last live shot: 0.48 % residual, carrier phases ≤ 0.11°).
+The live end-to-end example is `../software/examples/artiq_api_demo.ipynb`, two experiments on the
+two-core `rfsoc4x2-2q-fine` bundle: (1) the reference two-pulse waveform on DAC_A, captured on
+ADC_A and compared point by point with `software/examples/reference/waveform_generator.py`;
+(2) four DDS channels on one timeline — both DACs playing together, ADC_A and ADC_B recording —
+showing how one `with parallel:` spans the two cores and how a phase difference between the DACs
+is programmed and measured.
 
 ## Where things run
 
@@ -64,9 +67,10 @@ device db + run, and a point-by-point comparison of the captured waveform agains
 
 ## Verification status
 
-The scripted pass/fail run is `software/examples/artiq_rx_demo.py` (`RX_DEMO: PASS` in co-sim
-and on the board; final logs kept with the project notes). The bench smoke test is
-`software/examples/loopback_check.py`: one tone on a drive channel, pass/fail on whether it reaches
-the readout ADC — run it first after cabling. Host-pure test suite: 290 tests across `software/client/tests/` (55 of them cover the
-ARTIQ layers: `test_artiqapi.py` + `test_artiq_compat.py`). The design notes and root-cause records (ARTIQ_API_PLAN.md, the project journal) are
-kept with the maintainer's project notes, outside this repository.
+The notebook is the live check: demo 1 fails loudly if the capture does not match the generator
+(a wrong cable pair looks like a dead board from software — check the connector mapping in
+`software/server/README.md` first). Host-pure test suite: `software/client/tests/` (the ARTIQ
+layers: `test_artiqapi.py` + `test_artiq_compat.py`, including the two-core planning, kernel
+splitting and telemetry checks). The co-sim and board verification records of each bundle are in
+its `software/server/bits/<bundle>/PROVENANCE.md`; the design notes and root-cause records (the
+project journal) are kept with the maintainer's project notes, outside this repository.
