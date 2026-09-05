@@ -58,13 +58,12 @@ cable on one loop gave 11 % and 0.5° — see the bundle's PROVENANCE.md for tha
    ```
    or use `device_db_cosim` from any script. The first start of a config generates the RTL and
    verilates it (a few minutes); then it is seconds.
-2. **You have an RFSoC 4x2**: flash the vendor PYNQ image, then from `software/server/`:
-   `./board_setup.sh xilinx@<board-ip>` and `ssh -t xilinx@<board-ip> '~/riscq-4x2/start_server.sh'`
-   (see [software/server/README.md](software/server/README.md)). For the demo notebook loop
-   DAC_A → ADC_A and DAC_B → ADC_B (the connector ↔ SoC-port mapping is in
-   [software/server/README.md](software/server/README.md)); its first demo doubles as the cable
-   check. Build the `client` image (RISC-V toolchain + Python) and run your experiments with the
-   device dbs in `software/examples/configs/`.
+2. **You have an RFSoC 4x2**: follow [docs/bring-up.md](docs/bring-up.md) — the PYNQ 3.0.1
+   image, `software/server/board_setup.sh xilinx@<board-ip>` + `start_server.sh`, how a bundle
+   load programs the FPGA, the `client` image (RISC-V toolchain + Python), the loopback wiring
+   (DAC_A → ADC_A, DAC_B → ADC_B) and the notebook run with its expected numbers, plus the
+   pitfalls we have met. Then run your experiments with the device dbs in
+   `software/examples/configs/`.
 3. **You want to change the gateware**: `gateware/` — Vivado 2024.1+ and the
    `vivado-scripts/riscvsoc-bd` flow (`RISCQ_BOARD=rfsoc4x2`, default config
    `configs/rfsoc4x2-1q-fine.json`), ~35 min a build; the co-sim

@@ -5,6 +5,7 @@ would for ARTIQ; RISC-Q's own scheduler, kernel compiler and firmware run undern
 
 | document | what it covers |
 |---|---|
+| [bring-up.md](bring-up.md) | **first day with a board**: image, server install, how the FPGA gets programmed (bundles), client setup, wiring, running the demo notebook, the pitfalls we have met |
 | [artiq-interface.md](artiq-interface.md) | **the layer you normally use**: `EnvExperiment`, `@kernel`, `device_db`, `run_experiment`, the devices (`dds` / `adc` / `demod`) — every call, signature and error |
 | [explicit-api.md](explicit-api.md) | the lower `riscq.artiqapi` layer (explicit `Core` object): building timelines without the experiment class, `plan()` reports, `run()`, `RunResult` |
 | [hardware-contract.md](hardware-contract.md) | what is exact and what is snapped: time grids, phase modes, the recording rules, scheduling limits, and every planner error you can hit |
