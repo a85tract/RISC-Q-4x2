@@ -7,7 +7,10 @@ driver, same board) — and stay unverified until M6 hardware bring-up (spec 10 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import struct
+import time
 from pathlib import Path
 
 import pynq
@@ -32,9 +35,51 @@ BOARD_DEFAULTS = {
     "mts": {"daclatency": 260, "adclatency": 60, "dac_tiles": 0xF, "adc_tiles": 0xF,
             "ref_tile": 2, "required": False},
     "fclk0_mhz": None,                              # pin pynq Clocks.fclk0_mhz after download (RFSoC 4x2: 100)
+    # a bundle's own LMX2594 register list (xrfclk TICS format, R112..R0; the server resolves the file
+    # to the ints): programmed into BOTH LMXs after xrfclk's defaults. The 4x2 MTS bundle uses it for
+    # the LMX's phase-SYNC mode (VCO_PHASE_SYNC = 1, N / IncludedDivide): measured 2026-09-04, without
+    # it a full clock (re)programming lands the DAC->ADC timing in one of two states 25-60 ps apart,
+    # with it the state repeats within 3 ps (docs/hardware-contract.md, "Clocks and re-locks")
+    "lmx_regs": None,
 }
 
-_refclks_done = False    # LMK/LMX setup runs once per server process, not per load (spec 10 §3.2)
+_refclks_state = None    # (lmk, lmx, {lmx name: sha of its programmed list, None = xrfclk's}) as last
+                         # programmed — once per server process, not per load (spec 10 §3.2); a load
+                         # reprograms only when the bundle wants something else. None while unknown.
+
+
+def _lmx_spidevs() -> dict[str, str]:
+    """{device-tree name: /dev/spidevB.C} of the LMX2594s (RFSoC 4x2: lmxdac = spi0.1, lmxadc = spi0.2);
+    xrfclk has bound spidev to them by the time this runs."""
+    out = {}
+    for dev in Path("/sys/bus/spi/devices").glob("*"):
+        node = dev / "of_node"
+        if (node / "compatible").read_bytes().rstrip(b"\0") != b"ti,lmx2594":
+            continue
+        name = (node / "name").read_bytes().rstrip(b"\0").decode()
+        out[name] = "/dev/" + next((dev / "spidev").iterdir()).name
+    if set(out) != {"lmxdac", "lmxadc"}:
+        raise RuntimeError(f"expected the RFSoC 4x2's two LMX2594s (lmxdac, lmxadc) on SPI, found {sorted(out)}")
+    return out
+
+
+def _write_lmx(spidev: str, regs) -> None:
+    """Program one LMX2594 with the datasheet's sequence (SNAS696C 7.5.1): RESET on, RESET off, every
+    register R112 -> R0 as listed, 10 ms, then R0 again (FCAL_EN runs the VCO calibration). 24-bit
+    frames, as xrfclk writes them."""
+    regs = [int(v) & 0xFFFFFF for v in regs]
+    assert len(regs) == 113 and regs[0] >> 16 == 112 and regs[-1] >> 16 == 0, "expect R112..R0"
+    with open(spidev, "rb+", buffering=0) as f:
+        for v in (0x000002, 0x000000, *regs):
+            f.write(struct.pack(">I", v)[1:])
+        time.sleep(0.01)
+        f.write(struct.pack(">I", regs[-1])[1:])
+
+
+def _regs_sha(regs) -> str | None:
+    if not regs:
+        return None
+    return hashlib.sha256(",".join(str(int(v)) for v in regs).encode()).hexdigest()
 
 
 class PynqDriver:
@@ -57,10 +102,16 @@ class PynqDriver:
         cfg = {**BOARD_DEFAULTS, **(board or {})}
         self.params_text = Path(params_json).read_text()
 
-        global _refclks_done
-        if not _refclks_done:
-            self.refclks(cfg["lmk_freq"], cfg["lmx_freq"])
-            _refclks_done = True
+        # a load guarantees the clock state the bundle was validated with: program when this process
+        # has not yet, or when what is programmed (frequencies, or either LMX's list) differs from the
+        # bundle's. lmx_program() records what it programmed per LMX, so one LMX re-locked with the
+        # bundle's own list survives a load (the re-lock experiment relies on that) and one re-locked
+        # with another list is restored.
+        sha = _regs_sha(cfg["lmx_regs"])
+        if (_refclks_state is None or _refclks_state[:2] != (cfg["lmk_freq"], cfg["lmx_freq"])
+                or any(v != sha for v in _refclks_state[2].values())):
+            self.refclks(cfg["lmk_freq"], cfg["lmx_freq"], cfg["lmx_regs"])
+        self.refclks_state = _refclks_state
         log.info(f"loading overlay: {xsa}")
         self.overlay = pynq.Overlay(str(xsa), download=download)
         if cfg["fclk0_mhz"]:
@@ -149,12 +200,42 @@ class PynqDriver:
 
     # ── RFDC ops, reproduced verbatim from the references (spec 10 §3.3 / §7) ──
 
-    def refclks(self, lmk_freq: float, lmx_freq: float | None = None) -> None:
+    def refclks(self, lmk_freq: float, lmx_freq: float | None = None, lmx_regs=None) -> None:
+        """Program the LMK and both LMXs from xrfclk's files, then — given `lmx_regs`, the ints of an
+        LMX2594 TICS list (R112 first) — every LMX again from that list with the datasheet sequence
+        (SNAS696C 7.5.1). Recorded in `refclks_state` (and info()). The bundle's board.json "lmx_regs"
+        and the re-lock experiment (software/examples/lmx_relock_check.py) both come through here."""
+        global _refclks_state
+        _refclks_state = self.refclks_state = None      # unknown until everything below has succeeded
         if lmx_freq is None:
             xrfclk.set_ref_clks(lmk_freq=lmk_freq)
         else:
             xrfclk.set_ref_clks(lmk_freq=lmk_freq, lmx_freq=lmx_freq)
-        log.info(f"ref clocks: lmk={lmk_freq} lmx={lmx_freq}")
+        devs = _lmx_spidevs()
+        if lmx_regs:
+            for name, dev in sorted(devs.items()):
+                _write_lmx(dev, lmx_regs)
+                log.info(f"{name} ({dev}): programmed the LMX list {_regs_sha(lmx_regs)[:12]}")
+        _refclks_state = self.refclks_state = (lmk_freq, lmx_freq, {n: _regs_sha(lmx_regs) for n in devs})
+        log.info(f"ref clocks: {self.refclks_state}")
+
+    def lmx_program(self, which: str, regs=None) -> str:
+        """Diagnostic: reprogram ONE LMX (`lmxdac` / `lmxadc`) from `regs` (None: xrfclk's own list for
+        the current lmx_freq), the LMK and the other LMX untouched — the clock-phase repeatability
+        experiment. Reload the bundle afterwards: the tiles lost their refclk. Returns the spidev used."""
+        global _refclks_state
+        dev = _lmx_spidevs()[which]
+        if _refclks_state is None:
+            raise RuntimeError("the clocks have not been programmed in this process (load a bundle first)")
+        lmk_freq, lmx_freq, per_lmx = _refclks_state
+        if regs is None:
+            regs = xrfclk.xrfclk._Config["lmx2594"][float(lmx_freq)]
+        _refclks_state = self.refclks_state = None      # unknown while the SPI write is in flight
+        _write_lmx(dev, regs)
+        sha = None if regs is xrfclk.xrfclk._Config["lmx2594"][float(lmx_freq)] else _regs_sha(regs)
+        _refclks_state = self.refclks_state = (lmk_freq, lmx_freq, {**per_lmx, which: sha})
+        log.info(f"{which} ({dev}): reprogrammed alone -> {self.refclks_state}")
+        return dev
 
     def config_mts(self, daclatency: int = -1, adclatency: int = -1, dac_tiles: int = 0xF,
                    adc_tiles: int = 0xF, ref_tile: int = 2) -> None:
@@ -231,8 +312,13 @@ class PynqDriver:
                     if int(self.rfdc.adc_tiles[tile].blocks[block].NyquistZone) != n:
                         raise RuntimeError(f"ADC {tile},{block} Nyquist zone readback != {n}")
                     done.append(f"{tile},{block}")
-                except RuntimeError:
-                    raise
+                except RuntimeError as e:
+                    # the xrfdc wrapper raises RuntimeError for BOTH a failed call and an absent block
+                    # ("ADC 0 block 1 not available in XRFdc_SetNyquistZone": the 4x2's dual-ADC tiles
+                    # have blocks 0 and 2 only) — the absent block is skipped, anything else is loud
+                    if "not available" not in str(e):
+                        raise
+                    skipped.append(f"{tile},{block}")
                 except Exception:  # absent tile/block on partial-converter boards (RFSoC 4x2)
                     skipped.append(f"{tile},{block}")
         log.info(f"adc nyquist {n} set on {done}; absent blocks {skipped}")

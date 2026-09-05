@@ -704,15 +704,12 @@ def test_cz_amp_freq_sweep_seeds_the_argmax(responder):
     product the model runs, read through our 1-bit discriminator). The class's ONE compile, the
     both-lines `write_slot('amp')` pacing, the four `_cond_R` reruns per amp row, the 2D argmax and
     the CZ/freq + CZ/pulse write-back all run for real."""
-    from riscq.cal.base import sweep_q16
+    from riscq.cal.base import sweep_freq
     cfg = _drive_cfg()
     points, shots = 9, 400
     m = SocMap(SocParams.load(_SIM2Q))
     span = 3e6
-    lo = units._freq_code(25e6 - span, m.params)
-    hi = units._freq_code(25e6 + span, m.params)
-    _, _, xs = sweep_q16(lo, hi, points)
-    fax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
+    _, _, fax = sweep_freq(25e6 - span, 25e6 + span, points, m)   # the realized grid, this build's width
     f_star = float(fax[points // 2])                             # plant on a grid point
     r = responder(_SIM2Q)
 

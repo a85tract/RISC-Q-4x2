@@ -54,3 +54,11 @@ inverted), phase modes with a hop, the 32-bit batch-clock wrap inside a run, and
 within one 16-bit phase LSB. Run it inside the co-sim container (hours):
 
     cd /work/RISC-Q && PYTHONPATH=software/client:sim python sim/cosim2q_check.py [out_dir]
+
+`sim/cosim2q_queue.py` (a few minutes) is the proof of the kernel's queue barriers: 25 plays on one
+channel of a queue that holds 8, at the tightest spacing the planner admits, must all land (12 bursts
+at the right spacing in the trace). It is also how the planner's push budget (`PUSH_MARGIN`,
+`PUSH_COST`) was measured — at a period of 73 batches the kernel falls behind and the pushes arrive
+too late, visibly; 100 and up pass.
+
+    cd /work/RISC-Q && PYTHONPATH=software/client:sim python sim/cosim2q_queue.py [out_dir] [period]

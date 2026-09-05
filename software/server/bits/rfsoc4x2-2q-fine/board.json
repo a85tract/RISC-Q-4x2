@@ -14,5 +14,6 @@
     "ref_tile": 2,
     "required": true
   },
-  "fclk0_mhz": 96.968727
+  "fclk0_mhz": 96.968727,
+  "lmx_regs": "lmx2594-491.52-sync.txt"
 }

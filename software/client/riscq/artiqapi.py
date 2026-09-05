@@ -639,6 +639,73 @@ class Schedule:
         return "\n".join(out)
 
 
+POP_LATE = 3        # batches: a queue entry is out this long after its due batch (SrlShadow II=3; the
+                    # queue actually pops LEAD early, so this is conservative)
+PUSH_MARGIN = 300   # batches (0.61 us): a barrier's wait_until return plus that event's stores at the
+                    # 4x2's ~100 MHz CPU, before the play is in the queue
+PUSH_COST = 60      # batches (0.12 us): every further event's stores (set_freq .. play) while no wait holds
+                    # the kernel — the pace the kernel sustains pushing one play after another.
+                    # Both measured in co-sim (sim/cosim2q_queue.py, 25 plays on one channel at period P):
+                    # P = 73 (36.5 batches per play) FAILS — the kernel falls behind and pushes arrive
+                    # late; P = 100 (50 per play) and P = 121 PASS. The planner's model refuses P <= 115
+                    # and admits P = 121, i.e. it keeps ~15 % over what the RTL sustained.
+
+
+def _push_order(sch: "Schedule", core_index: int) -> list[tuple[int, int, int, int]]:
+    """Core `core_index`'s plays in the order its kernel pushes them — schedule order, an event's
+    chunks back to back: [(event index, chunk number, channel, due batch)]."""
+    out = []
+    for idx, e in enumerate(sch.events):
+        if e.channel // 3 != core_index:
+            continue
+        b = e.batch
+        for j, (_, nb) in enumerate(sch.chunks[idx]):
+            out.append((idx, j, e.channel, b))
+            b += nb
+    return out
+
+
+def _queue_barriers(sch: "Schedule", core_index: int) -> dict[tuple[int, int], int]:
+    """Where core `core_index`'s kernel must `wait_until` before a play push so that no channel's
+    TimedQueue ever holds more than `queue_depth` entries: {(event index, chunk number): batch}.
+
+    The push has no backpressure (an overfull queue silently drops entries), so before a channel's
+    (k+depth)-th event the kernel waits for the k-th play to have popped — its due batch plus POP_LATE
+    (the wait precedes the event's FIRST register write: set_freq / set_phase / set_amp / set_env /
+    set_dur are queue entries too, tagged with the channel's current start time, so they must not
+    be pushed into a full queue either). A barrier holds the whole core, and from then on the
+    planner tracks a lower bound of the kernel's clock — PUSH_MARGIN after a wait that waits,
+    PUSH_COST per further event — and refuses the schedule when a play would be pushed with less
+    than LEAD batches to its due."""
+    m = sch.core.m
+    depth = m.params.queue_depth
+    pushed: dict[int, list[int]] = {}
+    barriers: dict[tuple[int, int], int] = {}
+    clock = None                                   # lower bound of the kernel's clock, once a wait held it
+    last_bar = None
+    for idx, j, ch, due in _push_order(sch, core_index):
+        q = pushed.setdefault(ch, [])
+        if len(q) >= depth:
+            bar = q[-depth] + POP_LATE
+            barriers[(idx, j)] = bar               # ALWAYS emitted: the model's clock is only a lower
+            if clock is None or bar > clock:       # bound, a faster kernel still needs the wait (free
+                clock, last_bar = bar + PUSH_MARGIN, bar     # when the time has passed)
+            else:                                  # returns at once: just this event's stores
+                clock += PUSH_COST
+        elif clock is not None:
+            clock += PUSH_COST
+        if clock is not None and due - clock < LEAD:
+            raise RuntimeError(
+                f"{_label(ch, m)}: the play at batch {due} (event {idx}) can only be pushed after the "
+                f"queue entry from batch {last_bar - POP_LATE} pops (queue depth {depth}) and the pushes "
+                f"queued behind that wait, i.e. at about batch {clock}, which leaves it {due - clock} "
+                f"batches of lead (>= LEAD = {LEAD} needed; a wait costs PUSH_MARGIN = {PUSH_MARGIN}, "
+                f"every further event PUSH_COST = {PUSH_COST}); space the events — no {depth + 1} plays "
+                f"of one channel within {LEAD + PUSH_MARGIN + POP_LATE} batches — or split the run")
+        q.append(due)
+    return barriers
+
+
 def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Schedule:
     """Place every recorded event on the hardware's grids.
 
@@ -748,8 +815,10 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
     #    RX wrap bug). Queued plays must start >= 3 batches apart. (RegHead would tolerate 2 —
     #    II=2 — but the conservative bound covers every impl in TimedQueueImpl.)
     #  * The play push has NO backpressure (a Flow into the generator): an overfull queue
-    #    silently DROPS entries. The kernel may push every play long before the first pops, so
-    #    the safe static bound is total plays per channel <= queue_depth.
+    #    silently DROPS entries. The queue is queue_depth deep, so before its (k+depth)-th play of a
+    #    channel the kernel WAITS for the k-th to have popped (a `wait_until` barrier, emitted by
+    #    generate_kernel_source) — legal only while every later push still keeps its lead:
+    #    _queue_barriers checks that, per core.
     for ch in {e.channel for e in sch.events}:
         plays = []
         for idx, e in enumerate(sch.events):
@@ -768,12 +837,8 @@ def plan(core: Core, reserved_base: int = 0, max_run: int | None = None) -> Sche
                     "3 batches (SrlShadow II=3), so the later play lands a batch late and the "
                     "channel (and the trace recording) glitches low for a batch; space the "
                     "events apart")
-        depth = sch.core.m.params.queue_depth
-        if len(plays) > depth:
-            raise RuntimeError(
-                f"{_label(ch, m)}: {len(plays)} queued plays exceed the hardware queue depth {depth} — "
-                "the play push has no backpressure, so an overfull queue silently drops "
-                "entries; split the sequence into shorter kernels or merge/space its events")
+    for k in {e.channel // 3 for e in sch.events}:
+        _queue_barriers(sch, k)
 
     # the read of an IQ result halts ITS core until the integral settles (window end), and that
     # core's later MMIO pushes need their LEAD margin — refuse anything on the same core scheduled
@@ -978,8 +1043,12 @@ def generate_kernel_source(sch: Schedule, lead: int = 8192, doc: str = "", core_
     sequence origin t1: the default `now() + lead` anchors a single core on its own clock read; a
     multi-core run passes `run_origin()` (the SoC's reset-release latch, identical on every core)
     and the kernel then also fills a `tele` array — [t1, now at entry, now just before its first
-    play, now after each blocking readout] — that run() checks against the schedule."""
+    play, now after each blocking readout] — that run() checks against the schedule. Where a channel
+    would hold more than `queue_depth` plays, a `wait_until` queue barrier precedes the push (see
+    _queue_barriers)."""
     events = [(idx, e) for idx, e in enumerate(sch.events) if e.channel // 3 == core_index]
+    bars = _queue_barriers(sch, core_index)
+    depth = sch.core.m.params.queue_depth
     chans = sorted({e.channel for _, e in events})
     nm = {c: ("demod" if c % 3 == 2 else f"ch{c % 3}") for c in chans}
     n_iq = sum(1 for _, e in events if e.is_demod)
@@ -997,12 +1066,20 @@ def generate_kernel_source(sch: Schedule, lead: int = 8192, doc: str = "", core_
         # not from register programming; their amp is 0, so the output is silent either way).
         # The demod carrier advances per ADC sample: 4 per batch, not 16.
         rate = 4 if e.is_demod else 16
+        if (idx, 0) in bars:
+            # set_freq is itself a queue push (tagged with the channel's start time, which the last fire
+            # auto-advanced to its end), so the barrier goes before the event's FIRST write, not the play
+            body.append(f"    wait_until(t1 + {bars[(idx, 0)]})  # noqa: F821  queue barrier: the play "
+                        f"pushed {depth} plays ago has popped, the queues take this event's writes")
         body.append(f"    set_freq({n}, {W})  # noqa: F821")
         body.append(f"    set_phase({n}, {n}[\"p\"], {_i32(e.phase_const)} - {W} * (t1 * {rate}))"
                     f"  # noqa: F821")
         body.append(f"    set_amp({n}, {n}[\"p\"], {_i32(e.amp_code << 16)})  # noqa: F821")
         at = e.batch
-        for line, nb in sch.chunks[idx]:
+        for j, (line, nb) in enumerate(sch.chunks[idx]):
+            if j and (idx, j) in bars:
+                body.append(f"    wait_until(t1 + {bars[(idx, j)]})  # noqa: F821  queue barrier: the play "
+                            f"pushed {depth} plays ago has popped (chunk {j})")
             body.append(f"    set_env({n}, {n}[\"p\"], {_i32(line << 16)})  # noqa: F821")
             body.append(f"    set_dur({n}, {n}[\"p\"], {_i32(nb << 16)})  # noqa: F821")
             if origin is not None and not any("play(" in b for b in body):

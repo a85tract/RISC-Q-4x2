@@ -40,6 +40,21 @@ two connectors is the fixed board/cable path difference; the notebook's second d
 channels' `phase` if the connectors themselves must be aligned. The one-core bundles
 (`rfsoc4x2-1q-*`, `rfsoc4x2-2dac-*`) predate MTS and keep their unsynchronized tile clocks.
 
+**Clocks and re-locks** (measured 2026-09-04, `software/examples/lmx_relock_check.py`, 4 locks per
+arm, 82 MHz loopback phase of each path against the generator): the two LMX2594 synthesizers that
+make the 491.52 MHz tile reference clocks are programmed from PYNQ's xrfclk register files. With
+those files, re-locking either LMX alone (the LMK untouched) leaves both paths within 0.06°, but
+reprogramming the whole chain (LMK + both LMXs — what the first load in a fresh server process or a
+power cycle does) lands the paths in one of two states about 0.8° (DAC_A) / 1.8° (DAC_B) apart, i.e.
+25–60 ps, while MTS still reaches its pinned latencies. `rfsoc4x2-2q-fine` therefore carries its own
+LMX list (`board.json` `"lmx_regs"`: `lmx2594-491.52-sync.txt`, the xrfclk list with the LMX's
+phase-SYNC mode enabled — VCO_PHASE_SYNC = 1 and PLL_N 320 → 80 for the included ÷4, TI category 1
+for this frequency plan, no SYNC pulse needed), which the server programs into both LMXs after the
+defaults at every clock programming: with it the whole-chain reprogramming repeats within 0.06° /
+0.12° (≤ 3 ps) and the single-LMX re-locks within 0.1°. The absolute path phase moves by a fixed
+~3° between the two lists (the notebook's numbers are taken with the bundle's list). Loads take
+4–22 s in either state. Not covered from here: real power cycles, scope probing of the clock edges.
+
 ## Time grids
 
 | quantity | resolution | note |
@@ -62,9 +77,10 @@ the report prints exactly this.
 * `PHASE_MODE_CONTINUOUS` — the accumulator is not reset across a frequency change; the chain
   walks the `set()` calls (a `set` with no pulse still matters).
 
-Verified on hardware: cross-pulse carrier coherence < 0.5°; the live notebook's capture agreed with
-the ideal generator to ≤ 0.11° per tone on the 2026-08-31 bench and to ≤ 0.5° on the 2026-09-04
-bench (whose DAC_A → ADC_A cable is lossy; `software/server/bits/rfsoc4x2-2q-fine/PROVENANCE.md`).
+Verified on hardware: cross-pulse carrier coherence < 0.5°; the live notebook's capture agrees with
+the ideal generator to ≤ 0.3° per tone (2026-09-04, 0.6 % rms residual; ≤ 0.11° on the 2026-08-31
+bench). A lossy cable on one loop showed up as 0.5° and 11 % — the cable, not the design
+(`software/server/bits/rfsoc4x2-2q-fine/PROVENANCE.md`).
 
 ## The trace recorder (why fillers exist)
 
@@ -94,11 +110,20 @@ timed queue. Two limits, both enforced by `plan()` before anything runs:
   channel low for one batch, *and* reset the trace recorder. Practical corollaries: no 1– or
   2-batch gaps between pulses on a recorded channel; pulses starting mid-batch reserve an
   envelope-line triplet internally (invisible to you, but it is why the rule is 3).
-* **≤ 8 queued plays per channel** (`queue_depth` of this build). The push has no backpressure
-  — an overfull queue silently drops entries — so the planner refuses schedules that could
-  exceed it. Long pulses split internally, each chunk one play: ≈ 16 k-batch chunks on a
-  channel that also has mid-batch pulses; up to 65 535 batches (the duration field) per chunk
-  otherwise.
+* **The parameter queues hold 8 entries per channel** (`queue_depth` of this build; `set_freq` and
+  every fire push one entry each). The push has no backpressure — an overfull queue silently drops
+  entries — so before a channel's 9th, 10th, … event the generated kernel waits for the play pushed
+  8 plays earlier to pop (its due batch + 3) and only then writes the event (`set_freq` first). Such
+  a wait holds the whole core, so from the first one on the planner budgets the kernel's clock —
+  PUSH_MARGIN = 300 batches (0.61 µs) for a wait that waits and its event, PUSH_COST = 60 batches
+  per further event — and refuses the schedule when a play would be pushed with less than LEAD
+  (96 batches) to its due. In short: **no 9 plays of one channel within 399 batches (0.81 µs), and
+  a long burst of tightly spaced plays behind such a wait may be refused too**; beyond that a
+  channel may play any number of pulses in one run. The budget comes from co-sim
+  (`sim/cosim2q_queue.py`): the kernel sustained 25 plays at 50 batches per play and failed at 36.5;
+  the model keeps ~15 % over that. Long pulses split internally, each chunk one play: ≈ 16 k-batch
+  chunks on a channel that also has mid-batch pulses; up to 65 535 batches (the duration field) per
+  chunk otherwise. Capture fillers (`fill_gaps`) are plays too.
 * Two pulses on one channel may not overlap in time (a channel plays one pulse at a time).
 
 ## IQ readout rules
@@ -122,7 +147,7 @@ timed queue. Two limits, both enforced by `plan()` before anything runs:
 |---|---|---|
 | `pulses overlap — one ends at ..., the next starts at ...` | two pulses on one channel overlap (remember trailing edges round to whole batches) | separate them |
 | `queued plays at batches A and B start closer than 3 batches` | the II=3 spacing rule | ≥ 3 batches (6.1 ns) between play starts; avoid 1–2-batch pulses/gaps |
-| `N queued plays exceed the hardware queue depth 8` | too many pulses+fillers+chunks on one channel in one run | split into several runs, or merge/space events |
+| `the play at batch N (event k) can only be pushed after the queue entry from batch M pops` | 9 plays (pulses + fillers + chunks) of one channel within ~400 batches, or a dense burst of plays behind such a wait | space or merge events, or split the run |
 | `adc gate of N batches (snapped outward) exceeds rob_depth 65536` | window > trace memory | shorten the gate |
 | `N gates on adcK in one run` | more than one gate on the same trace | one gate per trace per run |
 | `this timeline spans hardware cores [...] but the build has no shared run origin` | a multi-core timeline on a build without `run_origin` (the one-core bundles) | use a `run_origin` build (`rfsoc4x2-2q-fine`) |

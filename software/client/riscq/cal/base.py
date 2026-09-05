@@ -229,12 +229,9 @@ def sweep_q16(x0: int, x1: int, n: int, fold: bool = False) -> tuple[int, int, n
     stays UNFOLDED: it is the frequency ramp the caller asked for, and the frequency callers map it
     back to Hz as a delta from their own first point (so it never jumps a whole `fs` at the fold).
     What still fails loud is a scan wider than one full turn, which would alias onto itself."""
-    # M7b note: this Q16 accumulator is a 16-BIT-CODE sweep — the realized value is `q >> 16`, which
-    # is what the hardware reads at freq_width 16. A freq_width-32 build reads the WHOLE word, so a
-    # FREQUENCY sweep built here would land on the full-precision ramp instead of the rounded codes
-    # and the returned axis would no longer describe what played. Amplitude sweeps are unaffected
-    # (amp stays a 16-bit seated field at every width). Frequency callers must pass
-    # `freq_width_ok=False` until they are migrated; see `sweep_q16_freq_guard`.
+    # This is a 16-BIT-CODE sweep — the realized value is `q >> 16`. Amplitude / phase / time knobs
+    # are 16-bit at every build width; a FREQUENCY ramp is not (a freq_width-32 build reads the whole
+    # word), so frequency callers use `sweep_freq`, which mirrors the build's own width.
     dxq = 0 if n <= 1 else round(((x1 - x0) << 16) / (n - 1))
     xs = (x0 * (1 << 16) + np.arange(n, dtype=np.int64) * dxq) >> 16
     if fold:
@@ -246,16 +243,34 @@ def sweep_q16(x0: int, x1: int, n: int, fold: bool = False) -> tuple[int, int, n
     return x0 << 16, dxq, xs.astype(int)
 
 
-def sweep_q16_freq_guard(m) -> None:
-    """Refuse a Q16 FREQUENCY sweep on a build whose frequency word is wider than the code the
-    sweep produces (M7b). Amplitude sweeps do not need this. Migrating a frequency sweep means
-    building the ramp in the build's own word width and converting the axis with
-    `units.word_to_freq`, not `units.code_to_freq`."""
-    if m.params.freq_width != 16:
-        raise NotImplementedError(
-            f"Q16 frequency sweeps are 16-bit-code sweeps; this build uses freq_width "
-            f"{m.params.freq_width}. Build the ramp in the build's word width (units.freq_word) "
-            f"and map the axis with units.word_to_freq.")
+def sweep_freq(f0_hz: float, f1_hz: float, n: int, m) -> tuple[int, int, np.ndarray]:
+    """A FREQUENCY ramp for the on-core accumulator at THIS build's word width: the kernel params
+    (x0q, dxq) — `set_freq(ch, x0q + i*dxq)` raw, as k_vna / k_cz_pop do — and the Hz each point
+    REALIZES, in the caller's own Nyquist zone (the x axis; a value written back to the config
+    re-derives the same register word bit-for-bit).
+
+    x0q is the seated word of f0 (16-bit build: code << 16; 32-bit: the SF(32) word), so its LSB
+    weighs fs / 2^32 at either width and the ramp arithmetic is the same; what differs is what the
+    register KEEPS — the top 16 bits (the code) or the whole word — and the axis mirrors exactly
+    that. The kernel's int32 accumulator wraps like the hardware's phase accumulator, so the ramp
+    may run through the band edge unfolded; wider than a full turn it would alias onto itself."""
+    fw, fs = m.params.freq_width, units.sample_rate(m.params)
+    assert abs(f0_hz) < fs and abs(f1_hz) < fs, \
+        f"sweep endpoints {f0_hz:g}..{f1_hz:g} Hz must lie within one sample rate ({fs:g} Hz) of DC — " \
+        "the range units.freq_word accepts, so every axis value converts back"
+    w0 = round(f0_hz / fs * (1 << fw)) << (32 - fw)              # UNWRAPPED: keeps the Nyquist zone
+    span = round((f1_hz - f0_hz) / fs * (1 << 32))
+    assert abs(span) < (1 << 32), "a frequency sweep may not cover more than one full turn of the band"
+    dxq = 0 if n <= 1 else round(span / (n - 1))
+    q = w0 + np.arange(n, dtype=np.int64) * dxq                  # the accumulator, unwrapped
+    kept = (q >> (32 - fw)) << (32 - fw)                         # what the register keeps at this width
+    assert np.abs(kept).max() < (1 << 32), \
+        "a point of the realized ramp rounds to the sample rate itself, which no register word holds"
+    assert int(kept.max() - kept.min()) < (1 << 32), \
+        "the realized ramp (the rounded step times n-1) covers a full turn: its ends alias onto each other"
+    # the kernel params are int32: the accumulator wraps mod 2^32 exactly like the hardware's, so the
+    # wrapped increment realizes the same points (dxq = 2^31 for a half-band sweep in two points)
+    return int(units._wrap_signed(w0, 32)), int(units._wrap_signed(dxq, 32)), kept * fs / (1 << 32)
 
 
 def gate_sigma(m, pulse: Pulse, carrier_hz: float, amp_code: int) -> float:

@@ -32,9 +32,9 @@ exp = run_experiment(Rabi, device_db)
 
 Verified end to end: the captured waveform of the reference two-pulse sequence matches the ideal
 generator in bit-accurate co-simulation and on the board (`software/examples/artiq_api_demo.ipynb`,
-run live and committed with its outputs): carrier phases within 0.5° per tone; the residual after
-the delay/scale fit is bench-dependent (0.4–0.5 % rms on the one-core bundles' bench of 2026-08-31,
-11 % on the 2026-09-04 bench whose DAC_A → ADC_A cable is lossy — see the bundle's PROVENANCE.md).
+run live and committed with its outputs): 0.6 % rms residual after the delay/scale fit, carrier
+phases within 0.3° per tone (2026-09-04, identical cables on both loops; the same run with a lossy
+cable on one loop gave 11 % and 0.5° — see the bundle's PROVENANCE.md for that comparison).
 
 ## Layout
 

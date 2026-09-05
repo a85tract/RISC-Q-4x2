@@ -88,3 +88,12 @@ Build with `gateware/vivado-scripts/riscvsoc-bd/build-riscvsoc-bd.sh` (see `gate
 built from, `board.json` = copy of an existing one with `fclk0_mhz` set to the build's achieved
 PS clock (Vivado report), `sha256sum * > SHA256SUMS`, and a `PROVENANCE.md` saying when/with
 what/how verified. Re-run `board_setup.sh`; the name is what `device_db` references.
+A bundle may carry its own LMX2594 register list (`"lmx_regs": "<file in the bundle dir>"`, TICS
+Pro / xrfclk text format, R112 first): after xrfclk's default files the server programs both LMXs
+from it with the datasheet sequence (reset, all registers, 10 ms, R0 again), and every load
+guarantees that state. `rfsoc4x2-2q-fine` uses it for the LMX's phase-SYNC mode (see
+`docs/hardware-contract.md`, "Clocks and re-locks"). Clock diagnostics over the same RPC:
+`refclks(lmk, lmx, lmx_regs=None)` reprograms the LMK and both LMXs (plus a list),
+`lmx_program("lmxdac" | "lmxadc", regs=None)` re-locks ONE LMX alone; reload the bundle afterwards.
+`info()["refclks"]` reports what is programmed. `software/examples/lmx_relock_check.py` is the
+clock-phase repeatability experiment built on them.

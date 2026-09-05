@@ -45,7 +45,7 @@ import numpy as np
 from riscq import run as rq
 from riscq.cal import kernels
 from riscq.cal.base import (GATE_CH, SEP, Result, acquire_shots, batch_timeout, batches, ef_table,
-                            sweep_q16_freq_guard,
+                            sweep_freq,
                             ef_vz, grid_period, herald_offset, heralding, prep, qubits_list,
                             readout_tables, relax_batches, rerun_counts, res_sign, seconds, socmap,
                             sweep_q16, train_step, x90_vz)
@@ -452,16 +452,14 @@ class Separation:
         for q in self.qubits:
             ro, demod, _, dur, ddly = readout_tables(cfg, q, m)
             table, pg, plen = prep(cfg, q, m, self.gate)
-            c0 = units._freq_code(float(cfg[f"readout/{q}/freq"]), m.params)   # DAC-rate center code (plain)
-            span = abs(units._freq_code(self.span, m.params))                  # the span as a code offset
-            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
-            c0q, dcq, xs = sweep_q16(c0 - span, c0 + span, npts)               # on-core sweep
+            f0 = float(cfg[f"readout/{q}/freq"])
+            c0q, dcq, hz = sweep_freq(f0 - self.span, f0 + self.span, npts, m)   # on-core, this build's width
             period = grid_period(relax_batches(cfg, m), SEP + plen, dur, ddly)
             progs[q] = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(gate=table, ro=ro, demod=demod),
                                       out=Array(2 * npts * s_run), npts=npts, shots=s_run, period=period,
                                       sh=0, ddly=ddly, mode=kernels.RAW, prep_gate=pg,
                                       c0q=int(c0q), dcq=int(dcq), **x90_vz(cfg, q))
-            meta[q] = np.array(xs, float)
+            meta[q] = hz
             timeout = max(timeout, batch_timeout(npts * s_run * period))
         rq.setup(drv, m, progs)
 
@@ -480,14 +478,11 @@ class Separation:
             seps = np.array([c.separation for c in clfs])
             mag0 = np.hypot(i0[:, :, 0].mean(1), i0[:, :, 1].mean(1))   # what the OLD cal argmax'd
             best = int(np.argmax(seps))
-            # DELTA-based physical Hz (spec 13 §2: codes never leave run()): the swept codes alias
-            # (Nyquist fold) — X6Y3's 6.55 GHz readout in the DAC's 2nd Nyquist zone would come back
-            # as its −1.44 GHz baseband alias through code_to_freq. f0 + code_to_freq(Δcode) stays in
-            # the config's band, and is code-exact: re-deriving the code from the written-back Hz
-            # reproduces xs[best] bit-for-bit (_freq_code folds mod 2^16 and Δcode is an integer).
-            f0 = float(cfg[f"readout/{q}/freq"])
-            c0 = units._freq_code(f0, m.params)
-            freqs = f0 + units.code_to_freq(meta[q] - c0, m.params)
+            # physical Hz in the config's own band (spec 13 §2: codes never leave run()): sweep_freq
+            # keeps the Nyquist zone — X6Y3's 6.55 GHz readout in the DAC's 2nd zone does not come
+            # back as its −1.44 GHz baseband alias — and each value is what the register realizes, so
+            # re-deriving the word from the written-back Hz reproduces the swept point bit-for-bit.
+            freqs = meta[q]
             data[q] = {"x": freqs, "y": seps, "mag0": mag0}
             proposal[f"readout/{q}/freq"] = float(freqs[best])
             fit[q] = clfs[best]
@@ -540,7 +535,6 @@ class Resonator:
         cfg = self.cfg
         shots = self.shots
         sh = max(0, (shots - 1).bit_length())    # pre-sum shift: `shots` integrals stay inside int32
-        fs = units.sample_rate(m.params)
         relax = relax_batches(cfg, m)
         progs, meta, timeout = {}, {}, 0
         for q in self.qubits:
@@ -553,30 +547,23 @@ class Resonator:
             assert npts > 1 and np.allclose(step, step[0]), \
                 "the on-core sweep is a linear ramp — `freqs` must be evenly spaced"
             ro, demod, _, dur, ddly = readout_tables(cfg, q, m)
-            # the sweep is c0 + Δcode, and the SPAN is taken unfolded: the ramp stays monotone
-            # across Nyquist on the host, and the kernel's int32 wrap folds it into the register
-            # the way the converter folds a tone (fold=True).
-            c0 = units._freq_code(float(f[0]), m.params)
-            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
-            c0q, dcq, xs = sweep_q16(c0, c0 + round((f[-1] - f[0]) * (1 << 16) / fs), npts,
-                                     fold=True)
+            # the SPAN is taken unfolded: the ramp stays monotone across Nyquist on the host, and the
+            # kernel's int32 wrap folds it into the register the way the converter folds a tone
+            c0q, dcq, hz = sweep_freq(float(f[0]), float(f[-1]), npts, m)
             period = grid_period(relax, 0, dur, ddly)
             progs[q] = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(ro=ro, demod=demod),
                                       out=Array(2 * npts), npts=npts, shots=shots, period=period,
                                       sh=sh, ddly=ddly, mode=kernels.IQSUM,
                                       c0q=int(c0q), dcq=int(dcq))
-            meta[q] = (float(f[0]), c0, np.array(xs, float))
+            meta[q] = hz
             timeout = max(timeout, batch_timeout(npts * shots * period))
         out = rq.run(drv, m, progs, results=["out"], timeout=timeout)
 
         data, fit = {}, {}
         for q in self.qubits:
-            f0, c0, xs = meta[q]
             z = out[q]["out"].astype(float).reshape(-1, 2) * (1 << sh) / shots   # mean IQ per point
             iq = z[:, 0] + 1j * z[:, 1]
-            # DELTA-based physical Hz, as in Separation: the swept codes alias, so report the
-            # caller's own band rather than the baseband image of the folded code.
-            data[q] = {"x": f0 + units.code_to_freq(xs - c0, m.params), "iq": iq, "mag": np.abs(iq)}
+            data[q] = {"x": meta[q], "iq": iq, "mag": np.abs(iq)}   # realized Hz in the caller's band
             fit[q] = None
         self.data, self.fit = data, fit
         return Result(True, data, fit, {}, cfg, f"Resonator {self.qubits}")
@@ -612,16 +599,14 @@ class Punchout:
         for q in self.qubits:
             ro, demod, _, dur, ddly = readout_tables(cfg, q, m)
             table, pg, plen = prep(cfg, q, m, "X90")
-            c0 = units._freq_code(float(cfg[f"readout/{q}/freq"]), m.params)
-            span = abs(units._freq_code(self.span, m.params))
-            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
-            c0q, dcq, xs = sweep_q16(c0 - span, c0 + span, npts)
+            f0 = float(cfg[f"readout/{q}/freq"])
+            c0q, dcq, hz = sweep_freq(f0 - self.span, f0 + self.span, npts, m)   # this build's word width
             period = grid_period(relax_batches(cfg, m), SEP + plen, dur, ddly)
             progs[q] = compile_kernel(kernels.k_vna, m, fw32=int(m.params.freq_width == 32), tables=dict(gate=table, ro=ro, demod=demod),
                                       out=Array(2 * npts * shots), npts=npts, shots=shots,
                                       period=period, sh=0, ddly=ddly, mode=kernels.RAW, prep_gate=pg,
                                       c0q=int(c0q), dcq=int(dcq), **x90_vz(cfg, q))
-            meta[q] = np.array(xs, float)
+            meta[q] = hz
             timeout = max(timeout, batch_timeout(npts * shots * period))
         rq.setup(drv, m, progs)
         rows = {q: [] for q in self.qubits}
@@ -635,9 +620,7 @@ class Punchout:
 
         data, fit = {}, {}
         for q in self.qubits:
-            f0 = float(cfg[f"readout/{q}/freq"])
-            c0 = units._freq_code(f0, m.params)
-            freqs = f0 + units.code_to_freq(meta[q] - c0, m.params)   # DELTA-based Hz (see Separation)
+            freqs = meta[q]                                   # realized Hz in the config's band (see Separation)
             data[q] = {"x": freqs, "amps": np.array(self.amps, float), "mag": np.array(rows[q])}
             fit[q] = None
         self.data, self.fit = data, fit

@@ -532,10 +532,36 @@ def test_play_starts_one_batch_apart_raise():
         A.plan(c)
 
 
-def test_too_many_queued_plays_raise():
+def test_queue_barriers_let_long_sequences_through():
+    """More plays than the queue holds are fine when they are spread out: before a channel's
+    (k+depth)-th play the kernel waits (a `wait_until` barrier right before the push) for the k-th
+    to have popped, and the planner checks every later push still keeps LEAD + PUSH_MARGIN."""
+    m = _map()
+    depth = m.params.queue_depth
+    c = A.Core(m)
+    ch = A.DDSChannel(c, 1)
+    n = depth + 4
+    for _ in range(n):
+        ch.set(82e6, phase=0.0, amplitude=0.4)
+        ch.sw.pulse_mu(16 * 4)
+        A.delay_mu(c, 16 * 600)                    # 604 batches apart: depth plays span >> LEAD + margin
+    sch = A.plan(c)
+    src = A.generate_kernel_source(sch)
+    lines = src.splitlines()
+    bars = [l for l in lines if "queue barrier" in l]
+    assert len(bars) == n - depth
+    due = [e.batch for e in sch.events]
+    want = [due[k - depth] + A.POP_LATE for k in range(depth, n)]
+    got = [int(l.split("t1 + ")[1].split(")")[0]) for l in bars]
+    assert got == want                              # each waits for the play pushed depth plays earlier
+    for l in bars:                                  # ... right before the event's FIRST queue write
+        assert lines[lines.index(l) + 1].lstrip().startswith("set_freq(")
+
+
+def test_queue_barrier_without_lead_raises():
     """The play push has NO backpressure (a Flow into the generator): an overfull TimedQueue
-    silently drops entries. The kernel may push every play before the first pops, so the planner
-    bounds total plays per channel by the build's queue_depth."""
+    silently drops entries. A (depth+1)-th play due before the first has popped plus LEAD +
+    PUSH_MARGIN cannot be pushed in time, so the planner refuses it."""
     m = _map()
     c = A.Core(m)
     ch = A.DDSChannel(c, 1)
@@ -543,7 +569,7 @@ def test_too_many_queued_plays_raise():
         ch.set(82e6, phase=0.0, amplitude=0.4)
         ch.sw.pulse_mu(16 * 4)
         A.delay_mu(c, 16 * 4)
-    with pytest.raises(RuntimeError, match="exceed the hardware queue depth"):
+    with pytest.raises(RuntimeError, match="can only be pushed after the queue entry"):
         A.plan(c)
 
 

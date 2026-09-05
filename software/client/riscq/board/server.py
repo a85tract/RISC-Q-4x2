@@ -93,6 +93,7 @@ class BoardServer:
                 "mts_result": getattr(self._drv, "mts_result", None),
                 "mts_latencies": getattr(self._drv, "mts_latencies", None),
                 "dsp_mhz": getattr(self, "_dsp_mhz", None),
+                "refclks": getattr(self._drv, "refclks_state", None),
                 "versions": {"python": sys.version.split()[0], "riscq": riscq_version}}
 
     def _measure_dsp_mhz(self, m, dt: float = 0.2) -> float:
@@ -159,8 +160,12 @@ class BoardServer:
         return self._driver().mts(daclatency=int(daclatency), adclatency=int(adclatency))
 
     @_locked
-    def refclks(self, lmk_freq, lmx_freq=None):
-        self._driver().refclks(lmk_freq, lmx_freq)
+    def refclks(self, lmk_freq, lmx_freq=None, lmx_regs=None):
+        self._driver().refclks(lmk_freq, lmx_freq, lmx_regs)
+
+    @_locked
+    def lmx_program(self, which, regs=None):
+        return self._driver().lmx_program(str(which), list(regs) if regs else None)
 
     @_locked
     def adc_nyquist_zone(self, n):
@@ -230,6 +235,9 @@ class BoardServer:
             raise FileNotFoundError(f"bundle {bundle!r}: missing {missing} in {d} (have: {have})")
         board_file = d / "board.json"
         board = json.loads(board_file.read_text()) if board_file.exists() else None
+        if board and board.get("lmx_regs"):        # the bundle's own LMX2594 list: TICS text -> ints
+            board["lmx_regs"] = [int(line.split()[1], 16)
+                                 for line in (d / board["lmx_regs"]).read_text().splitlines() if line.strip()]
 
         from riscq.board.pynq_driver import PynqDriver   # lazy: only importable on the board
         # the bitstream is programmed inside PynqDriver(): if it raises afterwards (MTS required and

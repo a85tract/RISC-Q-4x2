@@ -22,7 +22,7 @@ from riscq import run as rq
 from riscq.cal import fits, kernels
 from riscq.cal.config import _amp_phase
 from riscq.cal.base import (GATE_CH, Result, batch_timeout, batches, ef_pulse, gate_pulse,
-                            sweep_q16_freq_guard,
+                            sweep_freq,
                             grid_period, population, qubit_freq, readout_tables, relax_batches,
                             res_sign, seconds, socmap, sweep_q16, x90_vz)
 from riscq.lang import Array, ParamTable, compile_kernel
@@ -474,12 +474,10 @@ class CZSweep:
         czd = _cz_dur_batches(cfg, pair, m)
         if self.knob == "freq":
             f_cz = float(cfg[f"two_qubit/{pk}/CZ/freq"])
-            lo = units._freq_code(f_cz - self.span if self.lo is None else self.lo, m.params)
-            hi = units._freq_code(f_cz + self.span if self.hi is None else self.hi, m.params)
-            sweep_q16_freq_guard(m)   # M7b: a Q16 code sweep is 16-bit-only
-            x0, dx, xs = sweep_q16(lo, hi, self.points)
-            xax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
-            return kernels.FREQ, czd, int(x0), int(dx), xs, xax
+            lo = f_cz - self.span if self.lo is None else self.lo
+            hi = f_cz + self.span if self.hi is None else self.hi
+            x0, dx, xax = sweep_freq(lo, hi, self.points, m)    # this build's word width, Hz in the CZ band
+            return kernels.FREQ, czd, x0, dx, xax, xax
         if self.knob == "amp":
             a0 = _cz_amp(cfg, pair)
             lo = units._amp_code(0.02 if self.lo is None else self.lo)
@@ -682,11 +680,7 @@ class CZFrequency:
         m = socmap(drv)
         cfg, pair, pk = self.cfg, self.pair, pair_key(self.pair)
         f_cz = float(cfg[f"two_qubit/{pk}/CZ/freq"])
-        lo = units._freq_code(f_cz - self.span, m.params)
-        hi = units._freq_code(f_cz + self.span, m.params)
-        sweep_q16_freq_guard(m)       # M7b: a Q16 code sweep is 16-bit-only
-        x0, dx, xs = sweep_q16(lo, hi, self.points)
-        xax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
+        x0, dx, xax = sweep_freq(f_cz - self.span, f_cz + self.span, self.points, m)
         R, P0 = _cz_cond_R(cfg, drv, m, pair, "freq", x0, dx, self.points, self.ngates, self.shots)
         self.data = {pair: {"x": xax, "R": R, "P0": P0}}
         i = int(np.argmax(R))
@@ -757,11 +751,7 @@ class CZAmpFreqSweep:
         cfg, pair, pk = self.cfg, self.pair, pair_key(self.pair)
         amps = self._amp_axis(cfg)
         f_cz = float(cfg[f"two_qubit/{pk}/CZ/freq"])
-        lo = units._freq_code(f_cz - self.span, m.params)
-        hi = units._freq_code(f_cz + self.span, m.params)
-        sweep_q16_freq_guard(m)       # M7b: a Q16 code sweep is 16-bit-only
-        x0, dx, xs = sweep_q16(lo, hi, self.points)
-        fax = np.array([units.code_to_freq(int(x), m.params) for x in xs])
+        x0, dx, fax = sweep_freq(f_cz - self.span, f_cz + self.span, self.points, m)
         progs, tables, signs, timeout = _cz_cond_progs(cfg, m, pair, "freq", x0, dx, self.points,
                                                        self.ngates, self.shots, amp=float(amps[0]))
         rq.setup(drv, m, progs)

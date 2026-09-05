@@ -33,8 +33,15 @@ class _BoardExtras:
     def mts(self, daclatency: int = 260, adclatency: int = 60) -> int:
         return self._proxy.mts(daclatency, adclatency)
 
-    def refclks(self, lmk_freq: float, lmx_freq: float | None = None) -> None:
-        self._proxy.refclks(lmk_freq, lmx_freq)
+    def refclks(self, lmk_freq: float, lmx_freq: float | None = None, lmx_regs=None) -> None:
+        """Reprogram the LMK and both LMXs; `lmx_regs` (the ints of an LMX2594 TICS list, R112 first)
+        is programmed into both LMXs afterwards. Reload the bundle next: the RF tiles lost their clock."""
+        self._proxy.refclks(lmk_freq, lmx_freq, list(lmx_regs) if lmx_regs else None)
+
+    def lmx_program(self, which: str, regs=None) -> str:
+        """Diagnostic: reprogram ONE LMX ("lmxdac" / "lmxadc") from `regs` (None: xrfclk's own list),
+        the LMK and the other LMX untouched. Reload the bundle next."""
+        return self._proxy.lmx_program(str(which), list(regs) if regs else None)
 
     def adc_nyquist_zone(self, n: int) -> None:
         self._proxy.adc_nyquist_zone(int(n))
